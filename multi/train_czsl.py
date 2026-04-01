@@ -1,5 +1,6 @@
 """
 CZSL训练脚本 - 使用对比学习训练CLIP用于组合零样本学习
+支持metadata-based文本描述
 python -m multi.train_czsl --config multi/config.yaml
 """
 import os
@@ -28,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from multi.model import create_czsl_model, CLIPForCZSL
 from multi.loss import InfoNCELoss, CZSLContrastiveLoss
-from multi.data import create_czsl_dataloaders
+from multi.data import create_czsl_dataloaders_with_metadata, czsl_metadata_collate_fn
 
 
 class CZSLTrainer:
@@ -89,7 +90,7 @@ class CZSLTrainer:
     def train_epoch(self) -> dict:
         """
         训练一个epoch
-        使用类别级别的对比学习（而不是样本级别的对角线匹配）
+        使用样本级文本描述进行对比学习（InfoNCE风格）
 
         Returns:
             训练指标字典
@@ -101,8 +102,9 @@ class CZSLTrainer:
 
         train_bar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1} [Train]")
 
-        for batch_idx, (images, text_tokens, labels, texts) in enumerate(train_bar):
+        for batch_idx, (images, text_tokens, labels, texts, metas) in enumerate(train_bar):
             images = images.to(self.device)
+            text_tokens = text_tokens.to(self.device)
             labels = labels.to(self.device)
 
             # 调整图像尺寸
@@ -112,20 +114,28 @@ class CZSLTrainer:
             batch_size = images.size(0)
             self.optimizer.zero_grad()
 
-            # 编码图像
+            # 编码图像和样本级文本
             image_features = self.model.encode_image(images)
+            text_features = self.model.encode_text(text_tokens)
+
+            # 归一化特征
             image_features = F.normalize(image_features, dim=-1)
+            text_features = F.normalize(text_features, dim=-1)
 
-            # 使用缓存的类别文本特征进行类别级别的对比学习
-            # text_features_cache: [num_classes, embed_dim]
-            class_text_features = self.model.get_cached_text_features()  # [num_classes, embed_dim]
-
-            # 计算图像与类别的相似度 [batch_size, num_classes]
+            # 获取温度缩放因子
             logit_scale = self.model.model.logit_scale.exp()
-            logits = logit_scale * (image_features @ class_text_features.T)
 
-            # 使用BCE损失进行多标签分类
-            loss = nn.functional.binary_cross_entropy_with_logits(logits, labels)
+            # 计算样本级相似度矩阵 [batch_size, batch_size]
+            logits_per_image = logit_scale * (image_features @ text_features.t())
+            logits_per_text = logits_per_image.t()
+
+            # 标准InfoNCE：对角线为正样本（图像i匹配文本i）
+            targets = torch.arange(batch_size, device=self.device)
+
+            # 双向对比损失
+            loss_i2t = F.cross_entropy(logits_per_image, targets)
+            loss_t2i = F.cross_entropy(logits_per_text, targets)
+            loss = (loss_i2t + loss_t2i) / 2
 
             # 反向传播
             loss.backward()
@@ -139,13 +149,16 @@ class CZSLTrainer:
             # 记录
             total_loss += loss.item() * batch_size
 
-            # 计算准确率（多标签）：检查预测是否正确
+            # 计算准确率：检查是否正确匹配到对角线
             with torch.no_grad():
-                probs = torch.sigmoid(logits)
-                preds = (probs > 0.5).float()
-                # 完全匹配准确率
-                correct = (preds == labels).all(dim=1).sum().item()
-                total_correct += correct
+                # 图像到文本的预测准确率
+                pred_i2t = logits_per_image.argmax(dim=1)
+                correct_i2t = (pred_i2t == targets).sum().item()
+                # 文本到图像的预测准确率
+                pred_t2i = logits_per_text.argmax(dim=1)
+                correct_t2i = (pred_t2i == targets).sum().item()
+                # 平均准确率
+                total_correct += (correct_i2t + correct_t2i) / 2
                 total_samples += batch_size
 
             train_bar.set_postfix(loss=loss.item())
@@ -164,7 +177,7 @@ class CZSLTrainer:
     @torch.no_grad()
     def validate(self) -> dict:
         """
-        验证 - 使用类别级别的对比学习
+        验证 - 使用样本级文本描述进行对比学习
 
         Returns:
             验证指标字典
@@ -176,36 +189,49 @@ class CZSLTrainer:
 
         val_bar = tqdm(self.val_loader, desc=f"Epoch {self.current_epoch + 1} [Val]")
 
-        for images, text_tokens, labels, texts in val_bar:
+        for images, text_tokens, labels, texts, metas in val_bar:
             images = images.to(self.device)
-            labels = labels.to(self.device)
+            text_tokens = text_tokens.to(self.device)
 
             # 调整图像尺寸
             if images.shape[-1] != 224:
-                images = nn.functional.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+                images = nn.functional.interpolate(
+                    images, size=(224, 224), mode='bilinear', align_corners=False
+                )
 
             batch_size = images.size(0)
 
-            # 编码图像
+            # 编码图像和样本级文本
             image_features = self.model.encode_image(images)
+            text_features = self.model.encode_text(text_tokens)
+
+            # 归一化特征
             image_features = F.normalize(image_features, dim=-1)
+            text_features = F.normalize(text_features, dim=-1)
 
-            # 使用缓存的类别文本特征
-            class_text_features = self.model.get_cached_text_features()
-
-            # 计算相似度
+            # 获取温度缩放因子
             logit_scale = self.model.model.logit_scale.exp()
-            logits = logit_scale * (image_features @ class_text_features.T)
 
-            # 计算损失
-            loss = nn.functional.binary_cross_entropy_with_logits(logits, labels)
+            # 计算样本级相似度矩阵
+            logits_per_image = logit_scale * (image_features @ text_features.t())
+            logits_per_text = logits_per_image.t()
+
+            # InfoNCE目标：对角线为正样本
+            targets = torch.arange(batch_size, device=self.device)
+
+            # 双向对比损失
+            loss_i2t = F.cross_entropy(logits_per_image, targets)
+            loss_t2i = F.cross_entropy(logits_per_text, targets)
+            loss = (loss_i2t + loss_t2i) / 2
+
             total_loss += loss.item() * batch_size
 
-            # 计算准确率（多标签完全匹配）
-            probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).float()
-            correct = (preds == labels).all(dim=1).sum().item()
-            total_correct += correct
+            # 计算准确率
+            pred_i2t = logits_per_image.argmax(dim=1)
+            correct_i2t = (pred_i2t == targets).sum().item()
+            pred_t2i = logits_per_text.argmax(dim=1)
+            correct_t2i = (pred_t2i == targets).sum().item()
+            total_correct += (correct_i2t + correct_t2i) / 2
             total_samples += batch_size
 
             val_bar.set_postfix(loss=loss.item())
@@ -412,9 +438,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 创建数据加载器
-    print("\nLoading CZSL datasets...")
-    train_loader, val_loader, test_loader, num_classes = create_czsl_dataloaders(config)
+    # 创建数据加载器（使用metadata版本）
+    print("\nLoading CZSL datasets with metadata...")
+    train_loader, val_loader, test_loader, num_classes = create_czsl_dataloaders_with_metadata(config)
 
     # 创建模型
     print("\nCreating CZSL model...")

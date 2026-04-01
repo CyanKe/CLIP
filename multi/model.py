@@ -5,7 +5,7 @@ CLIP模型适配器 - 用于雷达干扰信号的组合零样本学习
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Dict, Optional, Tuple
+from typing import List, Tuple
 import sys
 import os
 
@@ -141,25 +141,40 @@ class CLIPAdapter(nn.Module):
         """
         return self.model.encode_image(image)
 
-    def cache_text_features(self, class_descriptions: Dict[str, List[str]]):
+    def cache_text_features(self, class_names: List[str]):
         """
         预计算并缓存文本特征
+        使用metadata_template生成描述
 
         Args:
-            class_descriptions: 类别描述字典 {class_name: [description1, ...]}
+            class_names: 类别名称列表
         """
+        from multi.metadata_template import JAM_TYPE_NAMES, VISUAL_TEMPLATES
+
         self.model.eval()
         all_features = []
-        class_names = []
 
         with torch.no_grad():
-            for class_name, descriptions in class_descriptions.items():
-                # 使用第一个描述作为默认
-                text = clip.tokenize(descriptions[0], truncate=True).to(self.device)
+            for cls_name in class_names:
+                # 查找干扰类型编号
+                jam_type = None
+                for k, v in JAM_TYPE_NAMES.items():
+                    if v == cls_name:
+                        jam_type = k
+                        break
+
+                if jam_type:
+                    # 使用metadata_template生成描述
+                    template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name, 'param': {}})
+                    base_desc = template['base']
+                    desc = f"{cls_name} looks like {base_desc}"
+                else:
+                    desc = f"a radar signal with {cls_name}"
+
+                text = clip.tokenize(desc, truncate=True).to(self.device)
                 text_features = self.encode_text(text)
                 text_features = F.normalize(text_features, dim=-1)
                 all_features.append(text_features)
-                class_names.append(class_name)
 
         self.text_features_cache = torch.cat(all_features, dim=0)  # [num_classes, embed_dim]
         self.cached_class_names = class_names
@@ -243,7 +258,6 @@ class CLIPForMultiLabel(CLIPAdapter):
         clip_model: str = "ViT-B/32",
         num_classes: int = 16,
         class_names: List[str] = None,
-        class_descriptions: Dict[str, List[str]] = None,
         **kwargs
     ):
         """
@@ -253,42 +267,57 @@ class CLIPForMultiLabel(CLIPAdapter):
             clip_model: CLIP模型名称
             num_classes: 类别数
             class_names: 类别名称列表
-            class_descriptions: 类别描述字典
         """
         super().__init__(clip_model, num_classes, **kwargs)
 
         self.class_names = class_names or [f"Class_{i}" for i in range(num_classes)]
-        self.class_descriptions = class_descriptions or {}
 
-        # 如果提供了类别描述，缓存文本特征
-        if class_descriptions:
-            self.cache_text_features(class_descriptions)
+        # 缓存文本特征（使用metadata_template生成描述）
+        if class_names:
+            self.cache_text_features(class_names)
 
     def build_combination_descriptions(
         self,
         class_indices: List[List[int]],
-        template: str = "a radar signal with {} and {}"
+        template: str = None
     ) -> List[str]:
         """
         构建组合类别的文本描述
+        使用metadata_template生成描述
 
         Args:
             class_indices: 组合索引列表 [[0,1], [2,3], ...]
-            template: 描述模板
+            template: 已弃用，保留参数兼容性
 
         Returns:
             组合描述列表
         """
+        from multi.metadata_template import JAM_TYPE_NAMES, VISUAL_TEMPLATES
+
         descriptions = []
         for indices in class_indices:
             if len(indices) == 2:
                 name1 = self.class_names[indices[0]]
                 name2 = self.class_names[indices[1]]
-                desc = template.format(
-                    self.class_descriptions.get(name1, [name1])[0].replace("a radar signal with ", ""),
-                    self.class_descriptions.get(name2, [name2])[0].replace("a radar signal with ", "")
-                )
-                descriptions.append(desc)
+
+                # 查找干扰类型编号
+                jam_type1 = jam_type2 = None
+                for k, v in JAM_TYPE_NAMES.items():
+                    if v == name1:
+                        jam_type1 = k
+                    if v == name2:
+                        jam_type2 = k
+
+                # 生成描述
+                descs = []
+                for name, jam_type in [(name1, jam_type1), (name2, jam_type2)]:
+                    if jam_type:
+                        template = VISUAL_TEMPLATES.get(jam_type, {'base': name, 'param': {}})
+                        descs.append(f"{name} looks like {template['base']}")
+                    else:
+                        descs.append(f"a radar signal with {name}")
+
+                descriptions.append(', '.join(descs))
         return descriptions
 
     def predict_multilabel(
@@ -331,7 +360,6 @@ class CLIPForCZSL(nn.Module):
         clip_model: str = "ViT-B/32",
         num_classes: int = 16,
         class_names: List[str] = None,
-        class_descriptions: Dict[str, List[str]] = None,
         freeze_vision: bool = False,
         freeze_text: bool = True,
         vision_layers_unfreeze: int = 2,
@@ -344,7 +372,6 @@ class CLIPForCZSL(nn.Module):
             clip_model: CLIP模型名称
             num_classes: 类别数
             class_names: 类别名称列表
-            class_descriptions: 类别描述字典
             freeze_vision: 是否冻结视觉编码器
             freeze_text: 是否冻结文本编码器
             vision_layers_unfreeze: 解冻视觉编码器最后N层
@@ -354,7 +381,6 @@ class CLIPForCZSL(nn.Module):
         self.device = device
         self.num_classes = num_classes
         self.class_names = class_names or [f"Class_{i}" for i in range(num_classes)]
-        self.class_descriptions = class_descriptions or {}
 
         # 加载预训练CLIP模型
         self.model, self.preprocess = clip.load(clip_model, device=device)
@@ -493,6 +519,7 @@ class CLIPForCZSL(nn.Module):
     ):
         """
         缓存所有类别和组合的文本特征
+        使用metadata_template生成描述，确保与训练一致
 
         Args:
             max_combination_size: 最大组合大小
@@ -500,14 +527,30 @@ class CLIPForCZSL(nn.Module):
         """
         self.eval()
         from itertools import combinations
+        from multi.metadata_template import JAM_TYPE_NAMES, VISUAL_TEMPLATES
 
         all_features = []
         all_names = []
 
-        # 单干扰特征
+        # 单干扰特征 - 使用metadata_template生成默认描述
         if include_single:
             for cls_name in self.class_names:
-                desc = self.class_descriptions.get(cls_name, [cls_name])[0]
+                # 查找干扰类型编号
+                jam_type = None
+                for k, v in JAM_TYPE_NAMES.items():
+                    if v == cls_name:
+                        jam_type = k
+                        break
+
+                if jam_type:
+                    # 使用metadata_template生成描述
+                    # 默认使用moderate JNR和默认参数
+                    template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name, 'param': {}})
+                    base_desc = template['base']
+                    desc = f"{cls_name} looks like {base_desc}"
+                else:
+                    desc = f"a radar signal with {cls_name}"
+
                 tokens = clip.tokenize(desc, truncate=True).to(self.device)
                 features = self.encode_text(tokens)
                 features = F.normalize(features, dim=-1)
@@ -518,16 +561,25 @@ class CLIPForCZSL(nn.Module):
         if max_combination_size >= 2:
             for i, j in combinations(range(len(self.class_names)), 2):
                 cls1, cls2 = self.class_names[i], self.class_names[j]
-                desc1 = self.class_descriptions.get(cls1, [cls1])[0]
-                desc2 = self.class_descriptions.get(cls2, [cls2])[0]
 
-                # 提取关键部分
-                if desc1.startswith("a radar signal with "):
-                    desc1 = desc1[len("a radar signal with "):]
-                if desc2.startswith("a radar signal with "):
-                    desc2 = desc2[len("a radar signal with "):]
+                # 查找干扰类型编号
+                jam_type1 = jam_type2 = None
+                for k, v in JAM_TYPE_NAMES.items():
+                    if v == cls1:
+                        jam_type1 = k
+                    if v == cls2:
+                        jam_type2 = k
 
-                combined_desc = f"a radar signal with {desc1} and {desc2}"
+                # 生成描述
+                descs = []
+                for cls_name, jam_type in [(cls1, jam_type1), (cls2, jam_type2)]:
+                    if jam_type:
+                        template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name, 'param': {}})
+                        descs.append(f"{cls_name} looks like {template['base']}")
+                    else:
+                        descs.append(f"a radar signal with {cls_name}")
+
+                combined_desc = ', '.join(descs)
                 tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
                 features = self.encode_text(tokens)
                 features = F.normalize(features, dim=-1)
@@ -653,13 +705,8 @@ def create_clip_model(config: dict, device: str = "cuda", model_type: str = "mul
     """
     model_config = config.get("model", {})
 
-    # 构建类别描述
-    class_descriptions = {}
-    class_names = []
-    for cls_info in config.get("jamming_classes", []):
-        name = cls_info["name"]
-        class_names.append(name)
-        class_descriptions[name] = cls_info["descriptions"]
+    # 提取类别名称
+    class_names = [cls_info["name"] for cls_info in config.get("jamming_classes", [])]
 
     if model_type == "czsl":
         # 创建CZSL模型
@@ -667,7 +714,6 @@ def create_clip_model(config: dict, device: str = "cuda", model_type: str = "mul
             clip_model=model_config.get("clip_model", "ViT-B/32"),
             num_classes=len(class_names),
             class_names=class_names,
-            class_descriptions=class_descriptions,
             freeze_vision=model_config.get("freeze_vision", False),
             freeze_text=model_config.get("freeze_text", True),
             vision_layers_unfreeze=model_config.get("vision_layers_unfreeze", 2),
@@ -679,7 +725,6 @@ def create_clip_model(config: dict, device: str = "cuda", model_type: str = "mul
             clip_model=model_config.get("clip_model", "ViT-B/32"),
             num_classes=len(class_names),
             class_names=class_names,
-            class_descriptions=class_descriptions,
             freeze_vision=model_config.get("freeze_vision", False),
             freeze_text=model_config.get("freeze_text", True),
             vision_layers_unfreeze=model_config.get("vision_layers_unfreeze", 2),
@@ -722,10 +767,10 @@ if __name__ == "__main__":
             "vision_layers_unfreeze": 2
         },
         "jamming_classes": [
-            {"name": "DFTJ", "descriptions": ["a radar signal with dense false target jamming"]},
-            {"name": "ISRJ", "descriptions": ["a radar signal with interrupted sampling repeater jamming"]},
-            {"name": "VDJ", "descriptions": ["a radar signal with velocity deception jamming"]},
-            {"name": "DDJ", "descriptions": ["a radar signal with distance and velocity joint deception jamming"]},
+            {"name": "DFTJ"},
+            {"name": "ISRJ"},
+            {"name": "VGPO"},
+            {"name": "RGPO"},
         ]
     }
 

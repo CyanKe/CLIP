@@ -551,7 +551,8 @@ def create_dataloaders(config, use_clip_dataset=True):
 class CZSLSTFTDataset(Dataset):
     """
     CZSL数据集 - 支持组合零样本学习
-    返回: (image, label, text_description, combination_index)
+    返回: (image, label, text_description)
+    使用metadata_template生成文本描述
     """
     # CLIP标准化参数
     CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -562,7 +563,6 @@ class CZSLSTFTDataset(Dataset):
         stft_file,
         label_file,
         class_names: list,
-        class_descriptions: dict,
         stft_var_name='all_stfts',
         label_var_name='all_label',
         image_size=224,
@@ -576,7 +576,6 @@ class CZSLSTFTDataset(Dataset):
             stft_file: STFT数据文件路径
             label_file: 标签文件路径
             class_names: 类别名称列表
-            class_descriptions: 类别描述字典
             stft_var_name: STFT数据变量名
             label_var_name: 标签变量名
             image_size: 输出图像尺寸
@@ -589,7 +588,6 @@ class CZSLSTFTDataset(Dataset):
         self.stft_var_name = stft_var_name
         self.label_var_name = label_var_name
         self.class_names = class_names
-        self.class_descriptions = class_descriptions
         self.image_size = image_size
         self.normalize_to_clip = normalize_to_clip
         self.channel_mode = channel_mode
@@ -622,7 +620,9 @@ class CZSLSTFTDataset(Dataset):
         return self.num_samples
 
     def _build_text_description(self, label_np):
-        """根据标签生成文本描述"""
+        """根据标签生成文本描述，使用metadata_template"""
+        from multi.metadata_template import JAM_TYPE_NAMES, VISUAL_TEMPLATES
+
         active_indices = np.where(label_np == 1)[0]
 
         if len(active_indices) == 0:
@@ -630,18 +630,26 @@ class CZSLSTFTDataset(Dataset):
 
         active_classes = [self.class_names[i] for i in active_indices]
 
-        if len(active_classes) == 1:
-            # 单干扰
-            return self.class_descriptions.get(active_classes[0], [active_classes[0]])[0]
+        # 生成描述
+        descs = []
+        for cls_name in active_classes:
+            # 查找干扰类型编号
+            jam_type = None
+            for k, v in JAM_TYPE_NAMES.items():
+                if v == cls_name:
+                    jam_type = k
+                    break
+
+            if jam_type:
+                template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name, 'param': {}})
+                descs.append(f"{cls_name} looks like {template['base']}")
+            else:
+                descs.append(f"a radar signal with {cls_name}")
+
+        if len(descs) == 1:
+            return descs[0]
         else:
-            # 组合干扰
-            desc_parts = []
-            for cls in active_classes:
-                cls_desc = self.class_descriptions.get(cls, [cls])[0]
-                if cls_desc.startswith("a radar signal with "):
-                    cls_desc = cls_desc[len("a radar signal with "):]
-                desc_parts.append(cls_desc)
-            return f"a radar signal with {' and '.join(desc_parts)}"
+            return ', '.join(descs)
 
     def __getitem__(self, index):
         h5_files = self._lazy_load()
@@ -711,6 +719,7 @@ class CZSLSTFTDatasetWithMetadata(Dataset):
     """
     CZSL数据集 - 支持metadata和样本级描述
     返回: (image, label, text_description, metadata_dict)
+    使用metadata_template生成文本描述
     """
     CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
     CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -729,7 +738,6 @@ class CZSLSTFTDatasetWithMetadata(Dataset):
         label_file,
         metadata_file=None,
         class_names: list = None,
-        class_descriptions: dict = None,
         stft_var_name='all_stfts',
         label_var_name='all_label',
         metadata_var_name='all_metadata',
@@ -746,7 +754,6 @@ class CZSLSTFTDatasetWithMetadata(Dataset):
             label_file: 标签文件路径
             metadata_file: metadata文件路径 (可选)
             class_names: 类别名称列表
-            class_descriptions: 类别描述字典
             stft_var_name: STFT数据变量名
             label_var_name: 标签变量名
             metadata_var_name: metadata变量名
@@ -763,7 +770,6 @@ class CZSLSTFTDatasetWithMetadata(Dataset):
         self.label_var_name = label_var_name
         self.metadata_var_name = metadata_var_name
         self.class_names = class_names or []
-        self.class_descriptions = class_descriptions or {}
         self.image_size = image_size
         self.normalize_to_clip = normalize_to_clip
         self.channel_mode = channel_mode
@@ -929,7 +935,7 @@ class CZSLSTFTDatasetWithMetadata(Dataset):
                 else:
                     param_desc = "many steep lines"
 
-            elif jam_type == 11:  # CIJ
+            elif jam_type == 11:  # C&IJ
                 type_desc = "chopping and interleaved jamming"
                 visual_desc = "continuous signal segments"
                 is_cont = jam_params.get('cij_is_continuous', True)
@@ -962,7 +968,9 @@ class CZSLSTFTDatasetWithMetadata(Dataset):
             return f"a radar signal with combined {types}"
 
     def _build_class_description(self, label_np):
-        """回退：使用类级别描述"""
+        """回退：使用metadata_template生成类级别描述"""
+        from multi.metadata_template import JAM_TYPE_NAMES, VISUAL_TEMPLATES
+
         active_indices = np.where(label_np == 1)[0]
         if len(active_indices) == 0:
             return "a radar signal with no jamming"
@@ -971,16 +979,25 @@ class CZSLSTFTDatasetWithMetadata(Dataset):
         if len(active_classes) == 0:
             return "a radar signal with jamming"
 
-        if len(active_classes) == 1:
-            return self.class_descriptions.get(active_classes[0], [active_classes[0]])[0]
+        # 使用metadata_template生成描述
+        descs = []
+        for cls_name in active_classes:
+            jam_type = None
+            for k, v in JAM_TYPE_NAMES.items():
+                if v == cls_name:
+                    jam_type = k
+                    break
+
+            if jam_type:
+                template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name, 'param': {}})
+                descs.append(f"{cls_name} looks like {template['base']}")
+            else:
+                descs.append(f"a radar signal with {cls_name}")
+
+        if len(descs) == 1:
+            return descs[0]
         else:
-            desc_parts = []
-            for cls in active_classes:
-                cls_desc = self.class_descriptions.get(cls, [cls])[0]
-                if cls_desc.startswith("a radar signal with "):
-                    cls_desc = cls_desc[len("a radar signal with "):]
-                desc_parts.append(cls_desc)
-            return f"a radar signal with {' and '.join(desc_parts)}"
+            return ', '.join(descs)
 
     def __getitem__(self, index):
         h5_files = self._lazy_load()
@@ -1057,13 +1074,13 @@ class CZSLContrastiveDataset(Dataset):
     CZSL对比学习数据集
     用于训练图像-文本对齐
     返回: (image, text_tokens, label)
+    使用metadata_template生成文本描述
     """
 
     def __init__(
         self,
         base_dataset,
-        class_names: list,
-        class_descriptions: dict
+        class_names: list
     ):
         """
         初始化
@@ -1071,14 +1088,14 @@ class CZSLContrastiveDataset(Dataset):
         Args:
             base_dataset: 基础数据集 (返回 image, label)
             class_names: 类别名称列表
-            class_descriptions: 类别描述字典
         """
         self.base_dataset = base_dataset
         self.class_names = class_names
-        self.class_descriptions = class_descriptions
 
     def _build_text_description(self, label):
-        """根据标签生成文本描述"""
+        """根据标签生成文本描述，使用metadata_template"""
+        from multi.metadata_template import JAM_TYPE_NAMES, VISUAL_TEMPLATES
+
         if isinstance(label, torch.Tensor):
             label_np = label.numpy()
         else:
@@ -1091,16 +1108,25 @@ class CZSLContrastiveDataset(Dataset):
 
         active_classes = [self.class_names[i] for i in active_indices]
 
-        if len(active_classes) == 1:
-            return self.class_descriptions.get(active_classes[0], [active_classes[0]])[0]
+        # 生成描述
+        descs = []
+        for cls_name in active_classes:
+            jam_type = None
+            for k, v in JAM_TYPE_NAMES.items():
+                if v == cls_name:
+                    jam_type = k
+                    break
+
+            if jam_type:
+                template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name, 'param': {}})
+                descs.append(f"{cls_name} looks like {template['base']}")
+            else:
+                descs.append(f"a radar signal with {cls_name}")
+
+        if len(descs) == 1:
+            return descs[0]
         else:
-            desc_parts = []
-            for cls in active_classes:
-                cls_desc = self.class_descriptions.get(cls, [cls])[0]
-                if cls_desc.startswith("a radar signal with "):
-                    cls_desc = cls_desc[len("a radar signal with "):]
-                desc_parts.append(cls_desc)
-            return f"a radar signal with {' and '.join(desc_parts)}"
+            return ', '.join(descs)
 
     def __len__(self):
         return len(self.base_dataset)
@@ -1140,11 +1166,8 @@ def load_czsl_dataset(config, split='train'):
 
     data_config = config.get("data", {})
 
-    # 获取类别信息
+    # 获取类别名称
     class_names = [cls["name"] for cls in config.get("jamming_classes", [])]
-    class_descriptions = {}
-    for cls_info in config.get("jamming_classes", []):
-        class_descriptions[cls_info["name"]] = cls_info["descriptions"]
 
     # JNR范围
     jnr_numbers = range(
@@ -1177,7 +1200,6 @@ def load_czsl_dataset(config, split='train'):
                 stft_file=stft_file,
                 label_file=label_file,
                 class_names=class_names,
-                class_descriptions=class_descriptions,
                 image_size=data_config.get("image_size", 224),
                 normalize_to_clip=True,
                 channel_mode='magnitude_only'
@@ -1225,6 +1247,42 @@ def czsl_collate_fn(batch):
     return images, text_tokens, labels, texts
 
 
+def czsl_metadata_collate_fn(batch):
+    """
+    支持metadata的CZSL collate函数
+    使用metadata_template生成文本描述并tokenize
+
+    Args:
+        batch: 批次数据列表，每个item为 (image, label, text, metadata_dict)
+
+    Returns:
+        images, text_tokens, labels, texts, metas
+    """
+    import clip
+    from multi.metadata_template import generate_short_description
+
+    images = torch.stack([item[0] for item in batch])
+    labels = torch.stack([item[1] for item in batch])
+    original_texts = [item[2] for item in batch]
+    metas = [item[3] for item in batch]
+
+    # 使用metadata生成更丰富的文本描述
+    texts = []
+    for i, meta in enumerate(metas):
+        if meta is not None:
+            # 使用metadata_template生成描述
+            text = generate_short_description(meta, style='visual_param')
+        else:
+            # 回退到原始文本
+            text = original_texts[i]
+        texts.append(text)
+
+    # tokenize texts
+    text_tokens = clip.tokenize(texts, truncate=True)
+
+    return images, text_tokens, labels, texts, metas
+
+
 def create_czsl_dataloaders(config):
     """
     创建CZSL数据加载器
@@ -1238,11 +1296,8 @@ def create_czsl_dataloaders(config):
     data_config = config.get("data", {})
     train_config = config.get("train", {})
 
-    # 获取类别信息
+    # 获取类别名称
     class_names = [cls["name"] for cls in config.get("jamming_classes", [])]
-    class_descriptions = {}
-    for cls_info in config.get("jamming_classes", []):
-        class_descriptions[cls_info["name"]] = cls_info["descriptions"]
 
     # 加载数据集
     train_dataset, num_classes, jnr_levels = load_czsl_dataset(config, split='train')
@@ -1252,8 +1307,7 @@ def create_czsl_dataloaders(config):
     # 包装为对比学习数据集
     train_contrastive = CZSLContrastiveDataset(
         base_dataset=train_dataset,
-        class_names=class_names,
-        class_descriptions=class_descriptions
+        class_names=class_names
     )
 
     # 创建数据加载器（使用模块级别的czsl_collate_fn）
@@ -1268,8 +1322,7 @@ def create_czsl_dataloaders(config):
 
     val_contrastive = CZSLContrastiveDataset(
         base_dataset=val_dataset,
-        class_names=class_names,
-        class_descriptions=class_descriptions
+        class_names=class_names
     )
 
     val_loader = DataLoader(
@@ -1283,8 +1336,7 @@ def create_czsl_dataloaders(config):
 
     test_contrastive = CZSLContrastiveDataset(
         base_dataset=test_dataset,
-        class_names=class_names,
-        class_descriptions=class_descriptions
+        class_names=class_names
     )
 
     test_loader = DataLoader(
@@ -1313,11 +1365,8 @@ def create_czsl_dataloaders_with_metadata(config, use_abstract_description=True)
     data_config = config.get("data", {})
     train_config = config.get("train", {})
 
-    # 获取类别信息
+    # 获取类别名称
     class_names = [cls["name"] for cls in config.get("jamming_classes", [])]
-    class_descriptions = {}
-    for cls_info in config.get("jamming_classes", []):
-        class_descriptions[cls_info["name"]] = cls_info["descriptions"]
 
     # JNR范围
     jnr_numbers = range(
@@ -1356,7 +1405,6 @@ def create_czsl_dataloaders_with_metadata(config, use_abstract_description=True)
                 label_file=label_file,
                 metadata_file=metadata_file if os.path.exists(metadata_file) else None,
                 class_names=class_names,
-                class_descriptions=class_descriptions,
                 image_size=data_config.get("image_size", 224),
                 normalize_to_clip=True,
                 channel_mode='real_imag_mag',

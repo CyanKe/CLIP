@@ -16,7 +16,7 @@ import numpy as np
 JAM_TYPE_NAMES = {
     1: 'DFTJ', 2: 'ISRJ', 3: 'RGPO', 4: 'VGPO',
     5: 'AJ', 6: 'BJ', 7: 'SJ', 8: 'NCJ',
-    9: 'NPJ', 10: 'SMSPJ', 11: 'CIJ', 12: 'NFMJ',
+    9: 'NPJ', 10: 'SMSPJ', 11: 'C&IJ', 12: 'NFMJ',
     13: 'NPMJ', 14: 'NAMJ', 15: 'CSJ', 16: 'PJ'
 }
 
@@ -27,7 +27,7 @@ JAM_TYPE_NAMES = {
 # 视觉特征模板：每种干扰类型的STFT图外观描述
 VISUAL_TEMPLATES = {
     1: {  # DFTJ
-        'base': 'diagonal lines in time-frequency domain',
+        'base': 'short slanted lines in time-frequency domain',
         'param': {  # 根据假目标数量
             'few': 'with a few false targets',
             'several': 'with several false targets',
@@ -85,7 +85,7 @@ VISUAL_TEMPLATES = {
             'many': 'with many steep traces'
         }
     },
-    11: {  # CIJ
+    11: {  # C&IJ
         'base': 'interleaved signal segments',
         'param': {
             'continuous': 'in continuous pattern',
@@ -176,7 +176,7 @@ def get_param_key(jam_type: int, jam_params: dict) -> str:
         M = jam_params.get('smspj_M', 5)
         return get_count_level(M)
 
-    elif jam_type == 11:  # CIJ
+    elif jam_type == 11:  # C&IJ
         is_cont = jam_params.get('cij_is_continuous', True)
         return 'continuous' if is_cont else 'discontinuous'
 

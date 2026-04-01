@@ -2,7 +2,7 @@
 测试metadata数据加载完整流程
 
 测试:
-1. 单个欺骗干扰 (DFTJ, ISRJ, RGPO, VGPO, SMSPJ, CIJ, CSJ)
+1. 单个欺骗干扰 (DFTJ, ISRJ, RGPO, VGPO, SMSPJ, C&IJ, CSJ)
 2. 欺骗干扰+AJ组合
 3. 文本描述生成
 """
@@ -22,7 +22,7 @@ from multi.metadata_template import generate_short_description, generate_abstrac
 JAM_TYPE_NAMES = {
     1: 'DFTJ', 2: 'ISRJ', 3: 'RGPO', 4: 'VGPO',
     5: 'AJ', 6: 'BJ', 7: 'SJ', 8: 'NCJ',
-    9: 'NPJ', 10: 'SMSPJ', 11: 'CIJ', 12: 'NFMJ',
+    9: 'NPJ', 10: 'SMSPJ', 11: 'C&IJ', 12: 'NFMJ',
     13: 'NPMJ', 14: 'NAMJ', 15: 'CSJ', 16: 'PJ'
 }
 
@@ -111,7 +111,7 @@ def create_test_metadata_deceptive(num_samples=30):
         metadata[0, idx]['jam_params']['smspj_M'] = M
         idx += 1
 
-    # CIJ (2个样本)
+    # C&IJ (2个样本)
     for a, b in [(2, 3), (4, 4)]:
         metadata[0, idx]['sample_idx'] = idx
         metadata[0, idx]['jam_types'][0] = 11
@@ -187,7 +187,7 @@ def create_test_metadata_deceptive(num_samples=30):
     metadata[0, idx]['jam_params']['aj_BJ'] = 25e6
     idx += 1
 
-    # CIJ+AJ
+    # C&IJ+AJ
     metadata[0, idx]['sample_idx'] = idx
     metadata[0, idx]['jam_types'][0] = 11
     metadata[0, idx]['jam_types'][1] = 5
@@ -242,7 +242,7 @@ def parse_metadata_for_description(meta_struct):
     if params['smspj_M'] > 0:
         jam_params['smspj_M'] = int(params['smspj_M'])
 
-    # CIJ
+    # C&IJ
     if params['cij_a'] > 0:
         jam_params['cij_a'] = int(params['cij_a'])
         jam_params['cij_b'] = int(params['cij_b'])
@@ -367,8 +367,8 @@ def test_deceptive_jamming_descriptions():
         print(f"  M={M}: {text}")
         idx += 1
 
-    # CIJ
-    print("\n【CIJ - 切片交织干扰】")
+    # C&IJ
+    print("\n【C&IJ - 切片交织干扰】")
     for i in range(2):
         stft, label, text, meta = dataset[idx]
         a = meta['jam_params'].get('cij_a', 0)
@@ -423,8 +423,8 @@ def test_deceptive_jamming_descriptions():
     print(f"  {text}")
     idx += 1
 
-    # CIJ+AJ
-    print("\n【CIJ+AJ】")
+    # C&IJ+AJ
+    print("\n【C&IJ+AJ】")
     stft, label, text, meta = dataset[idx]
     print(f"  {text}")
     idx += 1

@@ -1,11 +1,12 @@
 """
 文本编码器模块 - 用于CZSL的文本描述生成与编码
 支持单干扰和组合干扰的文本描述生成
+使用metadata_template生成描述
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Dict, Tuple, Optional
+from typing import List, Tuple, Optional
 from itertools import combinations
 import sys
 import os
@@ -13,18 +14,19 @@ import os
 # 添加CLIP路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import clip
+from multi.metadata_template import JAM_TYPE_NAMES, VISUAL_TEMPLATES
 
 
 class TextEncoder:
     """
     文本编码器
     负责生成文本描述并编码为特征向量
+    使用metadata_template生成描述
     """
 
     def __init__(
         self,
         class_names: List[str],
-        class_descriptions: Dict[str, List[str]],
         clip_model,
         device: str = "cuda"
     ):
@@ -33,12 +35,10 @@ class TextEncoder:
 
         Args:
             class_names: 类别名称列表
-            class_descriptions: 类别描述字典 {class_name: [description1, ...]}
             clip_model: CLIP模型实例
             device: 计算设备
         """
         self.class_names = class_names
-        self.class_descriptions = class_descriptions
         self.clip_model = clip_model
         self.device = device
         self.num_classes = len(class_names)
@@ -48,17 +48,31 @@ class TextEncoder:
         self._all_combination_features = None  # 所有组合特征
         self._all_combination_names = None  # 所有组合名称
 
+    def _get_class_description(self, cls_name: str) -> str:
+        """使用metadata_template生成类别描述"""
+        jam_type = None
+        for k, v in JAM_TYPE_NAMES.items():
+            if v == cls_name:
+                jam_type = k
+                break
+
+        if jam_type:
+            template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name, 'param': {}})
+            return f"{cls_name} looks like {template['base']}"
+        else:
+            return f"a radar signal with {cls_name}"
+
     def build_text_description(
         self,
         label_vector: torch.Tensor,
-        template: str = "a photo of {}"
+        template: str = None
     ) -> str:
         """
         根据标签向量生成文本描述
 
         Args:
             label_vector: [num_classes] 标签向量 (0/1)
-            template: 文本模板
+            template: 已弃用，保留参数兼容性
 
         Returns:
             文本描述字符串
@@ -75,21 +89,12 @@ class TextEncoder:
         active_classes = [self.class_names[i] for i in active_indices]
 
         # 生成描述
-        if len(active_classes) == 1:
-            # 单干扰
-            desc = self.class_descriptions.get(active_classes[0], [active_classes[0]])[0]
-            return desc
-        else:
-            # 组合干扰
-            desc_parts = []
-            for cls in active_classes:
-                cls_desc = self.class_descriptions.get(cls, [cls])[0]
-                # 提取关键部分（去掉"a radar signal with"前缀）
-                if cls_desc.startswith("a radar signal with "):
-                    cls_desc = cls_desc[len("a radar signal with "):]
-                desc_parts.append(cls_desc)
+        descs = [self._get_class_description(cls) for cls in active_classes]
 
-            return f"a radar signal with {' and '.join(desc_parts)}"
+        if len(descs) == 1:
+            return descs[0]
+        else:
+            return ', '.join(descs)
 
     def build_all_combination_descriptions(
         self,
@@ -113,7 +118,7 @@ class TextEncoder:
         # 单干扰
         if include_single:
             for i, cls_name in enumerate(self.class_names):
-                desc = self.class_descriptions.get(cls_name, [cls_name])[0]
+                desc = self._get_class_description(cls_name)
                 descriptions.append(desc)
                 comb_indices.append([i])
 
@@ -121,17 +126,9 @@ class TextEncoder:
         if max_combination_size >= 2:
             for i, j in combinations(range(self.num_classes), 2):
                 cls1, cls2 = self.class_names[i], self.class_names[j]
-
-                # 获取描述并提取关键部分
-                desc1 = self.class_descriptions.get(cls1, [cls1])[0]
-                desc2 = self.class_descriptions.get(cls2, [cls2])[0]
-
-                if desc1.startswith("a radar signal with "):
-                    desc1 = desc1[len("a radar signal with "):]
-                if desc2.startswith("a radar signal with "):
-                    desc2 = desc2[len("a radar signal with "):]
-
-                combined_desc = f"a radar signal with {desc1} and {desc2}"
+                desc1 = self._get_class_description(cls1)
+                desc2 = self._get_class_description(cls2)
+                combined_desc = f"{desc1}, {desc2}"
                 descriptions.append(combined_desc)
                 comb_indices.append([i, j])
 
@@ -169,11 +166,7 @@ class TextEncoder:
         """
         缓存所有单类别的文本特征
         """
-        descriptions = []
-        for cls_name in self.class_names:
-            desc = self.class_descriptions.get(cls_name, [cls_name])[0]
-            descriptions.append(desc)
-
+        descriptions = [self._get_class_description(cls) for cls in self.class_names]
         self._single_class_features = self.encode_texts(descriptions)
         print(f"Cached text features for {len(self.class_names)} single classes")
 
@@ -359,17 +352,10 @@ def create_text_encoder(
     Returns:
         TextEncoder实例
     """
-    class_names = []
-    class_descriptions = {}
-
-    for cls_info in config.get("jamming_classes", []):
-        name = cls_info["name"]
-        class_names.append(name)
-        class_descriptions[name] = cls_info["descriptions"]
+    class_names = [cls_info["name"] for cls_info in config.get("jamming_classes", [])]
 
     return TextEncoder(
         class_names=class_names,
-        class_descriptions=class_descriptions,
         clip_model=clip_model,
         device=device
     )
@@ -414,9 +400,6 @@ if __name__ == "__main__":
 
     # 提取类别信息
     class_names = [cls["name"] for cls in config.get("jamming_classes", [])]
-    class_descriptions = {}
-    for cls_info in config.get("jamming_classes", []):
-        class_descriptions[cls_info["name"]] = cls_info["descriptions"]
 
     print(f"Found {len(class_names)} jamming classes:")
     for i, name in enumerate(class_names):
@@ -424,24 +407,30 @@ if __name__ == "__main__":
 
     # 测试文本描述生成
     print("\n" + "-" * 40)
-    print("Testing text description generation...")
+    print("Testing text description generation with metadata_template...")
 
     # 创建一个模拟的标签向量
     label_vector = torch.zeros(len(class_names))
     label_vector[0] = 1  # DFTJ
     label_vector[1] = 1  # ISRJ
 
-    # 手动构建描述
+    # 使用metadata_template构建描述
     active = [class_names[i] for i in torch.where(label_vector == 1)[0].tolist()]
-    desc1 = class_descriptions.get(active[0], [active[0]])[0]
-    desc2 = class_descriptions.get(active[1], [active[1]])[0]
-    if desc1.startswith("a radar signal with "):
-        desc1 = desc1[len("a radar signal with "):]
-    if desc2.startswith("a radar signal with "):
-        desc2 = desc2[len("a radar signal with "):]
+    descs = []
+    for cls_name in active:
+        jam_type = None
+        for k, v in JAM_TYPE_NAMES.items():
+            if v == cls_name:
+                jam_type = k
+                break
+        if jam_type:
+            template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name, 'param': {}})
+            descs.append(f"{cls_name} looks like {template['base']}")
+        else:
+            descs.append(f"a radar signal with {cls_name}")
 
     print(f"Label: {active}")
-    print(f"Description: a radar signal with {desc1} and {desc2}")
+    print(f"Description: {', '.join(descs)}")
 
     # 测试所有组合
     print("\n" + "-" * 40)
@@ -454,7 +443,18 @@ if __name__ == "__main__":
     # 显示前几个组合
     print("\nFirst 5 single-class descriptions:")
     for i in range(min(5, len(class_names))):
-        print(f"  {i}: {class_descriptions[class_names[i]][0]}")
+        cls_name = class_names[i]
+        jam_type = None
+        for k, v in JAM_TYPE_NAMES.items():
+            if v == cls_name:
+                jam_type = k
+                break
+        if jam_type:
+            template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name, 'param': {}})
+            desc = f"{cls_name} looks like {template['base']}"
+        else:
+            desc = f"a radar signal with {cls_name}"
+        print(f"  {i}: {desc}")
 
     print("\nFirst 5 pair combinations:")
     count = 0
