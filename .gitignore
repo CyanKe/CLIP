@@ -8,3 +8,9 @@ __pycache__/
 thumbs.db
 .DS_Store
 .idea
+
+# W&B Cache and logs
+wandb/
+.wandb/
+**/wandb/
+**/wandb/
