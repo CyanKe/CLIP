@@ -14,3 +14,5 @@ wandb/
 .wandb/
 **/wandb/
 **/wandb/
+*.pt
+.claude

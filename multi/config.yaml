@@ -1,0 +1,259 @@
+# ============================================================================
+# 组合零样本学习配置文件
+# ============================================================================
+
+# CLIP模型配置
+model:
+  clip_model: "ViT-B/32"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14
+  freeze_vision: false           # 冻结视觉编码器（避免FP16梯度问题）
+  freeze_text: true             # 是否冻结文本编码器
+  vision_layers_unfreeze: 2     # 不解冻视觉编码器
+
+# 训练配置
+train:
+  batch_size: 16
+  epochs: 5
+  lr: 0.00001                     # 1e-5
+  weight_decay: 0.01
+  warmup_epochs: 2
+  threshold: 0.5                  # 多标签预测阈值
+
+  # 学习率调度
+  scheduler:
+    type: "cosine"                # cosine, linear, constant
+    min_lr: 0.0000001             # 1e-7
+
+  # 混合精度训练（CLIP内部已使用FP16，建议关闭）
+  use_amp: false
+
+  # 梯度裁剪
+  grad_clip: 1.0
+
+# 损失函数配置
+loss:
+  type: "czsl_contrastive"     # czsl_contrastive, infonce, multilabel_infonce, asymmetric, bce
+  temperature: 0.07            # 对比损失温度参数
+  label_smoothing: 0.0         # 标签平滑
+  contrastive_weight: 1.0      # 对比损失权重
+  classification_weight: 0.0   # 分类损失权重（0表示纯对比学习）
+  learnable_temperature: true  # 是否学习温度参数
+
+# 数据配置
+data:
+  base_path: "D:/VScode/Jamming_signal_simulation/NXT_Gen/output/260331"
+  jnr_start: 10
+  jnr_end: 10
+  jnr_step: 1
+  num_workers: 4
+  pin_memory: true
+
+  # 图像预处理
+  image_size: 224                # CLIP输入分辨率
+
+# ============================================================================
+# 日志配置
+# ============================================================================
+logging:
+  type: "wandb"                  # wandb, console, tensorboard
+  name: "CLIP_CZSL_Jamming"
+
+  # WandB配置
+  wandb:
+    project: "CLIP-CZSL-Jamming"
+    entity: "cyanke9142-xidian-university"
+    tags: ["CLIP", "CZSL", "Multi-label", "Jamming"]
+    notes: "CLIP fine-tuning for Compositional Zero-Shot Learning on Radar Jamming Signals"
+
+  # TensorBoard配置
+  tensorboard:
+    log_dir: "runs/clip_czsl"
+
+# 评估配置
+evaluation:
+  threshold: 0.5
+  save_predictions: true
+  visualize_embeddings: true
+
+# 保存配置
+checkpoint:
+  save_dir: "checkpoints"
+  save_best_only: false  # 保存所有epoch的检查点，便于调试
+  monitor: "val_f1"             # 监控指标
+  mode: "max"                    # max or min
+
+# 干扰类型定义 (用于文本描述)
+jamming_classes:
+  - name: "DFTJ"
+    descriptions:
+      - "a radar signal with dense false target jamming"
+      - "a radar echo with multiple delayed and stacked false targets"
+      - "a radar signal intercepted, delayed and retransmitted many times to create false targets"
+  - name: "ISRJ"
+    descriptions:
+      - "a radar signal with interrupted sampling repeater jamming"
+      - "a radar echo with periodic sampled and forwarded interference"
+      - "a radar signal with interference sampling and immediate forwarding jamming"
+  - name: "VGPO"
+    descriptions:
+      - "a radar signal with velocity deception jamming"
+      - "a radar echo with false Doppler frequency modulation"
+      - "a radar signal with velocity drag deception interference"
+  - name: "RGPO"
+    descriptions:
+      - "a radar signal with distance and velocity joint deception jamming"
+      - "a radar echo with combined range and Doppler deception"
+      - "a radar signal with simultaneous range-velocity deception interference"
+  - name: "AJ"
+    descriptions:
+      - "a radar signal with aiming suppression jamming"
+      - "a radar echo with frequency-aligned narrowband jamming"
+      - "a radar signal with targeted frequency coverage jamming"
+  - name: "BJ"
+    descriptions:
+      - "a radar signal with barrage suppression jamming"
+      - "a radar echo with wideband barrage interference"
+      - "a radar signal with broadband noise covering multiple frequencies"
+  - name: "SJ"
+    descriptions:
+      - "a radar signal with swept frequency jamming"
+      - "a radar echo with periodically varying center frequency interference"
+      - "a radar signal with sweeping carrier frequency jamming"
+  - name: "NCJ"
+    descriptions:
+      - "a radar signal with noise convolution jamming"
+      - "a radar echo with convolved gaussian noise interference"
+      - "a radar signal with noise convolution smart jamming"
+  - name: "NPJ"
+    descriptions:
+      - "a radar signal with noise multiplication jamming"
+      - "a radar echo with multiplied gaussian noise interference"
+      - "a radar signal with noise product smart jamming"
+  - name: "SPSMJ"
+    descriptions:
+      - "a radar signal with smeared spectrum jamming"
+      - "a radar echo with spread spectrum interference from sub-pulses"
+      - "a radar signal with interval-sampled and compressed sub-pulse jamming"
+  - name: "C&IJ"
+    descriptions:
+      - "a radar signal with chopping and interleaved jamming"
+      - "a radar echo with sliced and reconstructed interference"
+      - "a radar signal with time-sliced and repeatedly filled jamming"
+  - name: "NFMJ"
+    descriptions:
+      - "a radar signal with noise frequency modulation jamming"
+      - "a radar echo with instantaneous frequency modulated by noise"
+      - "a radar signal with noise-modulated instantaneous frequency"
+  - name: "NPMJ"
+    descriptions:
+      - "a radar signal with noise phase modulation jamming"
+      - "a radar echo with instantaneous phase modulated by noise"
+      - "a radar signal with noise-modulated instantaneous phase"
+  - name: "NAMJ"
+    descriptions:
+      - "a radar signal with noise amplitude modulation jamming"
+      - "a radar echo with amplitude modulated by gaussian noise"
+      - "a radar signal with noise-modulated signal amplitude"
+  - name: "CSJ"
+    descriptions:
+      - "a radar signal with comb spectrum jamming"
+      - "a radar echo with comb-shaped frequency distribution"
+      - "a radar signal with multiple false targets from multi-frequency modulation"
+  - name: "PJ"
+    descriptions:
+      - "a radar signal with pulse jamming"
+      - "a radar echo with rectangular pulse interference on carrier"
+      - "a radar signal with repetitive high-frequency pulse jamming"
+
+# ============================================================================
+# CZSL 配置 - 组合零样本学习
+# czsl.seen_combinations: 训练时可见的组合
+# czsl.unseen_combinations: 仅测试时评估的零样本组合
+# loss.type: "czsl_contrastive": 使用对比损失
+# ============================================================================
+czsl:
+  # Seen/Unseen 组合划分
+  # 格式: [类别名] 或 [类别名1, 类别名2] 表示组合
+
+  # 已见组合（用于训练）
+  # 默认：所有单干扰类型都是seen
+  # 可以添加部分两两组合作为seen
+  seen_combinations:
+    # 单干扰类型（全部为seen）
+    - ["DFTJ"]
+    - ["ISRJ"]
+    - ["SPSMJ"]
+    - ["AJ"]
+    - ["BJ"]
+    - ["SJ"]
+    - ["NCJ"]
+    - ["NPJ"]
+    - ["C&IJ"]
+    - ["NFMJ"]
+    - ["NPMJ"]
+    - ["NAMJ"]
+    - ["CSJ"]
+    - ["PJ"]
+    - ["VGPO"]
+    - ["RGPO"]
+    - ["DFTJ", "AJ"]
+    - ["ISRJ", "AJ"]
+
+  # 合作为seen（训练时可见）
+  # 未见组合（用于零样本测试）
+  # 这些组合在训练时不出现，但测试时需要识别
+  unseen_combinations:
+    - ["RGPO", "AJ"]
+    - ["VGPO", "AJ"]
+    - ["SMSPJ", "AJ"]
+  # - ["DFTJ", "BJ"]
+  # - ["DFTJ", "SJ"]
+
+  # - ["ISRJ", "BJ"]
+  # - ["ISRJ", "SJ"]
+  # - ["SPSMJ", "AJ"]
+  # - ["SPSMJ", "BJ"]
+  # - ["SPSMJ", "SJ"]
+
+    # # 部分两两组
+    # - ["DFTJ", "ISRJ"]
+    # - ["VDJ", "DDJ"]
+    # - ["AJ", "BJ"]
+    # - ["SJ", "NCJ"]
+    # - ["NPJ", "SPSMJ"]
+    # - ["C&IJ", "NFMJ"]
+    # - ["NPMJ", "NAMJ"]
+    # - ["CSJ", "PJ"]
+    # - ["DFTJ", "VDJ"]
+    # - ["ISRJ", "DDJ"]
+    # - ["AJ", "SJ"]
+    # - ["BJ", "NCJ"]
+    # - ["NPJ", "C&IJ"]
+    # - ["SPSMJ", "NFMJ"]
+    # - ["NPMJ", "CSJ"]
+    # - ["NAMJ", "PJ"]
+    # - ["DFTJ", "NFMJ"]      # Dense False Target + Noise FM
+    # - ["ISRJ", "NPMJ"]      # Interrupted Sampling + Noise PM
+    # - ["VDJ", "NPJ"]        # Velocity Deception + Noise Product
+    # - ["DDJ", "NCJ"]        # Distance-Velocity Deception + Noise Convolution
+    # - ["AJ", "CSJ"]         # Aiming + Comb Spectrum
+    # - ["BJ", "PJ"]          # Barrage + Pulse
+    # - ["SJ", "NAMJ"]        # Swept Frequency + Noise AM
+    # - ["SPSMJ", "C&IJ"]     # Smeared Spectrum + Chopping Interleaved（与seen重复，换一组）
+    # - ["DFTJ", "CSJ"]       # Dense False Target + Comb Spectrum
+    # - ["ISRJ", "PJ"]        # Interrupted Sampling + Pulse
+    # - ["VDJ", "NAMJ"]       # Velocity Deception + Noise AM
+    # - ["DDJ", "NFMJ"]       # Distance-Velocity Deception + Noise FM
+    # - ["AJ", "NPMJ"]        # Aiming + Noise PM
+    # - ["BJ", "NPJ"]         # Barrage + Noise Product
+    # - ["SJ", "NCJ"]         # Swept Frequency + Noise Convolution
+    # - ["SPSMJ", "CSJ"]      # Smeared Spectrum + Comb Spectrum
+
+  # 数据划分参数
+  unseen_ratio: 0.2          # 自动划分时unseen比例
+  split_seed: 42             # 划分随机种子
+
+  # 零样本推理配置
+  zero_shot:
+    use_combinations: true   # 是否使用组合特征
+    max_combination_size: 2  # 最大组合大小
+    threshold: 0.5           # 多标签预测阈值
