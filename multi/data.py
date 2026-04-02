@@ -790,24 +790,88 @@ class CZSLSTFTDatasetWithMetadata(Dataset):
         # 用于缓存的文件句柄
         self._h5_files = None
         self._metadata = None
+        self._metadata_fields = []  # 字段名称列表 (HDF5格式)
+        self._metadata_list = []    # 样本列表 (JSON格式)
+        self._metadata_num_samples = 0
 
         # 加载metadata（如果存在）
         if metadata_file and os.path.exists(metadata_file):
             self._load_metadata(metadata_file)
 
     def _load_metadata(self, metadata_file):
-        """加载metadata文件"""
+        """加载metadata文件（支持JSON和MATLAB v7.3 HDF5格式）"""
+        # 检查文件扩展名
+        if metadata_file.endswith('.json'):
+            self._load_metadata_json(metadata_file)
+        else:
+            self._load_metadata_matlab(metadata_file)
+
+    def _load_metadata_json(self, metadata_file):
+        """加载JSON格式的metadata文件"""
+        import json
         try:
-            import scipy.io as sio
-            data = sio.loadmat(metadata_file)
-            if self.metadata_var_name in data:
-                self._metadata = data[self.metadata_var_name]
-                print(f"Loaded metadata from {metadata_file}")
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                # JSON格式：直接是样本列表 [{...}, {...}, ...]
+                self._metadata_list = json.load(f)
+
+            if isinstance(self._metadata_list, list):
+                self._metadata_num_samples = len(self._metadata_list)
+                self._metadata = 'json_list'  # 标记为JSON列表格式
+                print(f"Loaded metadata from {metadata_file} (JSON format, {self._metadata_num_samples} samples)")
             else:
-                print(f"Warning: {self.metadata_var_name} not found in {metadata_file}")
+                print(f"Warning: JSON metadata should be a list, got {type(self._metadata_list)}")
+                self._metadata = None
+
         except Exception as e:
-            print(f"Warning: Failed to load metadata: {e}")
+            print(f"Warning: Failed to load JSON metadata: {e}")
             self._metadata = None
+
+    def _load_metadata_matlab(self, metadata_file):
+        """加载MATLAB格式的metadata文件"""
+        try:
+            import h5py
+            with h5py.File(metadata_file, 'r') as f:
+                if self.metadata_var_name not in f:
+                    print(f"Warning: {self.metadata_var_name} not found in {metadata_file}")
+                    self._metadata = None
+                    return
+
+                meta_group = f[self.metadata_var_name]
+
+                # MATLAB v7.3 struct数组存储为HDF5 Group
+                # 每个字段是一个独立的Dataset
+                if isinstance(meta_group, h5py.Group):
+                    # 只存储字段名称和形状信息，不读取实际数据
+                    # 因为HDF5引用需要保持文件打开才能有效
+                    self._metadata_fields = list(meta_group.keys())
+                    print(f"Metadata fields found: {self._metadata_fields}")
+
+                    # 检测样本数量（从第一个字段获取形状）
+                    first_field = meta_group[self._metadata_fields[0]]
+                    self._metadata_num_samples = first_field.shape[0]
+
+                    print(f"Loaded metadata from {metadata_file} (HDF5 Group format, {self._metadata_num_samples} samples)")
+                    self._metadata = 'hdf5_group'  # 标记为HDF5 Group格式
+                else:
+                    # 直接是Dataset（旧格式）
+                    self._metadata = meta_group[:]
+                    print(f"Loaded metadata from {metadata_file} (HDF5 Dataset format)")
+
+        except Exception as e:
+            print(f"HDF5 loading failed: {e}")
+            # 如果h5py失败，尝试scipy.io（支持旧版MATLAB格式）
+            try:
+                import scipy.io as sio
+                data = sio.loadmat(metadata_file)
+                if self.metadata_var_name in data:
+                    self._metadata = data[self.metadata_var_name]
+                    print(f"Loaded metadata from {metadata_file} (MATLAB format)")
+                else:
+                    print(f"Warning: {self.metadata_var_name} not found in {metadata_file}")
+                    self._metadata = None
+            except Exception as e2:
+                print(f"Warning: Failed to load metadata: {e2}")
+                self._metadata = None
 
     def _lazy_load(self):
         """延迟加载h5文件"""
@@ -816,18 +880,129 @@ class CZSLSTFTDatasetWithMetadata(Dataset):
                 'stft': h5py.File(self.stft_file, 'r'),
                 'label': h5py.File(self.label_file, 'r')
             }
+            # 如果metadata文件存在且是HDF5 Group格式，也加载它
+            if self._metadata == 'hdf5_group' and self.metadata_file:
+                self._h5_files['meta'] = h5py.File(self.metadata_file, 'r')
         return self._h5_files
 
     def __len__(self):
         return self.num_samples
 
     def _parse_metadata(self, index):
-        """解析metadata结构为Python字典"""
+        """解析metadata结构为Python字典（支持JSON和MATLAB v7.3 HDF5格式）"""
         if self._metadata is None:
             return None
 
         try:
-            # MATLAB struct数组索引方式
+            # JSON列表格式（推荐）
+            if self._metadata == 'json_list':
+                if index < len(self._metadata_list):
+                    meta = self._metadata_list[index]
+                    # 直接返回，JSON已经是Python字典格式
+                    # 确保jam_types是列表
+                    if isinstance(meta.get('jam_types'), int):
+                        meta['jam_types'] = [meta['jam_types']]
+                    return meta
+                return None
+
+            # HDF5 Group格式（MATLAB v7.3）
+            if self._metadata == 'hdf5_group':
+                metadata_dict = {}
+
+                # 获取metadata h5文件句柄
+                h5_files = self._lazy_load()
+                h5_meta = h5_files.get('meta')
+                if h5_meta is None:
+                    return None
+
+                # 获取metadata group
+                meta_group = h5_meta[self.metadata_var_name]
+                fields = self._metadata_fields  # 现在是字段名称列表
+
+                # MATLAB v7.3格式：每个字段是cell array，元素是HDF5 object reference
+                # 需要解引用来获取实际数据
+
+                # sample_idx
+                if 'sample_idx' in fields:
+                    field_data = meta_group['sample_idx']
+                    ref = field_data[index, 0]
+                    if isinstance(ref, h5py.h5r.Reference):
+                        target = h5_meta[ref]
+                        metadata_dict['sample_idx'] = int(target[0, 0])
+                    else:
+                        metadata_dict['sample_idx'] = int(ref)
+
+                # jam_types
+                if 'jam_types' in fields:
+                    field_data = meta_group['jam_types']
+                    ref = field_data[index, 0]
+                    if isinstance(ref, h5py.h5r.Reference):
+                        target = h5_meta[ref]
+                        # target可能是单个数值或数组
+                        data = target[:]
+                        if data.ndim == 2 and data.shape == (1, 1):
+                            metadata_dict['jam_types'] = [int(data[0, 0])] if data[0, 0] > 0 else []
+                        else:
+                            # 多个干扰类型
+                            jam_types_flat = data.flatten()
+                            metadata_dict['jam_types'] = [int(j) for j in jam_types_flat if j > 0]
+                    else:
+                        metadata_dict['jam_types'] = [int(ref)] if ref > 0 else []
+
+                # JNR
+                if 'JNR' in fields:
+                    field_data = meta_group['JNR']
+                    ref = field_data[index, 0]
+                    if isinstance(ref, h5py.h5r.Reference):
+                        target = h5_meta[ref]
+                        metadata_dict['JNR'] = float(target[0, 0])
+                    else:
+                        metadata_dict['JNR'] = float(ref)
+
+                # pos
+                if 'pos' in fields:
+                    field_data = meta_group['pos']
+                    ref = field_data[index, 0]
+                    if isinstance(ref, h5py.h5r.Reference):
+                        target = h5_meta[ref]
+                        metadata_dict['pos'] = int(target[0, 0]) if target.size > 0 else 0
+                    else:
+                        metadata_dict['pos'] = int(ref) if ref else 0
+
+                # jam_params - 可能是Group或Dataset
+                metadata_dict['jam_params'] = {}
+                if 'jam_params' in fields:
+                    field_data = meta_group['jam_params']
+                    ref = field_data[index, 0]
+                    if isinstance(ref, h5py.h5r.Reference):
+                        target = h5_meta[ref]
+                        if isinstance(target, h5py.Group):
+                            # Group包含各个参数字段
+                            for param_name in target.keys():
+                                param_data = target[param_name][:]
+                                if param_data.size == 1:
+                                    val = param_data.item()
+                                    # 处理bytes类型
+                                    if isinstance(val, bytes):
+                                        metadata_dict['jam_params'][param_name] = val.decode('utf-8')
+                                    else:
+                                        metadata_dict['jam_params'][param_name] = val
+                                else:
+                                    metadata_dict['jam_params'][param_name] = param_data.tolist()
+                        elif isinstance(target, h5py.Dataset):
+                            # Dataset可能是struct
+                            if target.dtype.names:
+                                for field in target.dtype.names:
+                                    val = target[field][0, 0]
+                                    metadata_dict['jam_params'][field] = val.item() if hasattr(val, 'item') else float(val)
+                            else:
+                                param_data = target[:]
+                                if param_data.size == 1:
+                                    metadata_dict['jam_params']['value'] = param_data.item()
+
+                return metadata_dict
+
+            # MATLAB struct数组格式（旧格式）
             meta_struct = self._metadata[0, index]
 
             # 提取字段
@@ -1063,6 +1238,8 @@ class CZSLSTFTDatasetWithMetadata(Dataset):
         if self._h5_files is not None:
             self._h5_files['stft'].close()
             self._h5_files['label'].close()
+            if 'meta' in self._h5_files:
+                self._h5_files['meta'].close()
             self._h5_files = None
 
     def __del__(self):
@@ -1378,14 +1555,14 @@ def create_czsl_dataloaders_with_metadata(config, use_abstract_description=True)
 
     # split文件映射
     split_files = {
-        'train': ('train_echo_stfts.mat', 'train_echo_label.mat', 'train_echo_metadata.mat'),
-        'val': ('val_echo_stfts.mat', 'val_echo_label.mat', 'val_echo_metadata.mat'),
-        'test': ('test_echo_stfts.mat', 'test_echo_label.mat', 'test_echo_metadata.mat')
+        'train': ('train_echo_stfts.mat', 'train_echo_label.mat', 'train_echo_metadata'),
+        'val': ('val_echo_stfts.mat', 'val_echo_label.mat', 'val_echo_metadata'),
+        'test': ('test_echo_stfts.mat', 'test_echo_label.mat', 'test_echo_metadata')
     }
 
     # 加载数据集
     def load_split(split):
-        stft_name, label_name, metadata_name = split_files[split]
+        stft_name, label_name, metadata_base = split_files[split]
         all_datasets = []
 
         for jnr in jnr_levels:
@@ -1394,7 +1571,17 @@ def create_czsl_dataloaders_with_metadata(config, use_abstract_description=True)
 
             stft_file = os.path.join(data_folder_path, stft_name)
             label_file = os.path.join(data_folder_path, label_name)
-            metadata_file = os.path.join(data_folder_path, metadata_name)
+
+            # 优先使用JSON格式metadata，回退到MAT格式
+            metadata_file_json = os.path.join(data_folder_path, metadata_base + '.json')
+            metadata_file_mat = os.path.join(data_folder_path, metadata_base + '.mat')
+
+            if os.path.exists(metadata_file_json):
+                metadata_file = metadata_file_json
+            elif os.path.exists(metadata_file_mat):
+                metadata_file = metadata_file_mat
+            else:
+                metadata_file = None
 
             if not (os.path.exists(stft_file) and os.path.exists(label_file)):
                 continue
@@ -1423,23 +1610,14 @@ def create_czsl_dataloaders_with_metadata(config, use_abstract_description=True)
 
     num_classes = 16  # 默认16类
 
-    # 自定义collate函数处理metadata
-    def metadata_collate_fn(batch):
-        """处理包含metadata字典的batch"""
-        stfts = torch.stack([item[0] for item in batch])
-        labels = torch.stack([item[1] for item in batch])
-        texts = [item[2] for item in batch]
-        metas = [item[3] for item in batch]
-        return stfts, labels, texts, metas
-
-    # 创建数据加载器
+    # 创建数据加载器（使用模块级别的czsl_metadata_collate_fn）
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_config.get("batch_size", 32),
         shuffle=True,
         num_workers=data_config.get("num_workers", 4),
         pin_memory=data_config.get("pin_memory", True),
-        collate_fn=metadata_collate_fn
+        collate_fn=czsl_metadata_collate_fn
     )
 
     val_loader = DataLoader(
@@ -1448,7 +1626,7 @@ def create_czsl_dataloaders_with_metadata(config, use_abstract_description=True)
         shuffle=False,
         num_workers=data_config.get("num_workers", 4),
         pin_memory=data_config.get("pin_memory", True),
-        collate_fn=metadata_collate_fn
+        collate_fn=czsl_metadata_collate_fn
     )
 
     test_loader = DataLoader(
@@ -1457,7 +1635,7 @@ def create_czsl_dataloaders_with_metadata(config, use_abstract_description=True)
         shuffle=False,
         num_workers=data_config.get("num_workers", 4),
         pin_memory=data_config.get("pin_memory", True),
-        collate_fn=metadata_collate_fn
+        collate_fn=czsl_metadata_collate_fn
     )
 
     return train_loader, val_loader, test_loader, num_classes

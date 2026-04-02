@@ -57,17 +57,32 @@ VISUAL_TEMPLATES = {
             'down': 'with decreasing frequency shift'
         }
     },
+    # === 扩展: AJ 带宽描述 ===
     5: {  # AJ - 瞄准干扰
-        'base': 'a narrow horizontal noise band in the middle',
-        'param': {}
+        'base': 'a horizontal noise band in the middle',
+        'param': {
+            'narrow': 'with narrow bandwidth',      # < 30 MHz
+            'moderate': 'with moderate bandwidth',  # 30-80 MHz
+            'wide': 'with wide bandwidth'           # > 80 MHz
+        }
     },
+    # === 扩展: BJ 带宽描述 ===
     6: {  # BJ - 阻塞干扰
         'base': 'a wide horizontal noise band in the middle',
-        'param': {}
+        'param': {
+            'narrow': 'with narrow bandwidth',
+            'moderate': 'with moderate bandwidth',
+            'wide': 'with wide bandwidth'
+        }
     },
+    # === 扩展: SJ 带宽描述 ===
     7: {  # SJ - 扫频干扰
-        'base': 'multiple diagonal narrow interference bands',
-        'param': {}
+        'base': 'multiple diagonal interference bands',
+        'param': {
+            'narrow': 'with narrow bandwidth',
+            'moderate': 'with moderate bandwidth',
+            'wide': 'with wide bandwidth'
+        }
     },
     8: {  # NCJ - 噪声卷积干扰
         'base': 'a vertical narrow noise band with higher energy in the middle',
@@ -77,12 +92,24 @@ VISUAL_TEMPLATES = {
         'base': 'a vertical narrow noise band with uniform energy',
         'param': {}
     },
+    # === 扩展: SMSPJ 数量+斜率组合描述 ===
     10: {  # SMSPJ
         'base': 'steep diagonal lines',
         'param': {
+            # 数量描述
             'few': 'with a few steep traces',
             'several': 'with several steep traces',
-            'many': 'with many steep traces'
+            'many': 'with many steep traces',
+            # 数量+斜率组合 (优先匹配更具体的描述)
+            'few_gentle': 'with a few gently sloping traces',
+            'few_moderate': 'with a few moderately sloping traces',
+            'few_steep': 'with a few steeply sloping traces',
+            'several_gentle': 'with several gently sloping traces',
+            'several_moderate': 'with several moderately sloping traces',
+            'several_steep': 'with several steeply sloping traces',
+            'many_gentle': 'with many gently sloping traces',
+            'many_moderate': 'with many moderately sloping traces',
+            'many_steep': 'with many steeply sloping traces'
         }
     },
     11: {  # C&IJ
@@ -92,24 +119,51 @@ VISUAL_TEMPLATES = {
             'discontinuous': 'in discontinuous pattern'
         }
     },
+    # === 扩展: NFMJ 带宽描述 ===
     12: {  # NFMJ - 噪声调频干扰
         'base': 'gradual energy decay from center without clear boundary',
-        'param': {}
+        'param': {
+            'narrow': 'with narrow bandwidth',
+            'moderate': 'with moderate bandwidth',
+            'wide': 'with wide bandwidth'
+        }
     },
+    # === 扩展: NPMJ 带宽描述 ===
     13: {  # NPMJ - 噪声调相干扰
         'base': 'a jittering horizontal high energy band in the middle',
-        'param': {}
+        'param': {
+            'narrow': 'with narrow bandwidth',
+            'moderate': 'with moderate bandwidth',
+            'wide': 'with wide bandwidth'
+        }
     },
+    # === 扩展: NAMJ 带宽描述 ===
     14: {  # NAMJ - 噪声调幅干扰
         'base': 'a flat horizontal high energy band with surrounding noise',
-        'param': {}
+        'param': {
+            'narrow': 'with narrow bandwidth',
+            'moderate': 'with moderate bandwidth',
+            'wide': 'with wide bandwidth'
+        }
     },
+    # === 扩展: CSJ 数量+梳齿组合描述 ===
     15: {  # CSJ
         'base': 'comb-like diagonal lines',
         'param': {
+            # 数量描述 (当没有梳齿数时)
             'few': 'with a few comb teeth',
             'several': 'with several comb teeth',
-            'many': 'with many comb teeth'
+            'many': 'with many comb teeth',
+            # 数量+梳齿组合 (所有可能的组合)
+            'few_fewteeth': 'with sparse comb structure',
+            'few_severalteeth': 'with sparse-moderate comb structure',
+            'few_manyteeth': 'with sparse-dense comb structure',
+            'several_fewteeth': 'with moderate-sparse comb structure',
+            'several_severalteeth': 'with moderate comb structure',
+            'several_manyteeth': 'with moderate-dense comb structure',
+            'many_fewteeth': 'with dense-sparse comb structure',
+            'many_severalteeth': 'with dense-moderate comb structure',
+            'many_manyteeth': 'with dense comb structure'
         }
     },
     16: {  # PJ - 脉冲干扰
@@ -144,45 +198,170 @@ def get_count_level(count: int) -> str:
         return 'many'
 
 
+def get_bandwidth_level(bandwidth_hz: float) -> str:
+    """
+    获取带宽等级
+
+    Args:
+        bandwidth_hz: 带宽（Hz）
+
+    Returns:
+        带宽等级: 'narrow', 'moderate', 'wide'
+
+    >>> 根据实际数据分布，可能需要调整阈值 <<<
+    """
+    bandwidth_mhz = bandwidth_hz / 1e6  # 转换为MHz
+    if bandwidth_mhz < 25:
+        return 'narrow'
+    elif bandwidth_mhz < 45:
+        return 'moderate'
+    else:
+        return 'wide'
+
+
+def get_speed_level(speed: float) -> str:
+    """
+    获取拖引速度等级
+
+    Args:
+        speed: 速度参数值
+
+    Returns:
+        速度等级: 'slow', 'moderate', 'fast'
+
+    >>> 阈值需要根据实际参数范围调整 <<<
+    """
+    if speed < 0.5:
+        return 'slow'
+    elif speed < 1.5:
+        return 'moderate'
+    else:
+        return 'fast'
+
+
+def get_slope_level(slope_factor: float) -> str:
+    """
+    获取斜率等级
+
+    Args:
+        slope_factor: 斜率因子
+
+    Returns:
+        斜率等级: 'gentle', 'moderate', 'steep'
+
+    >>> 阈值需要根据实际参数范围调整 <<<
+    """
+    if slope_factor < 0.5:
+        return 'gentle'
+    elif slope_factor < 1.0:
+        return 'moderate'
+    else:
+        return 'steep'
+
+
 def get_param_key(jam_type: int, jam_params: dict) -> str:
     """根据干扰类型和参数获取对应的param key"""
     if jam_type == 1:  # DFTJ
-        k = jam_params.get('dftj_k', 5)
-        return get_count_level(k)
+        k = jam_params.get('dftj_k')
+        if k is not None:
+            return get_count_level(k)
+        return ''
 
     elif jam_type == 2:  # ISRJ
-        M = jam_params.get('isrj_M', 3)
-        if M <= 2:
-            return 'simple'
-        elif M <= 3:
-            return 'moderate'
-        else:
-            return 'complex'
+        M = jam_params.get('isrj_M')
+        if M is not None:
+            if M <= 2:
+                return 'simple'
+            elif M <= 3:
+                return 'moderate'
+            else:
+                return 'complex'
+        return ''
 
     elif jam_type == 3:  # RGPO
-        pos_rel = jam_params.get('rgpo_position_relation', 'after')
-        # 处理可能的bytes类型
-        if isinstance(pos_rel, bytes):
-            pos_rel = pos_rel.decode('utf-8')
-        return pos_rel
+        pos_rel = jam_params.get('rgpo_position_relation')
+        if pos_rel:
+            if isinstance(pos_rel, bytes):
+                pos_rel = pos_rel.decode('utf-8')
+            return pos_rel
+        return ''
 
     elif jam_type == 4:  # VGPO
-        dop_dir = jam_params.get('vgpo_doppler_direction', 'up')
-        if isinstance(dop_dir, bytes):
-            dop_dir = dop_dir.decode('utf-8')
-        return dop_dir
+        dop_dir = jam_params.get('vgpo_doppler_direction')
+        if dop_dir:
+            if isinstance(dop_dir, bytes):
+                dop_dir = dop_dir.decode('utf-8')
+            return dop_dir
+        return ''
 
+    # === 扩展: 带宽参数 ===
+    elif jam_type == 5:  # AJ - 瞄准干扰
+        BJ = jam_params.get('aj_BJ')
+        if BJ is not None:
+            return get_bandwidth_level(BJ)
+        return ''
+
+    elif jam_type == 6:  # BJ - 阻塞干扰
+        BJ = jam_params.get('bj_BJ')
+        if BJ is not None:
+            return get_bandwidth_level(BJ)
+        return ''
+
+    elif jam_type == 7:  # SJ - 扫频干扰
+        BJ = jam_params.get('sj_BJ')
+        if BJ is not None:
+            return get_bandwidth_level(BJ)
+        return ''
+
+    # === 扩展: SMSPJ 斜率参数 ===
     elif jam_type == 10:  # SMSPJ
-        M = jam_params.get('smspj_M', 5)
-        return get_count_level(M)
+        M = jam_params.get('smspj_M')
+        slope = jam_params.get('smspj_slope_factor')
+        if M is not None:
+            count_level = get_count_level(M)
+            if slope is not None:
+                slope_level = get_slope_level(slope)
+                return f"{count_level}_{slope_level}"
+            return count_level
+        return ''
 
+    # === 扩展: C&IJ 切片参数 ===
     elif jam_type == 11:  # C&IJ
-        is_cont = jam_params.get('cij_is_continuous', True)
-        return 'continuous' if is_cont else 'discontinuous'
+        is_cont = jam_params.get('cij_is_continuous')
+        if is_cont is not None:
+            return 'continuous' if is_cont else 'discontinuous'
+        return ''
 
+    # === 扩展: NFMJ/NPMJ/NAMJ 带宽参数 ===
+    elif jam_type == 12:  # NFMJ
+        BJ = jam_params.get('nfmj_BJ')
+        if BJ is not None:
+            return get_bandwidth_level(BJ)
+        return ''
+
+    elif jam_type == 13:  # NPMJ
+        BJ = jam_params.get('npmj_BJ')
+        if BJ is not None:
+            return get_bandwidth_level(BJ)
+        return ''
+
+    elif jam_type == 14:  # NAMJ
+        BJ = jam_params.get('namj_BJ')
+        if BJ is not None:
+            return get_bandwidth_level(BJ)
+        return ''
+
+    # === 扩展: CSJ 梳齿数 ===
     elif jam_type == 15:  # CSJ
-        M = jam_params.get('csj_M', 5)
-        return get_count_level(M)
+        M = jam_params.get('csj_M')
+        teeth = jam_params.get('csj_comb_teeth_count')
+        if M is not None:
+            count_level = get_count_level(M)
+            if teeth is not None:
+                teeth_level = get_count_level(teeth)
+                return f"{count_level}_{teeth_level}teeth"
+            return count_level
+        return ''
 
     return ''
 
@@ -257,6 +436,10 @@ def generate_short_description(metadata: dict, style: str = 'visual') -> str:
     jam_types = metadata.get('jam_types', [])
     JNR = metadata.get('JNR', 15)
     jam_params = metadata.get('jam_params', {})
+
+    # 确保 jam_types 是列表
+    if isinstance(jam_types, int):
+        jam_types = [jam_types]
 
     if not jam_types:
         return "a radar signal with no jamming"

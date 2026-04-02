@@ -13,6 +13,6 @@ thumbs.db
 wandb/
 .wandb/
 **/wandb/
-**/wandb/
+**/results/
 *.pt
 .claude

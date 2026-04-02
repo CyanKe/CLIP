@@ -357,7 +357,7 @@ RECOMMENDED_UNSEEN_COMBINATIONS = [
     ["AJ", "CSJ"],       # Aiming + Comb Spectrum
     ["BJ", "PJ"],        # Barrage + Pulse
     ["SJ", "NAMJ"],      # Swept Frequency + Noise AM
-    ["SPSMJ", "C&IJ"],   # Smeared Spectrum + Chopping Interleaved
+    ["SMSPJ", "C&IJ"],   # Smeared Spectrum + Chopping Interleaved
 ]
 
 
