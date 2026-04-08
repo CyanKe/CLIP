@@ -12,7 +12,7 @@ model:
 # 训练配置
 train:
   batch_size: 16
-  epochs: 20
+  epochs: 50
   lr: 0.00001                     # 1e-5
   weight_decay: 0.01
   warmup_epochs: 2
@@ -40,10 +40,10 @@ loss:
 
 # 数据配置
 data:
-  base_path: "D:/VScode/Jamming_signal_simulation/output/260401"
-  jnr_start: 10
-  jnr_end: 10
-  jnr_step: 1
+  base_path: "D:/VScode/Jamming_signal_simulation/output/260403"
+  jnr_start: 0
+  jnr_end: 20
+  jnr_step: 5
   num_workers: 4
   pin_memory: true
 
@@ -54,7 +54,7 @@ data:
 # 日志配置
 # ============================================================================
 logging:
-  type: "wandb"                  # wandb, console, tensorboard
+  type: "wandb"                # wandb, console, tensorboard
   name: "CLIP_CZSL_Jamming"
 
   # WandB配置
@@ -135,62 +135,66 @@ czsl:
     - ["NAMJ"]
     - ["PJ"]
 
-    - ["DFTJ", "AJ"]
-    # - ["DFTJ", "BJ"]
-    # - ["DFTJ", "SJ"]
-    # - ["DFTJ", "NCJ"]
-    # - ["DFTJ", "NPJ"]
-    # - ["DFTJ", "NAMJ"]
-    # - ["DFTJ", "NPMJ"]
-    # - ["DFTJ", "NFMJ"]
-    # - ["DFTJ", "PJ"]
 
-    - ["ISRJ", "AJ"]
-    # - ["ISRJ", "BJ"]
-    # - ["ISRJ", "SJ"]
-    # - ["ISRJ", "NCJ"]
-    # - ["ISRJ", "NPJ"]
-    # - ["ISRJ", "NAMJ"]
-    # - ["ISRJ", "NPMJ"]
-    # - ["ISRJ", "NFMJ"]
-    # - ["ISRJ", "PJ"]
 
   # 合作为seen（训练时可见）
+
+  unseen_combinations:
   # 未见组合（用于零样本测试）
   # 这些组合在训练时不出现，但测试时需要识别
-  unseen_combinations:
+    - ["DFTJ", "AJ"]
+    - ["DFTJ", "BJ"]
+    - ["DFTJ", "SJ"]
+    - ["DFTJ", "NCJ"]
+    - ["DFTJ", "NPJ"]
+    - ["DFTJ", "NAMJ"]
+    - ["DFTJ", "NPMJ"]
+    - ["DFTJ", "NFMJ"]
+    - ["DFTJ", "PJ"]
+
+    - ["ISRJ", "AJ"]
+    - ["ISRJ", "BJ"]
+    - ["ISRJ", "SJ"]
+    - ["ISRJ", "NCJ"]
+    - ["ISRJ", "NPJ"]
+    - ["ISRJ", "NAMJ"]
+    - ["ISRJ", "NPMJ"]
+    - ["ISRJ", "NFMJ"]
+    - ["ISRJ", "PJ"]
+
     - ["SMSPJ", "AJ"]
-    # - ["SMSPJ", "BJ"]
-    # - ["SMSPJ", "SJ"]
-    # - ["SMSPJ", "NCJ"]
-    # - ["SMSPJ", "NPJ"]
-    # - ["SMSPJ", "NAMJ"]
-    # - ["SMSPJ", "NPMJ"]
-    # - ["SMSPJ", "NFMJ"]
-    # - ["SMSPJ", "PJ"]
+    - ["SMSPJ", "BJ"]
+    - ["SMSPJ", "SJ"]
+    - ["SMSPJ", "NCJ"]
+    - ["SMSPJ", "NPJ"]
+    - ["SMSPJ", "NAMJ"]
+    - ["SMSPJ", "NPMJ"]
+    - ["SMSPJ", "NFMJ"]
+    - ["SMSPJ", "PJ"]
 
     - ["C&IJ", "AJ"]
-    # - ["C&IJ", "BJ"]
-    # - ["C&IJ", "SJ"]
-    # - ["C&IJ", "NCJ"]
-    # - ["C&IJ", "NPJ"]
-    # - ["C&IJ", "NAMJ"]
-    # - ["C&IJ", "NPMJ"]
-    # - ["C&IJ", "NFMJ"]
-    # - ["C&IJ", "PJ"]
+    - ["C&IJ", "BJ"]
+    - ["C&IJ", "SJ"]
+    - ["C&IJ", "NCJ"]
+    - ["C&IJ", "NPJ"]
+    - ["C&IJ", "NAMJ"]
+    - ["C&IJ", "NPMJ"]
+    - ["C&IJ", "NFMJ"]
+    - ["C&IJ", "PJ"]
 
     - ["CSJ", "AJ"]
-    # - ["CSJ", "BJ"]
-    # - ["CSJ", "SJ"]
-    # - ["CSJ", "NCJ"]
-    # - ["CSJ", "NPJ"]
-    # - ["CSJ", "NAMJ"]
-    # - ["CSJ", "NPMJ"]
-    # - ["CSJ", "NFMJ"]
-    # - ["CSJ", "PJ"]
+    - ["CSJ", "BJ"]
+    - ["CSJ", "SJ"]
+    - ["CSJ", "NCJ"]
+    - ["CSJ", "NPJ"]
+    - ["CSJ", "NAMJ"]
+    - ["CSJ", "NPMJ"]
+    - ["CSJ", "NFMJ"]
+    - ["CSJ", "PJ"]
+
 
   # 数据划分参数
-  unseen_ratio: 0.2          # 自动划分时unseen比例
+  unseen_ratio: 0          # 自动划分时unseen比例
   split_seed: 42             # 划分随机种子
 
   # 零样本推理配置

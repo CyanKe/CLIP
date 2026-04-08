@@ -78,7 +78,7 @@ class CZSLEvaluator:
 
         eval_bar = tqdm(data_loader, desc="Zero-Shot Evaluation")
 
-        for images, text_tokens, labels, texts in eval_bar:
+        for images, text_tokens, labels, texts, metas in eval_bar:
             images = images.to(self.device)
             labels = labels.to(self.device)
 
@@ -111,8 +111,14 @@ class CZSLEvaluator:
                             if part in self.class_names:
                                 preds[i, self.class_names.index(part)] = 1
             else:
-                # 使用多标签预测
-                probs, preds = self.model.zero_shot_multilabel_predict(images, threshold=0.5)
+                # 使用单类别特征进行多标签预测
+                text_features = self.model.get_cached_text_features()
+                image_features = self.model.encode_image(images)
+                image_features = F.normalize(image_features, dim=-1)
+                logit_scale = self.model.model.logit_scale.exp()
+                logits = logit_scale * (image_features @ text_features.T)
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).float()
 
             all_labels.append(labels.cpu())
             all_preds.append(preds.cpu())
@@ -193,15 +199,21 @@ class CZSLEvaluator:
 
         eval_bar = tqdm(data_loader, desc="Evaluating by Combination Type")
 
-        for images, text_tokens, labels, texts in eval_bar:
+        for images, text_tokens, labels, texts, metas in eval_bar:
             images = images.to(self.device)
             labels = labels.to(self.device)
 
             if images.shape[-1] != 224:
                 images = nn.functional.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
 
-            # 零样本预测
-            probs, preds = self.model.zero_shot_multilabel_predict(images, threshold=0.5)
+            # 零样本预测 - 使用单类别特征
+            text_features = self.model.get_cached_text_features()
+            image_features = self.model.encode_image(images)
+            image_features = F.normalize(image_features, dim=-1)
+            logit_scale = self.model.model.logit_scale.exp()
+            logits = logit_scale * (image_features @ text_features.T)
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
 
             batch_size = images.shape[0]
             for i in range(batch_size):
@@ -526,7 +538,7 @@ class CZSLEvaluator:
 
         eval_bar = tqdm(data_loader, desc="Saving STFT images")
 
-        for images, text_tokens, labels, texts in eval_bar:
+        for images, text_tokens, labels, texts, metas in eval_bar:
             images = images.to(self.device)
             labels = labels.to(self.device)
 
@@ -536,21 +548,14 @@ class CZSLEvaluator:
 
             batch_size = images.shape[0]
 
-            # 零样本预测
-            if use_combinations:
-                similarities, indices, pred_names = self.model.zero_shot_predict(
-                    images, use_combinations=True, top_k=1
-                )
-                preds = torch.zeros(batch_size, len(self.class_names), device=self.device)
-                for i, name in enumerate(pred_names):
-                    if name and len(name) > 0:
-                        comb_name = name[0]
-                        parts = comb_name.split('+')
-                        for part in parts:
-                            if part in self.class_names:
-                                preds[i, self.class_names.index(part)] = 1
-            else:
-                probs, preds = self.model.zero_shot_multilabel_predict(images, threshold=0.5)
+            # 零样本预测 - 使用单类别特征
+            text_features = self.model.get_cached_text_features()
+            image_features = self.model.encode_image(images)
+            image_features = F.normalize(image_features, dim=-1)
+            logit_scale = self.model.model.logit_scale.exp()
+            logits = logit_scale * (image_features @ text_features.T)
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
 
             # 保存每张图像
             for i in range(batch_size):
