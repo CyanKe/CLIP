@@ -284,10 +284,19 @@ class TimeDomainDataset(Dataset):
         # 所以我们需要读取第 index 行
         raw_time = h5_file[self.time_var_name][index, :]  # Shape: (8000,)
 
-        # 2. 提取幅度 (如果是复数)
-        if np.iscomplexobj(raw_time):
+        # 2. 处理数据类型 - 检查是否是结构化数组
+        if raw_time.dtype.names is not None:
+            # 结构化数组，包含 real 和 imag 字段
+            # 提取实部和虚部
+            real_part = raw_time['real'] if 'real' in raw_time.dtype.names else raw_time['f0']
+            imag_part = raw_time['imag'] if 'imag' in raw_time.dtype.names else raw_time['f1']
+            # 组合为复数并提取幅度
+            time_data = np.sqrt(real_part**2 + imag_part**2)
+        elif np.iscomplexobj(raw_time):
+            # 直接的复数数组
             time_data = np.abs(raw_time)
         else:
+            # 实数数组
             time_data = raw_time
 
         # 3. 归一化到 [0, 1] 或 [-1, 1]
