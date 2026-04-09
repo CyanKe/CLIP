@@ -100,7 +100,7 @@ def test_data_loading():
         return
 
     # 检查时域数据文件
-    time_file = os.path.join(test_data_dir, "train_echo_time.mat")
+    time_file = os.path.join(test_data_dir, "train_echo_times.mat")
     if not os.path.exists(time_file):
         print("  [WARN] Time domain data file not found, skipping data loading test")
         return
