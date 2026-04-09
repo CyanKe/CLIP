@@ -27,18 +27,28 @@ def collate_fn(batch):
     将 batch 转换为 tensor，并生成文本 tokens
 
     Args:
-        batch: list of (image, label, metadata)
+        batch: list of (stft_image, label, metadata) 或 (stft_image, time_signal, label, metadata)
 
     Returns:
-        images, text_tokens, labels, texts, metadata_list
+        stft_images, time_signals, text_tokens, labels, texts, metadata_list
     """
     from multi.text_templates import generate_text_descriptions
     import clip
 
-    images, labels, metadata_list = zip(*batch)
+    # 检查第一个样本的长度以确定是否包含时域信号
+    sample = batch[0]
+    has_time_signal = len(sample) == 4  # (stft_image, time_signal, label, metadata)
 
-    # 堆叠图像和标签
-    images = torch.stack(images, dim=0)
+    if has_time_signal:
+        stft_images, time_signals, labels, metadata_list = zip(*batch)
+        # 堆叠时域信号
+        time_signals = torch.stack(time_signals, dim=0)
+    else:
+        stft_images, labels, metadata_list = zip(*batch)
+        time_signals = None
+
+    # 堆叠 STFT 图像和标签
+    stft_images = torch.stack(stft_images, dim=0)
     labels = torch.stack(labels, dim=0)
 
     # 为每个样本生成文本描述并 tokenize (使用 template 风格)
@@ -49,7 +59,7 @@ def collate_fn(batch):
 
     text_tokens = clip.tokenize(texts, truncate=True)
 
-    return images, text_tokens, labels, texts, metadata_list
+    return stft_images, time_signals, text_tokens, labels, texts, metadata_list
 
 
 class STFTDataset(Dataset):
@@ -204,6 +214,139 @@ class STFTDataset(Dataset):
         return stft_tensor, label_tensor, metadata
 
 
+class TimeDomainDataset(Dataset):
+    """
+    时域信号数据集 - 用于处理 complex single 格式的 HDF5 时域数据
+
+    数据流:
+    1. 从 .mat 读取 complex single 时域数据
+    2. 提取幅度 (magnitude)
+    3. 归一化并 pad/truncate 到固定长度
+    4. 返回 1D 张量
+    """
+
+    def __init__(
+        self,
+        time_file: str,
+        time_var_name: str = 'raw_time',
+        seq_len: int = 2048,
+        normalization_stats: dict = None,
+    ):
+        """
+        Args:
+            time_file: 时域数据 .mat 文件路径
+            time_var_name: 时域数据变量名
+            seq_len: 固定序列长度
+            normalization_stats: 归一化统计量 (min, max)
+        """
+        super().__init__()
+
+        self.time_file = time_file
+        self.time_var_name = time_var_name
+        self.seq_len = seq_len
+
+        # 延迟加载元数据
+        with h5py.File(time_file, 'r') as f:
+            # 用户的数据是二维数组 (样本数, 8000)
+            data_shape = f[time_var_name].shape
+            if len(data_shape) == 2:
+                self.num_samples = data_shape[0]  # 第一维是样本数
+            else:
+                raise ValueError(f"Expected 2D array (samples, seq_len), got shape {data_shape}")
+
+        # 归一化参数
+        if normalization_stats is None:
+            # 默认值 (应使用预计算的统计量)
+            normalization_stats = {
+                'time_min': -1.0,
+                'time_max': 1.0,
+            }
+        self.norm_min = normalization_stats.get('time_min', -1.0)
+        self.norm_max = normalization_stats.get('time_max', 1.0)
+
+        # 延迟加载的文件句柄
+        self._h5_file = None
+
+    def _lazy_load(self):
+        """延迟加载 h5 文件 (每个 worker 独立)"""
+        if self._h5_file is None:
+            self._h5_file = h5py.File(self.time_file, 'r')
+        return self._h5_file
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, index: int):
+        h5_file = self._lazy_load()
+
+        # 1. 读取时域数据
+        # 用户提供的是二维数组 (样本数, 8000)
+        # 所以我们需要读取第 index 行
+        raw_time = h5_file[self.time_var_name][index, :]  # Shape: (8000,)
+
+        # 2. 提取幅度 (如果是复数)
+        if np.iscomplexobj(raw_time):
+            time_data = np.abs(raw_time)
+        else:
+            time_data = raw_time
+
+        # 3. 归一化到 [0, 1] 或 [-1, 1]
+        time_data = np.clip(time_data, self.norm_min, self.norm_max)
+        range_span = self.norm_max - self.norm_min
+        if range_span > 0:
+            time_data = (time_data - self.norm_min) / range_span
+
+        # 4. Pad or Truncate 到固定长度
+        if len(time_data) > self.seq_len:
+            time_data = time_data[:self.seq_len]
+        elif len(time_data) < self.seq_len:
+            pad_len = self.seq_len - len(time_data)
+            time_data = np.pad(time_data, (0, pad_len), mode='constant')
+
+        # 5. 转换为张量
+        time_tensor = torch.from_numpy(time_data).float()
+
+        return time_tensor
+
+
+class CombinedRadarDataset(Dataset):
+    """
+    组合雷达数据集 - 同时加载 STFT 和时域信号
+    """
+
+    def __init__(
+        self,
+        stft_dataset: STFTDataset,
+        time_dataset: TimeDomainDataset,
+    ):
+        """
+        Args:
+            stft_dataset: STFT 数据集实例
+            time_dataset: 时域数据集实例
+        """
+        super().__init__()
+        self.stft_dataset = stft_dataset
+        self.time_dataset = time_dataset
+
+        # 验证两个数据集的样本数是否一致
+        if len(stft_dataset) != len(time_dataset):
+            raise ValueError(
+                f"STFT dataset has {len(stft_dataset)} samples, "
+                f"but time domain dataset has {len(time_dataset)} samples. "
+                "They must have the same number of samples."
+            )
+
+    def __len__(self):
+        return len(self.stft_dataset)
+
+    def __getitem__(self, index: int):
+        # 从两个数据集获取对应样本
+        stft_tensor, label, metadata = self.stft_dataset[index]
+        time_tensor = self.time_dataset[index]
+
+        return stft_tensor, time_tensor, label, metadata
+
+
 def create_czsl_dataloaders(
     config: dict,
     normalization_stats: dict = None,
@@ -232,6 +375,11 @@ def create_czsl_dataloaders(
     jnr_end = data_config.get('jnr_end', 10)
     jnr_step = data_config.get('jnr_step', 1)
 
+    # 时域数据配置
+    use_time_domain = config.get('use_time_domain', False)
+    time_seq_len = data_config.get('time_seq_len', 2048)
+    time_var_name = data_config.get('time_var_name', 'raw_time')
+
     # JNR 级别
     jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
 
@@ -251,6 +399,9 @@ def create_czsl_dataloaders(
             label_file = os.path.join(data_folder, f'{split_name}_echo_label.mat')
             metadata_file = os.path.join(data_folder, f'{split_name}_echo_metadata.json')
 
+            # 时域数据文件路径 (假设命名规则)
+            time_file = os.path.join(data_folder, f'{split_name}_echo_time.mat')
+
             if not (os.path.exists(stft_file) and os.path.exists(label_file)):
                 print(f"Warning: Data not found for {jnr_folder}/{split_name}, skipping...")
                 continue
@@ -259,15 +410,34 @@ def create_czsl_dataloaders(
             if not os.path.exists(metadata_file):
                 metadata_file = None
 
-            dataset = STFTDataset(
+            # 创建 STFT 数据集
+            stft_dataset = STFTDataset(
                 stft_file=stft_file,
                 label_file=label_file,
                 metadata_file=metadata_file,
                 normalization_stats=normalization_stats,
                 class_names=class_names,
             )
-            datasets.append(dataset)
-            print(f"Loaded {split_name} data from {jnr_folder}: {len(dataset)} samples")
+
+            # 如果启用时域数据，创建时域数据集并组合
+            if use_time_domain:
+                if os.path.exists(time_file):
+                    time_dataset = TimeDomainDataset(
+                        time_file=time_file,
+                        time_var_name=time_var_name,
+                        seq_len=time_seq_len,
+                        normalization_stats=normalization_stats,
+                    )
+                    # 组合两个数据集
+                    combined_dataset = CombinedRadarDataset(stft_dataset, time_dataset)
+                    datasets.append(combined_dataset)
+                    print(f"Loaded {split_name} data (STFT + Time) from {jnr_folder}: {len(combined_dataset)} samples")
+                else:
+                    print(f"Warning: Time domain data not found for {jnr_folder}/{split_name}, using STFT only...")
+                    datasets.append(stft_dataset)
+            else:
+                datasets.append(stft_dataset)
+                print(f"Loaded {split_name} data (STFT only) from {jnr_folder}: {len(stft_dataset)} samples")
 
         if not datasets:
             raise ValueError(f"No data found for {split_name} split!")

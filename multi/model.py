@@ -8,10 +8,79 @@ import torch.nn.functional as F
 from typing import List, Tuple
 import sys
 import os
+import math
 
 # 添加路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import clip
+
+
+class TimeDomainTransformerEncoder(nn.Module):
+    """
+    基于 Transformer 的时域信号编码器
+
+    输入: (batch, seq_len) 的 1D 时域信号
+    输出: (batch, embed_dim) 的特征向量
+    """
+
+    def __init__(self, embed_dim=512, num_heads=8, num_layers=3, seq_len=8000, dropout=0.1):
+        super().__init__()
+        self.seq_len = seq_len
+
+        # 输入投影：将 1D 信号投影到 embed_dim
+        self.input_proj = nn.Linear(1, embed_dim)
+
+        # 位置编码 (可学习)
+        self.pos_encoder = nn.Parameter(torch.zeros(1, seq_len, embed_dim))
+
+        # Transformer Encoder 层
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # 输出投影
+        self.output_proj = nn.Linear(embed_dim, embed_dim)
+
+        # 初始化权重
+        self._init_weights()
+
+    def _init_weights(self):
+        """初始化权重"""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, seq_len) 的时域信号
+
+        Returns:
+            (batch, embed_dim) 的特征向量
+        """
+        # x: (batch, seq_len) -> (batch, seq_len, 1)
+        x = x.unsqueeze(-1)
+
+        # 投影到 embed_dim
+        x = self.input_proj(x)  # (batch, seq_len, embed_dim)
+
+        # 添加位置编码
+        x = x + self.pos_encoder
+
+        # Transformer 编码
+        x = self.transformer(x)  # (batch, seq_len, embed_dim)
+
+        # Global average pooling
+        x = x.mean(dim=1)  # (batch, embed_dim)
+
+        # 输出投影
+        x = self.output_proj(x)
+
+        return x
 
 
 class CLIPForCZSL(nn.Module):
@@ -29,7 +98,9 @@ class CLIPForCZSL(nn.Module):
         freeze_vision: bool = False,
         freeze_text: bool = True,
         vision_layers_unfreeze: int = 2,
-        device: str = "cuda"
+        device: str = "cuda",
+        use_time_domain: bool = False,
+        time_seq_len: int = 8000,
     ):
         """
         初始化 CZSL-CLIP 模型
@@ -42,11 +113,15 @@ class CLIPForCZSL(nn.Module):
             freeze_text: 是否冻结文本编码器
             vision_layers_unfreeze: 解冻视觉编码器最后 N 层
             device: 计算设备
+            use_time_domain: 是否使用时域信号
+            time_seq_len: 时域信号序列长度
         """
         super().__init__()
         self.device = device
         self.num_classes = num_classes
         self.class_names = class_names or [f"Class_{i}" for i in range(num_classes)]
+        self.use_time_domain = use_time_domain
+        self.time_seq_len = time_seq_len
 
         # 加载预训练 CLIP 模型
         self.model, self.preprocess = clip.load(clip_model, device=device)
@@ -61,6 +136,19 @@ class CLIPForCZSL(nn.Module):
             freeze_text=freeze_text,
             vision_layers_unfreeze=vision_layers_unfreeze
         )
+
+        # 初始化时域编码器和融合层（如果启用时域信号）
+        if self.use_time_domain:
+            # 时域编码器
+            self.time_encoder = TimeDomainTransformerEncoder(
+                embed_dim=self.embed_dim,
+                num_heads=8,
+                num_layers=3,
+                seq_len=time_seq_len
+            ).to(device)
+
+            # 融合投影层：拼接后投影回 embed_dim
+            self.fusion_projection = nn.Linear(self.embed_dim * 2, self.embed_dim).to(device)
 
         # 文本特征缓存（用于零样本推理）
         self._text_features_cache = None
@@ -110,20 +198,39 @@ class CLIPForCZSL(nn.Module):
     def forward_contrastive(
         self,
         image: torch.Tensor,
-        text_tokens: torch.Tensor
+        text_tokens: torch.Tensor,
+        time_signal: torch.Tensor = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         对比学习前向传播
 
         Args:
-            image: 图像张量 [batch_size, 3, H, W]
+            image: STFT 图像张量 [batch_size, 3, H, W]
             text_tokens: 文本 tokens [batch_size, seq_len]
+            time_signal: 时域信号张量 [batch_size, seq_len] (可选)
 
         Returns:
             image_features: 图像特征 [batch_size, embed_dim]
             text_features: 文本特征 [batch_size, embed_dim]
         """
-        image_features = self.encode_image(image)
+        # 提取 STFT 特征
+        stft_features = self.encode_image(image)
+
+        # 如果启用时域信号且提供了时域数据，进行融合
+        if self.use_time_domain and time_signal is not None:
+            # 提取时域特征
+            time_features = self.time_encoder(time_signal)
+
+            # 拼接特征
+            fused_features = torch.cat([stft_features, time_features], dim=-1)
+
+            # 投影回 embed_dim
+            image_features = self.fusion_projection(fused_features)
+        else:
+            # 仅使用 STFT 特征
+            image_features = stft_features
+
+        # 提取文本特征
         text_features = self.encode_text(text_tokens)
 
         # 归一化
@@ -135,19 +242,21 @@ class CLIPForCZSL(nn.Module):
     def forward(
         self,
         image: torch.Tensor,
-        text_tokens: torch.Tensor = None
+        text_tokens: torch.Tensor = None,
+        time_signal: torch.Tensor = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播（对比学习模式）
 
         Args:
-            image: 图像张量
+            image: STFT 图像张量
             text_tokens: 文本 tokens (对比学习模式需要)
+            time_signal: 时域信号张量 (可选)
 
         Returns:
             image_features, text_features
         """
-        return self.forward_contrastive(image, text_tokens)
+        return self.forward_contrastive(image, text_tokens, time_signal)
 
     @torch.no_grad()
     def cache_text_features(
@@ -270,6 +379,7 @@ class CLIPForCZSL(nn.Module):
     def zero_shot_predict(
         self,
         image: torch.Tensor,
+        time_signal: torch.Tensor = None,
         use_combinations: bool = True,
         top_k: int = 1
     ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
@@ -288,8 +398,24 @@ class CLIPForCZSL(nn.Module):
         """
         self.eval()
 
-        # 编码图像
-        image_features = self.encode_image(image)
+        # 编码 STFT 图像
+        stft_features = self.encode_image(image)
+
+        # 如果启用时域信号且提供了时域数据，进行融合
+        if self.use_time_domain and time_signal is not None:
+            # 提取时域特征
+            time_features = self.time_encoder(time_signal)
+
+            # 拼接特征
+            fused_features = torch.cat([stft_features, time_features], dim=-1)
+
+            # 投影回 embed_dim
+            image_features = self.fusion_projection(fused_features)
+        else:
+            # 仅使用 STFT 特征
+            image_features = stft_features
+
+        # 归一化
         image_features = F.normalize(image_features, dim=-1)
 
         # 选择文本特征
@@ -326,7 +452,12 @@ def create_czsl_model(config: dict, device: str = "cuda") -> CLIPForCZSL:
         CLIPForCZSL 模型实例
     """
     model_config = config.get("model", {})
+    data_config = config.get("data", {})
     class_names = [cls_info["name"] for cls_info in config.get("jamming_classes", [])]
+
+    # 时域配置
+    use_time_domain = config.get("use_time_domain", False)
+    time_seq_len = data_config.get("time_seq_len", 8000)
 
     model = CLIPForCZSL(
         clip_model=model_config.get("clip_model", "ViT-B/32"),
@@ -335,7 +466,9 @@ def create_czsl_model(config: dict, device: str = "cuda") -> CLIPForCZSL:
         freeze_vision=model_config.get("freeze_vision", False),
         freeze_text=model_config.get("freeze_text", True),
         vision_layers_unfreeze=model_config.get("vision_layers_unfreeze", 2),
-        device=device
+        device=device,
+        use_time_domain=use_time_domain,
+        time_seq_len=time_seq_len
     )
 
     return model
