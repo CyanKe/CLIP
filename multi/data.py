@@ -32,7 +32,7 @@ def collate_fn(batch):
     Returns:
         stft_images, time_signals, text_tokens, labels, texts, metadata_list
     """
-    from multi.text_templates import generate_text_descriptions
+    from multi.metadata_template import generate_short_description
     import clip
 
     # 检查第一个样本的长度以确定是否包含时域信号
@@ -51,10 +51,11 @@ def collate_fn(batch):
     stft_images = torch.stack(stft_images, dim=0)
     labels = torch.stack(labels, dim=0)
 
-    # 为每个样本生成文本描述并 tokenize (使用 template 风格)
+    # 使用 metadata_template 生成文本描述并 tokenize
+    # 使用 'visual_param' 风格：视觉特征 + 参数强度
     texts = []
     for meta in metadata_list:
-        text = generate_text_descriptions(meta, style='meta')
+        text = generate_short_description(meta, style='visual_param')
         texts.append(text)
 
     text_tokens = clip.tokenize(texts, truncate=True)
@@ -376,7 +377,6 @@ def create_czsl_dataloaders(
     Returns:
         (train_loader, val_loader, test_loader, num_classes)
     """
-    from multi.text_templates import generate_text_descriptions
 
     data_config = config.get('data', {})
     base_path = data_config.get('base_path')
