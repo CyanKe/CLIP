@@ -33,6 +33,7 @@ def collate_fn(batch):
         images, text_tokens, labels, texts, metadata_list
     """
     from multi.text_templates import generate_text_descriptions
+    from multi.metadata_template import generate_short_description
     import clip
 
     images, labels, metadata_list = zip(*batch)
@@ -45,6 +46,7 @@ def collate_fn(batch):
     texts = []
     for meta in metadata_list:
         text = generate_text_descriptions(meta, style='meta')
+        # text = generate_short_description(meta, style='visual_param')
         texts.append(text)
 
     text_tokens = clip.tokenize(texts, truncate=True)

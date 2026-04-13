@@ -4,15 +4,15 @@
 
 # CLIP模型配置
 model:
-  clip_model: "ViT-B/32"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14
+  clip_model: "resnet18"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14, resnet18
   freeze_vision: false           # 冻结视觉编码器（避免FP16梯度问题）
   freeze_text: false             # 是否冻结文本编码器
   # vision_layers_unfreeze: 2     # 不解冻视觉编码器
 
 # 训练配置
 train:
-  batch_size: 16
-  epochs: 50
+  batch_size: 8
+  epochs: 5
   lr: 0.00001                     # 1e-5
   weight_decay: 0.01
   warmup_epochs: 2
@@ -31,7 +31,7 @@ train:
 
 # 损失函数配置
 loss:
-  type: "czsl_contrastive"     # czsl_contrastive, infonce, multilabel_infonce, asymmetric, bce
+  type: "infonce"     # czsl_contrastive, infonce, multilabel_infonce, asymmetric, bce
   temperature: 0.07            # 对比损失温度参数
   label_smoothing: 0.0         # 标签平滑
   contrastive_weight: 1.0      # 对比损失权重
@@ -76,7 +76,7 @@ evaluation:
 
 # 保存配置
 checkpoint:
-  save_dir: "checkpoints"
+  save_dir: "checkpoints/RN50"
   save_best_only: false  # 保存所有epoch的检查点，便于调试
   monitor: "val_f1"             # 监控指标
   mode: "max"                    # max or min
@@ -129,12 +129,10 @@ czsl:
     - ["SJ"]
     - ["NCJ"]
     - ["NPJ"]
-    - ["C&IJ"]
     - ["NFMJ"]
     - ["NPMJ"]
     - ["NAMJ"]
     - ["PJ"]
-
 
 
   # 合作为seen（训练时可见）
@@ -142,6 +140,7 @@ czsl:
   unseen_combinations:
   # 未见组合（用于零样本测试）
   # 这些组合在训练时不出现，但测试时需要识别
+
     - ["DFTJ", "AJ"]
     - ["DFTJ", "BJ"]
     - ["DFTJ", "SJ"]

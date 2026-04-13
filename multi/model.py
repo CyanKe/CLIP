@@ -12,6 +12,84 @@ import os
 # 添加路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import clip
+import torchvision.models as models
+
+
+class ResNet18Visual(nn.Module):
+    """
+    Wrapper for ResNet18 visual encoder to mimic CLIP's visual interface.
+    Exposes layer3, layer4 for freezing logic compatibility.
+    """
+    def __init__(self, resnet):
+        super().__init__()
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+        self.avgpool = resnet.avgpool
+        self.flatten = nn.Flatten()
+        self.proj = None  # Will be set externally
+        self.input_resolution = 224
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        x = self.flatten(x)
+        x = self.proj(x)
+        return x
+
+
+class HybridResNetCLIP(nn.Module):
+    """
+    Hybrid model combining ResNet18 (ImageNet pretrained) visual encoder
+    with CLIP RN50 text encoder.
+    """
+    def __init__(self, device="cuda", target_embed_dim=1024):
+        super().__init__()
+
+        # 1. Visual Encoder (ResNet18)
+        resnet = models.resnet18(pretrained=True)
+        resnet = resnet.to(device)
+        self.visual = ResNet18Visual(resnet)
+        self.visual.proj = nn.Linear(512, target_embed_dim).to(device)
+
+        # 2. Text Encoder (Load from CLIP RN50)
+        # Load base CLIP model to get text components
+        base_model, _ = clip.load("RN50", device=device)
+
+        # Copy text components (ensure they are registered as parameters/buffers)
+        self.transformer = base_model.transformer
+        self.token_embedding = base_model.token_embedding
+        self.positional_embedding = base_model.positional_embedding
+        self.ln_final = base_model.ln_final
+        self.text_projection = base_model.text_projection
+        self.logit_scale = nn.Parameter(base_model.logit_scale.clone())
+        self.context_length = base_model.context_length
+
+    def encode_image(self, image):
+        return self.visual(image)
+
+    def encode_text(self, text):
+        # Logic from clip.model.CLIP.encode_text
+        x = self.token_embedding(text).type(self.visual.proj.weight.dtype)
+        x = x + self.positional_embedding.type(self.visual.proj.weight.dtype)
+        x = x.permute(1, 0, 2)
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.ln_final(x).type(self.visual.proj.weight.dtype)
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        return x
 
 
 class CLIPForCZSL(nn.Module):
@@ -49,7 +127,13 @@ class CLIPForCZSL(nn.Module):
         self.class_names = class_names or [f"Class_{i}" for i in range(num_classes)]
 
         # 加载预训练 CLIP 模型
-        self.model, self.preprocess = clip.load(clip_model, device=device)
+        if clip_model == "resnet18":
+            # Use HybridResNetCLIP
+            self.model = HybridResNetCLIP(device=device, target_embed_dim=1024) # Match RN50 dim
+            self.preprocess = clip.clip._transform(self.model.visual.input_resolution)
+        else:
+            self.model, self.preprocess = clip.load(clip_model, device=device)
+
         self.model = self.model.float()  # 转换为 FP32
 
         # 获取特征维度
@@ -167,7 +251,6 @@ class CLIPForCZSL(nn.Module):
         """
         self.eval()
         from itertools import combinations
-        from multi.text_templates import JAM_TYPE_NAMES, VISUAL_TEMPLATES
 
         all_features = []
         all_names = []
@@ -175,17 +258,8 @@ class CLIPForCZSL(nn.Module):
         # 单干扰特征
         if include_single:
             for cls_name in self.class_names:
-                jam_type = None
-                for k, v in JAM_TYPE_NAMES.items():
-                    if v == cls_name:
-                        jam_type = k
-                        break
-
-                if jam_type:
-                    template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name})
-                    desc = f"{cls_name} looks like {template['base']}"
-                else:
-                    desc = f"a radar signal with {cls_name}"
+                # 推理模板: a radar signal with {classname}
+                desc = f"a radar signal with {cls_name}"
 
                 tokens = clip.tokenize(desc, truncate=True).to(self.device)
                 features = self.encode_text(tokens)
@@ -198,20 +272,8 @@ class CLIPForCZSL(nn.Module):
             if seen_combinations:
                 combo_only = [c for c in seen_combinations if len(c) > 1]
                 for combo in combo_only:
-                    descs = []
-                    for cls_name in combo:
-                        jam_type = None
-                        for k, v in JAM_TYPE_NAMES.items():
-                            if v == cls_name:
-                                jam_type = k
-                                break
-                        if jam_type:
-                            template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name})
-                            descs.append(f"{cls_name} looks like {template['base']}")
-                        else:
-                            descs.append(f"a radar signal with {cls_name}")
-
-                    combined_desc = ', '.join(descs)
+                    # 使用组合干扰模板: a radar signal with combined jamming: classname1, classname2
+                    combined_desc = f"a radar signal with combined jamming: {', '.join(combo)}"
                     tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
                     features = self.encode_text(tokens)
                     features = F.normalize(features, dim=-1)
@@ -221,22 +283,8 @@ class CLIPForCZSL(nn.Module):
                 for i, j in combinations(range(len(self.class_names)), 2):
                     cls1, cls2 = self.class_names[i], self.class_names[j]
 
-                    jam_type1 = jam_type2 = None
-                    for k, v in JAM_TYPE_NAMES.items():
-                        if v == cls1:
-                            jam_type1 = k
-                        if v == cls2:
-                            jam_type2 = k
-
-                    descs = []
-                    for cls_name, jam_type in [(cls1, jam_type1), (cls2, jam_type2)]:
-                        if jam_type:
-                            template = VISUAL_TEMPLATES.get(jam_type, {'base': cls_name})
-                            descs.append(f"{cls_name} looks like {template['base']}")
-                        else:
-                            descs.append(f"a radar signal with {cls_name}")
-
-                    combined_desc = ', '.join(descs)
+                    # 使用组合干扰模板: a radar signal with combined jamming: classname1, classname2
+                    combined_desc = f"a radar signal with combined jamming: {cls1}, {cls2}"
                     tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
                     features = self.encode_text(tokens)
                     features = F.normalize(features, dim=-1)
@@ -351,7 +399,7 @@ if __name__ == "__main__":
 
     test_config = {
         "model": {
-            "clip_model": "ViT-B/32",
+            "clip_model": "resnet18",
             "freeze_vision": False,
             "freeze_text": True,
             "vision_layers_unfreeze": 2
