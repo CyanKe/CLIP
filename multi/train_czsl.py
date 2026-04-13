@@ -71,16 +71,27 @@ class CZSLTrainer:
         train_bar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1} [Train]")
 
         debug_done = False
-        for batch_idx, (images, text_tokens, labels, texts, metas) in enumerate(train_bar):
-            images = images.to(self.device)
+        # 数据解包：现在 collate_fn 返回 (stft_images, time_signals, text_tokens, labels, texts, metas)
+        for batch_idx, batch_data in enumerate(train_bar):
+            if len(batch_data) == 6:
+                stft_images, time_signals, text_tokens, labels, texts, metas = batch_data
+                has_time_signal = True
+            else:
+                stft_images, text_tokens, labels, texts, metas = batch_data
+                time_signals = None
+                has_time_signal = False
+
+            stft_images = stft_images.to(self.device)
             text_tokens = text_tokens.to(self.device)
             labels = labels.to(self.device)
+            if has_time_signal and time_signals is not None:
+                time_signals = time_signals.to(self.device)
 
             # 调整图像尺寸
-            if images.shape[-1] != 224:
-                images = nn.functional.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+            if stft_images.shape[-1] != 224:
+                stft_images = nn.functional.interpolate(stft_images, size=(224, 224), mode='bilinear', align_corners=False)
 
-            batch_size = images.size(0)
+            batch_size = stft_images.size(0)
 
             # Debug: 打印第一批次的详细信息
             if debug and not debug_done and batch_idx == 0:
@@ -101,8 +112,8 @@ class CZSLTrainer:
 
             self.optimizer.zero_grad()
 
-            # 对比学习前向传播
-            image_features, text_features = self.model(images, text_tokens)
+            # 对比学习前向传播 (传入时域信号)
+            image_features, text_features = self.model(stft_images, text_tokens, time_signals)
 
             # 计算相似度矩阵
             logit_scale = self.model.model.logit_scale.exp()
@@ -151,14 +162,24 @@ class CZSLTrainer:
         val_bar = tqdm(self.val_loader, desc=f"Epoch {self.current_epoch + 1} [Val]")
 
         debug_done = False
-        for batch_idx, (images, text_tokens, labels, texts, metas) in enumerate(val_bar):
-            images = images.to(self.device)
+        for batch_idx, batch_data in enumerate(val_bar):
+            if len(batch_data) == 6:
+                stft_images, time_signals, text_tokens, labels, texts, metas = batch_data
+                has_time_signal = True
+            else:
+                stft_images, text_tokens, labels, texts, metas = batch_data
+                time_signals = None
+                has_time_signal = False
+
+            stft_images = stft_images.to(self.device)
             text_tokens = text_tokens.to(self.device)
+            if has_time_signal and time_signals is not None:
+                time_signals = time_signals.to(self.device)
 
-            if images.shape[-1] != 224:
-                images = nn.functional.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+            if stft_images.shape[-1] != 224:
+                stft_images = nn.functional.interpolate(stft_images, size=(224, 224), mode='bilinear', align_corners=False)
 
-            batch_size = images.size(0)
+            batch_size = stft_images.size(0)
 
             # Debug: 打印第一批次的详细信息
             if debug and not debug_done:
@@ -181,7 +202,7 @@ class CZSLTrainer:
                 print(f"{'='*80}")
                 debug_done = True
 
-            image_features, text_features = self.model(images, text_tokens)
+            image_features, text_features = self.model(stft_images, text_tokens, time_signals)
 
             logit_scale = self.model.model.logit_scale.exp()
             logits_per_image = logit_scale * (image_features @ text_features.t())
