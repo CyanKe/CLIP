@@ -4,7 +4,7 @@
 
 # CLIP模型配置
 model:
-  clip_model: "resnet18"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14, resnet18
+  clip_model: "ViT-B/32"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14, resnet18
   freeze_vision: false           # 冻结视觉编码器（避免FP16梯度问题）
   freeze_text: false             # 是否冻结文本编码器
   # vision_layers_unfreeze: 2     # 不解冻视觉编码器
@@ -40,9 +40,9 @@ loss:
 
 # 数据配置
 data:
-  base_path: "D:/VScode/Jamming_signal_simulation/output/260403"
-  jnr_start: 0
-  jnr_end: 20
+  base_path: "D:/VScode/Jamming_signal_simulation/output/260414"
+  jnr_start: 10
+  jnr_end: 10
   jnr_step: 5
   num_workers: 4
   pin_memory: true
@@ -83,7 +83,7 @@ evaluation:
 
 # 保存配置
 checkpoint:
-  save_dir: "checkpoints/RN50"
+  save_dir: "checkpoints"
   save_best_only: false  # 保存所有epoch的检查点，便于调试
   monitor: "val_f1"             # 监控指标
   mode: "max"                    # max or min
@@ -92,8 +92,6 @@ checkpoint:
 jamming_classes:
   - name: "DFTJ"
   - name: "ISRJ"
-  - name: "VGPO"
-  - name: "RGPO"
   - name: "AJ"
   - name: "BJ"
   - name: "SJ"
@@ -125,8 +123,6 @@ czsl:
     # 欺骗干扰
     - ["DFTJ"]
     - ["ISRJ"]
-    - ["VGPO"]
-    - ["RGPO"]
     - ["SMSPJ"]
     - ["C&IJ"]
     - ["CSJ"]
@@ -148,55 +144,55 @@ czsl:
   # 未见组合（用于零样本测试）
   # 这些组合在训练时不出现，但测试时需要识别
 
-    - ["DFTJ", "AJ"]
-    - ["DFTJ", "BJ"]
-    - ["DFTJ", "SJ"]
-    - ["DFTJ", "NCJ"]
-    - ["DFTJ", "NPJ"]
-    - ["DFTJ", "NAMJ"]
-    - ["DFTJ", "NPMJ"]
-    - ["DFTJ", "NFMJ"]
-    - ["DFTJ", "PJ"]
+    # - ["DFTJ", "AJ"]
+    # - ["DFTJ", "BJ"]
+    # - ["DFTJ", "SJ"]
+    # - ["DFTJ", "NCJ"]
+    # - ["DFTJ", "NPJ"]
+    # - ["DFTJ", "NAMJ"]
+    # - ["DFTJ", "NPMJ"]
+    # - ["DFTJ", "NFMJ"]
+    # - ["DFTJ", "PJ"]
 
-    - ["ISRJ", "AJ"]
-    - ["ISRJ", "BJ"]
-    - ["ISRJ", "SJ"]
-    - ["ISRJ", "NCJ"]
-    - ["ISRJ", "NPJ"]
-    - ["ISRJ", "NAMJ"]
-    - ["ISRJ", "NPMJ"]
-    - ["ISRJ", "NFMJ"]
-    - ["ISRJ", "PJ"]
+    # - ["ISRJ", "AJ"]
+    # - ["ISRJ", "BJ"]
+    # - ["ISRJ", "SJ"]
+    # - ["ISRJ", "NCJ"]
+    # - ["ISRJ", "NPJ"]
+    # - ["ISRJ", "NAMJ"]
+    # - ["ISRJ", "NPMJ"]
+    # - ["ISRJ", "NFMJ"]
+    # - ["ISRJ", "PJ"]
 
-    - ["SMSPJ", "AJ"]
-    - ["SMSPJ", "BJ"]
-    - ["SMSPJ", "SJ"]
-    - ["SMSPJ", "NCJ"]
-    - ["SMSPJ", "NPJ"]
-    - ["SMSPJ", "NAMJ"]
-    - ["SMSPJ", "NPMJ"]
-    - ["SMSPJ", "NFMJ"]
-    - ["SMSPJ", "PJ"]
+    # - ["SMSPJ", "AJ"]
+    # - ["SMSPJ", "BJ"]
+    # - ["SMSPJ", "SJ"]
+    # - ["SMSPJ", "NCJ"]
+    # - ["SMSPJ", "NPJ"]
+    # - ["SMSPJ", "NAMJ"]
+    # - ["SMSPJ", "NPMJ"]
+    # - ["SMSPJ", "NFMJ"]
+    # - ["SMSPJ", "PJ"]
 
-    - ["C&IJ", "AJ"]
-    - ["C&IJ", "BJ"]
-    - ["C&IJ", "SJ"]
-    - ["C&IJ", "NCJ"]
-    - ["C&IJ", "NPJ"]
-    - ["C&IJ", "NAMJ"]
-    - ["C&IJ", "NPMJ"]
-    - ["C&IJ", "NFMJ"]
-    - ["C&IJ", "PJ"]
+    # - ["C&IJ", "AJ"]
+    # - ["C&IJ", "BJ"]
+    # - ["C&IJ", "SJ"]
+    # - ["C&IJ", "NCJ"]
+    # - ["C&IJ", "NPJ"]
+    # - ["C&IJ", "NAMJ"]
+    # - ["C&IJ", "NPMJ"]
+    # - ["C&IJ", "NFMJ"]
+    # - ["C&IJ", "PJ"]
 
-    - ["CSJ", "AJ"]
-    - ["CSJ", "BJ"]
-    - ["CSJ", "SJ"]
-    - ["CSJ", "NCJ"]
-    - ["CSJ", "NPJ"]
-    - ["CSJ", "NAMJ"]
-    - ["CSJ", "NPMJ"]
-    - ["CSJ", "NFMJ"]
-    - ["CSJ", "PJ"]
+    # - ["CSJ", "AJ"]
+    # - ["CSJ", "BJ"]
+    # - ["CSJ", "SJ"]
+    # - ["CSJ", "NCJ"]
+    # - ["CSJ", "NPJ"]
+    # - ["CSJ", "NAMJ"]
+    # - ["CSJ", "NPMJ"]
+    # - ["CSJ", "NFMJ"]
+    # - ["CSJ", "PJ"]
 
 
   # 数据划分参数

@@ -73,16 +73,15 @@ class STFTDataset(Dataset):
     3. 全局归一化 (使用预计算的统计量)
     4. Resize 到 224x224
     5. CLIP 标准化
+
+    标签来源: metadata.json 中的 jam_types 字段 (数组格式: ["DFTJ", "AJ"])
     """
 
     def __init__(
         self,
         stft_file: str,
-        label_file: str,
-        metadata_file: str = None,
+        metadata_file: str,
         stft_var_name: str = 'all_stfts',
-        label_var_name: str = 'all_label',
-        metadata_var_name: str = 'all_metadata',
         normalization_stats: dict = None,
         image_size: int = 224,
         apply_clip_norm: bool = True,
@@ -91,32 +90,34 @@ class STFTDataset(Dataset):
         """
         Args:
             stft_file: STFT 数据 .mat 文件路径
-            label_file: 标签 .mat 文件路径
-            metadata_file: metadata .json 文件路径 (可选)
+            metadata_file: metadata .json 文件路径 (包含 jam_types 字段)
             stft_var_name: STFT 变量名
-            label_var_name: 标签变量名
-            metadata_var_name: metadata 变量名
             normalization_stats: 归一化统计量 (real_max, mag_max 等)
             image_size: 输出图像尺寸
             apply_clip_norm: 是否应用 CLIP 标准化
-            class_names: 类别名称列表
+            class_names: 类别名称列表 (用于将 jam_types 转换为多热编码)
         """
         super().__init__()
 
         self.stft_file = stft_file
-        self.label_file = label_file
         self.metadata_file = metadata_file
         self.stft_var_name = stft_var_name
-        self.label_var_name = label_var_name
-        self.metadata_var_name = metadata_var_name
 
-        # 延迟加载元数据
+        # 延迟加载 STFT 样本数
         with h5py.File(stft_file, 'r') as f:
             self.num_samples = f[stft_var_name].shape[2]
-        with h5py.File(label_file, 'r') as f:
-            self.num_classes = f[label_var_name].shape[0]
 
         self.class_names = class_names or []
+        self.num_classes = len(class_names)
+
+        # 加载 metadata
+        if metadata_file and os.path.exists(metadata_file):
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                self._metadata = json.load(f)
+            # 从 metadata 构建 label 映射
+            self._labels = self._build_labels_from_metadata()
+        else:
+            raise ValueError(f"Metadata file required: {metadata_file}")
 
         # 归一化参数
         if normalization_stats is None:
@@ -139,21 +140,50 @@ class STFTDataset(Dataset):
             self.clip_norm = None
 
         # 延迟加载的文件句柄
-        self._h5_files = None
-        self._metadata = None
+        self._h5_file = None
+
+    def _build_labels_from_metadata(self) -> np.ndarray:
+        """
+        从 metadata 的 jam_types 字段构建多热编码标签
+
+        jam_types 格式: ["DFTJ", "AJ"] 或 ["CSJ"]
+
+        Returns:
+            labels: np.ndarray, shape (num_samples, num_classes)
+        """
+        labels = np.zeros((self.num_samples, self.num_classes), dtype=np.float32)
+
+        # 构建类别名称到索引的映射
+        name_to_idx = {name: i for i, name in enumerate(self.class_names)}
+
+        for i, meta in enumerate(self._metadata):
+            if i >= self.num_samples:
+                break
+
+            jam_types = meta.get('jam_types', [])
+
+            # 解析 jam_types (数组格式)
+            if isinstance(jam_types, list):
+                types_list = jam_types
+            elif isinstance(jam_types, str):
+                # 兼容字符串格式
+                types_list = [jam_types] if jam_types and jam_types != 'None' else []
+            else:
+                types_list = []
+
+            # 转换为多热编码
+            for jam_type in types_list:
+                jam_type = jam_type.strip() if isinstance(jam_type, str) else str(jam_type)
+                if jam_type in name_to_idx:
+                    labels[i, name_to_idx[jam_type]] = 1.0
+
+        return labels
 
     def _lazy_load(self):
         """延迟加载 h5 文件 (每个 worker 独立)"""
-        if self._h5_files is None:
-            self._h5_files = {
-                'stft': h5py.File(self.stft_file, 'r'),
-                'label': h5py.File(self.label_file, 'r'),
-            }
-            # 加载 metadata (如果存在)
-            if self.metadata_file and os.path.exists(self.metadata_file):
-                with open(self.metadata_file, 'r', encoding='utf-8') as f:
-                    self._metadata = json.load(f)
-        return self._h5_files
+        if self._h5_file is None:
+            self._h5_file = h5py.File(self.stft_file, 'r')
+        return self._h5_file
 
     def __len__(self):
         return self.num_samples
@@ -163,18 +193,18 @@ class STFTDataset(Dataset):
         if self._metadata is None:
             return None
         if isinstance(self._metadata, list) and index < len(self._metadata):
-            meta = self._metadata[index].copy()  # 复制一份，避免修改原始数据
-            # 将 jam_types 从整数转换为列表
+            meta = self._metadata[index].copy()
+            # 将 jam_types 从整数转换为列表 (兼容旧格式)
             if 'jam_types' in meta and isinstance(meta['jam_types'], int):
                 meta['jam_types'] = [meta['jam_types']]
             return meta
         return None
 
     def __getitem__(self, index: int):
-        h5_files = self._lazy_load()
+        h5_file = self._lazy_load()
 
         # 1. 读取 STFT 数据 (structured complex64)
-        raw_stft = h5_files['stft'][self.stft_var_name][:, :, index]
+        raw_stft = h5_file[self.stft_var_name][:, :, index]
 
         # 2. 转换为复数
         stft_complex = raw_stft['real'] + 1j * raw_stft['imag']
@@ -205,157 +235,13 @@ class STFTDataset(Dataset):
         if self.clip_norm is not None:
             stft_tensor = self.clip_norm(stft_tensor)
 
-        # 8. 读取标签
-        label = h5_files['label'][self.label_var_name][:, index]
-        label_tensor = torch.from_numpy(label).float()
+        # 8. 从预构建的标签数组获取标签
+        label_tensor = torch.from_numpy(self._labels[index])
 
         # 9. 获取 metadata (用于生成文本描述)
         metadata = self._get_metadata(index)
 
         return stft_tensor, label_tensor, metadata
-
-
-class TimeDomainDataset(Dataset):
-    """
-    时域信号数据集 - 用于处理 complex single 格式的 HDF5 时域数据
-
-    数据流:
-    1. 从 .mat 读取 complex single 时域数据
-    2. 提取幅度 (magnitude)
-    3. 归一化并 pad/truncate 到固定长度
-    4. 返回 1D 张量
-    """
-
-    def __init__(
-        self,
-        time_file: str,
-        time_var_name: str = 'raw_time',
-        seq_len: int = 2048,
-        normalization_stats: dict = None,
-    ):
-        """
-        Args:
-            time_file: 时域数据 .mat 文件路径
-            time_var_name: 时域数据变量名
-            seq_len: 固定序列长度
-            normalization_stats: 归一化统计量 (min, max)
-        """
-        super().__init__()
-
-        self.time_file = time_file
-        self.time_var_name = time_var_name
-        self.seq_len = seq_len
-
-        # 延迟加载元数据
-        with h5py.File(time_file, 'r') as f:
-            # 用户的数据是二维数组 (样本数, 8000)
-            data_shape = f[time_var_name].shape
-            if len(data_shape) == 2:
-                self.num_samples = data_shape[0]  # 第一维是样本数
-            else:
-                raise ValueError(f"Expected 2D array (samples, seq_len), got shape {data_shape}")
-
-        # 归一化参数
-        if normalization_stats is None:
-            # 默认值 (应使用预计算的统计量)
-            normalization_stats = {
-                'time_min': -1.0,
-                'time_max': 1.0,
-            }
-        self.norm_min = normalization_stats.get('time_min', -1.0)
-        self.norm_max = normalization_stats.get('time_max', 1.0)
-
-        # 延迟加载的文件句柄
-        self._h5_file = None
-
-    def _lazy_load(self):
-        """延迟加载 h5 文件 (每个 worker 独立)"""
-        if self._h5_file is None:
-            self._h5_file = h5py.File(self.time_file, 'r')
-        return self._h5_file
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, index: int):
-        h5_file = self._lazy_load()
-
-        # 1. 读取时域数据
-        # 用户提供的是二维数组 (样本数, 8000)
-        # 所以我们需要读取第 index 行
-        raw_time = h5_file[self.time_var_name][index, :]  # Shape: (8000,)
-
-        # 2. 处理数据类型 - 检查是否是结构化数组
-        if raw_time.dtype.names is not None:
-            # 结构化数组，包含 real 和 imag 字段
-            # 提取实部和虚部
-            real_part = raw_time['real'] if 'real' in raw_time.dtype.names else raw_time['f0']
-            imag_part = raw_time['imag'] if 'imag' in raw_time.dtype.names else raw_time['f1']
-            # 组合为复数并提取幅度
-            time_data = np.sqrt(real_part**2 + imag_part**2)
-        elif np.iscomplexobj(raw_time):
-            # 直接的复数数组
-            time_data = np.abs(raw_time)
-        else:
-            # 实数数组
-            time_data = raw_time
-
-        # 3. 归一化到 [0, 1] 或 [-1, 1]
-        time_data = np.clip(time_data, self.norm_min, self.norm_max)
-        range_span = self.norm_max - self.norm_min
-        if range_span > 0:
-            time_data = (time_data - self.norm_min) / range_span
-
-        # 4. Pad or Truncate 到固定长度
-        if len(time_data) > self.seq_len:
-            time_data = time_data[:self.seq_len]
-        elif len(time_data) < self.seq_len:
-            pad_len = self.seq_len - len(time_data)
-            time_data = np.pad(time_data, (0, pad_len), mode='constant')
-
-        # 5. 转换为张量
-        time_tensor = torch.from_numpy(time_data).float()
-
-        return time_tensor
-
-
-class CombinedRadarDataset(Dataset):
-    """
-    组合雷达数据集 - 同时加载 STFT 和时域信号
-    """
-
-    def __init__(
-        self,
-        stft_dataset: STFTDataset,
-        time_dataset: TimeDomainDataset,
-    ):
-        """
-        Args:
-            stft_dataset: STFT 数据集实例
-            time_dataset: 时域数据集实例
-        """
-        super().__init__()
-        self.stft_dataset = stft_dataset
-        self.time_dataset = time_dataset
-
-        # 验证两个数据集的样本数是否一致
-        if len(stft_dataset) != len(time_dataset):
-            raise ValueError(
-                f"STFT dataset has {len(stft_dataset)} samples, "
-                f"but time domain dataset has {len(time_dataset)} samples. "
-                "They must have the same number of samples."
-            )
-
-    def __len__(self):
-        return len(self.stft_dataset)
-
-    def __getitem__(self, index: int):
-        # 从两个数据集获取对应样本
-        stft_tensor, label, metadata = self.stft_dataset[index]
-        time_tensor = self.time_dataset[index]
-
-        return stft_tensor, time_tensor, label, metadata
-
 
 def create_czsl_dataloaders(
     config: dict,
@@ -405,48 +291,28 @@ def create_czsl_dataloaders(
             data_folder = os.path.join(base_path, jnr_folder)
 
             stft_file = os.path.join(data_folder, f'{split_name}_echo_stfts.mat')
-            label_file = os.path.join(data_folder, f'{split_name}_echo_label.mat')
             metadata_file = os.path.join(data_folder, f'{split_name}_echo_metadata.json')
 
             # 时域数据文件路径 (假设命名规则)
-            time_file = os.path.join(data_folder, f'{split_name}_echo_time.mat')
+            time_file = os.path.join(data_folder, f'{split_name}_echo_times.mat')
 
-            if not (os.path.exists(stft_file) and os.path.exists(label_file)):
-                print(f"Warning: Data not found for {jnr_folder}/{split_name}, skipping...")
+            if not os.path.exists(stft_file):
+                print(f"Warning: STFT data not found for {jnr_folder}/{split_name}, skipping...")
                 continue
 
-            # Metadata 文件可选
             if not os.path.exists(metadata_file):
-                metadata_file = None
+                print(f"Warning: Metadata not found for {jnr_folder}/{split_name}, skipping...")
+                continue
 
             # 创建 STFT 数据集
             stft_dataset = STFTDataset(
                 stft_file=stft_file,
-                label_file=label_file,
                 metadata_file=metadata_file,
                 normalization_stats=normalization_stats,
                 class_names=class_names,
             )
-
-            # 如果启用时域数据，创建时域数据集并组合
-            if use_time_domain:
-                if os.path.exists(time_file):
-                    time_dataset = TimeDomainDataset(
-                        time_file=time_file,
-                        time_var_name=time_var_name,
-                        seq_len=time_seq_len,
-                        normalization_stats=normalization_stats,
-                    )
-                    # 组合两个数据集
-                    combined_dataset = CombinedRadarDataset(stft_dataset, time_dataset)
-                    datasets.append(combined_dataset)
-                    print(f"Loaded {split_name} data (STFT + Time) from {jnr_folder}: {len(combined_dataset)} samples")
-                else:
-                    print(f"Warning: Time domain data not found for {jnr_folder}/{split_name}, using STFT only...")
-                    datasets.append(stft_dataset)
-            else:
-                datasets.append(stft_dataset)
-                print(f"Loaded {split_name} data (STFT only) from {jnr_folder}: {len(stft_dataset)} samples")
+            datasets.append(stft_dataset)
+            print(f"Loaded {split_name} data from {jnr_folder}: {len(stft_dataset)} samples")
 
         if not datasets:
             raise ValueError(f"No data found for {split_name} split!")
@@ -494,7 +360,7 @@ if __name__ == "__main__":
     # 测试数据加载
     import yaml
 
-    with open('multi/config.yaml', 'r') as f:
+    with open('multi/config.yaml', 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     # 加载统计量

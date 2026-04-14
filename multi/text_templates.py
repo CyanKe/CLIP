@@ -1,6 +1,5 @@
 """
 文本描述模板模块 - 用于生成雷达干扰信号的 CLIP 文本描述
-
 支持 3 种描述策略:
 1. simple: 简单类别名，如 "DFTJ"
 2. template: 模板描述，如 "DFTJ looks like dense false targets"
@@ -29,6 +28,9 @@ JAM_TYPE_NAMES = {
     16: 'PJ',    # 相位编码干扰
 }
 
+# 反向映射：名称 -> ID
+JAM_NAME_TO_ID = {v: k for k, v in JAM_TYPE_NAMES.items()}
+
 # ============================================================================
 # 视觉特征模板 (template 风格)
 # ============================================================================
@@ -52,31 +54,69 @@ VISUAL_TEMPLATES = {
 }
 
 
-def get_simple_description(jam_type: int) -> str:
+def get_jam_type_name(jam_type) -> str:
+    """
+    获取干扰类型名称（支持整数或字符串输入）
+
+    Args:
+        jam_type: 干扰类型编号 (1-16) 或名称字符串 ("DFTJ")
+
+    Returns:
+        干扰类型名称
+    """
+    if isinstance(jam_type, str):
+        # 已经是字符串名称，直接返回
+        return jam_type
+    elif isinstance(jam_type, int):
+        # 整数编号，转换为名称
+        return JAM_TYPE_NAMES.get(jam_type, f'Type{jam_type}')
+    else:
+        return f'Type{jam_type}'
+
+
+def get_jam_type_id(jam_type) -> int:
+    """
+    获取干扰类型编号（支持整数或字符串输入）
+
+    Args:
+        jam_type: 干扰类型编号 (1-16) 或名称字符串 ("DFTJ")
+
+    Returns:
+        干扰类型编号，找不到返回 None
+    """
+    if isinstance(jam_type, int):
+        return jam_type
+    elif isinstance(jam_type, str):
+        return JAM_NAME_TO_ID.get(jam_type)
+    return None
+
+
+def get_simple_description(jam_type) -> str:
     """
     生成简单类别名描述
 
     Args:
-        jam_type: 干扰类型编号 (1-16)
+        jam_type: 干扰类型编号 (1-16) 或名称字符串 ("DFTJ")
 
     Returns:
         简单类别名，如 "DFTJ"
     """
-    return JAM_TYPE_NAMES.get(jam_type, f'Type{jam_type}')
+    return get_jam_type_name(jam_type)
 
 
-def get_template_description(jam_type: int) -> str:
+def get_template_description(jam_type) -> str:
     """
     生成模板描述
 
     Args:
-        jam_type: 干扰类型编号 (1-16)
+        jam_type: 干扰类型编号 (1-16) 或名称字符串 ("DFTJ")
 
     Returns:
         模板描述，如 "DFTJ looks like dense false targets with diagonal lines"
     """
-    name = JAM_TYPE_NAMES.get(jam_type, f'Type{jam_type}')
-    template = VISUAL_TEMPLATES.get(jam_type, {'base': 'unknown pattern'})
+    name = get_jam_type_name(jam_type)
+    jam_id = get_jam_type_id(jam_type)
+    template = VISUAL_TEMPLATES.get(jam_id, {'base': 'unknown pattern'}) if jam_id else {'base': 'unknown pattern'}
     return f"{name} looks like {template['base']}"
 
 
@@ -86,6 +126,7 @@ def get_meta_description(metadata: dict) -> str:
 
     Args:
         metadata: metadata 字典，包含 jam_types, JNR, jam_params 等
+                  jam_types 格式支持: "DFTJ", ["DFTJ"], ["DFTJ", "AJ"]
 
     Returns:
         动态描述，如 "DFTJ with JNR=10dB, k=5 false targets"
@@ -94,14 +135,21 @@ def get_meta_description(metadata: dict) -> str:
     jam_params = metadata.get('jam_params', {})
     jnr = metadata.get('JNR', None)
 
+    # 确保 jam_types 是列表
+    if isinstance(jam_types, str):
+        jam_types = [jam_types] if jam_types else []
+    elif not isinstance(jam_types, list):
+        jam_types = []
+
     if not jam_types:
         return "a radar signal with unknown jamming"
 
     descriptions = []
 
     for jam_type in jam_types:
-        name = JAM_TYPE_NAMES.get(jam_type, f'Type{jam_type}')
-        template = VISUAL_TEMPLATES.get(jam_type, {'base': 'unknown pattern', 'param': None})
+        name = get_jam_type_name(jam_type)
+        jam_id = get_jam_type_id(jam_type)
+        template = VISUAL_TEMPLATES.get(jam_id, {'base': 'unknown pattern', 'param': None}) if jam_id else {'base': 'unknown pattern', 'param': None}
 
         # 构建描述
         parts = [name]
@@ -129,9 +177,28 @@ def get_meta_description(metadata: dict) -> str:
         descriptions.append(' with '.join(parts[:2]) if len(parts) > 1 else parts[0])
 
     if len(descriptions) == 1:
-        return f"a radar signal with {descriptions[0]}"
+        return f"a radar signal with single jamming: {descriptions[0]}"
     else:
         return f"a radar signal with combined jamming: {', '.join(descriptions)}"
+
+
+def _normalize_jam_types(jam_types) -> list:
+    """
+    规范化 jam_types 为列表格式
+
+    Args:
+        jam_types: "DFTJ", ["DFTJ"], [1], 或 None
+
+    Returns:
+        列表格式，如 ["DFTJ"] 或 [1]
+    """
+    if jam_types is None:
+        return []
+    if isinstance(jam_types, str):
+        return [jam_types] if jam_types else []
+    if isinstance(jam_types, list):
+        return jam_types
+    return []
 
 
 def generate_text_descriptions(metadata: dict = None, style: str = 'all') -> dict:
@@ -151,14 +218,14 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all') -> dic
     """
     if style == 'simple':
         if metadata and 'jam_types' in metadata:
-            jam_types = metadata.get('jam_types', [])
+            jam_types = _normalize_jam_types(metadata.get('jam_types'))
             if jam_types:
                 return get_simple_description(jam_types[0])
         return "a radar signal"
 
     elif style == 'template':
         if metadata and 'jam_types' in metadata:
-            jam_types = metadata.get('jam_types', [])
+            jam_types = _normalize_jam_types(metadata.get('jam_types'))
             if jam_types:
                 return get_template_description(jam_types[0])
         return "a radar signal with jamming"
@@ -175,7 +242,7 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all') -> dic
             'meta': 'a radar signal with jamming',
         }
         if metadata and 'jam_types' in metadata:
-            jam_types = metadata.get('jam_types', [])
+            jam_types = _normalize_jam_types(metadata.get('jam_types'))
             if jam_types:
                 result['simple'] = get_simple_description(jam_types[0])
                 result['template'] = get_template_description(jam_types[0])
@@ -196,8 +263,8 @@ if __name__ == "__main__":
     print(f"  meta: {generate_text_descriptions(style='meta')}")
     print()
 
-    # 测试 2: 有 metadata（单个干扰）
-    print("Test 2: Single jamming (DFTJ)")
+    # 测试 2: 整数格式 jam_types（旧格式）
+    print("Test 2: Integer format jam_types (old format)")
     meta1 = {
         'jam_types': [1],
         'JNR': 10,
@@ -208,13 +275,36 @@ if __name__ == "__main__":
         print(f"  {style}: {text}")
     print()
 
-    # 测试 3: 有 metadata（复合干扰）
-    print("Test 3: Combined jamming (DFTJ + AJ)")
+    # 测试 3: 字符串格式 jam_types（新格式 - 列表）
+    print("Test 3: String format jam_types (list)")
     meta2 = {
-        'jam_types': [1, 5],
-        'JNR': 15,
-        'jam_params': {'dftj_k': 3},
+        'jam_types': ['DFTJ'],
+        'JNR': 10,
+        'jam_params': {'k': 5},
     }
     result = generate_text_descriptions(metadata=meta2, style='all')
+    for style, text in result.items():
+        print(f"  {style}: {text}")
+    print()
+
+    # 测试 4: 字符串格式 jam_types（新格式 - 单个字符串）
+    print("Test 4: String format jam_types (single string)")
+    meta_single = {
+        'jam_types': 'AJ',  # 单个字符串，不是列表
+        'JNR': 10,
+    }
+    result = generate_text_descriptions(metadata=meta_single, style='all')
+    for style, text in result.items():
+        print(f"  {style}: {text}")
+    print()
+
+    # 测试 5: 组合干扰（字符串格式）
+    print("Test 5: Combined jamming (string format)")
+    meta3 = {
+        'jam_types': ['DFTJ', 'AJ'],
+        'JNR': 15,
+        'jam_params': {'k': 3},
+    }
+    result = generate_text_descriptions(metadata=meta3, style='all')
     for style, text in result.items():
         print(f"  {style}: {text}")

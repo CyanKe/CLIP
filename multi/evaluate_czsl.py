@@ -2,6 +2,8 @@
 CZSL评估脚本 - 支持零样本组合识别评估
 python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode zero_shot
 """
+# pylint: disable=no-member
+
 import os
 import sys
 import yaml

@@ -425,20 +425,20 @@ if __name__ == "__main__":
     print("="*60)
 
     # 测试默认划分
-    print("\n1. Testing default split generation:")
-    seen, unseen = generate_default_splits(class_names, unseen_ratio=0.2, seed=42)
+    print("\n1. 测试默认划分生成:")
+    seen, unseen = generate_default_splits(class_names, unseen_ratio=0.2, seed=45)
 
-    print(f"\nSeen combinations ({len(seen)}):")
-    print("  Single classes:", len([c for c in seen if len(c) == 1]))
-    print("  Pair combinations:", len([c for c in seen if len(c) == 2]))
+    print(f"\n见过组合 ({len(seen)}):")
+    print("  单一类别:", len([c for c in seen if len(c) == 1]))
+    print("  成对组合:", len([c for c in seen if len(c) == 2]))
 
-    print(f"\nUnseen combinations ({len(unseen)}):")
+    print(f"\n没见过组合 ({len(unseen)}):")
     for comb in unseen[:5]:
         names = [class_names[i] for i in comb]
         print(f"  {' + '.join(names)}")
 
     # 测试划分器
-    print("\n2. Testing CombinationSplitter:")
+    print("\n2. 测试组合划分器:")
     splitter = CombinationSplitter(
         class_names=class_names,
         seen_combinations=seen,
@@ -446,7 +446,7 @@ if __name__ == "__main__":
     )
 
     # 测试标签向量
-    print("\n3. Testing label vector classification:")
+    print("\n3. 测试标签向量分类器(区分是否见过):")
     test_label = np.zeros(len(class_names))
     test_label[0] = 1  # DFTJ
     test_label[1] = 1  # ISRJ
@@ -457,6 +457,6 @@ if __name__ == "__main__":
     print(f"  Type: {comb_type}")
 
     # 打印推荐的unseen组合
-    print("\n4. Recommended unseen combinations for 16 jamming types:")
+    print("\n4. 推荐的没见过的组合:")
     for comb in RECOMMENDED_UNSEEN_COMBINATIONS:
         print(f"  {' + '.join(comb)}")
