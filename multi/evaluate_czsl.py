@@ -133,8 +133,19 @@ class CZSLEvaluator:
                 image_features = F.normalize(image_features, dim=-1)
                 logit_scale = self.model.model.logit_scale.exp()
                 logits = logit_scale * (image_features @ text_features.T)
-                probs = torch.sigmoid(logits)
-                preds = (probs > 0.5).float()
+
+                # 多标签预测策略：softmax + top-k > threshold
+                probs = torch.softmax(logits, dim=-1)
+                num_classes = len(self.class_names)
+                threshold = 1.0 / num_classes
+                top_k = 3
+                topk_values, topk_indices = torch.topk(probs, k=top_k, dim=-1)
+
+                preds = torch.zeros(batch_size, num_classes, device=self.device)
+                for b in range(batch_size):
+                    for j, idx in enumerate(topk_indices[b]):
+                        if topk_values[b, j] > threshold:
+                            preds[b, idx] = 1.0
 
             all_labels.append(labels.cpu())
             all_preds.append(preds.cpu())
@@ -273,10 +284,26 @@ class CZSLEvaluator:
             image_features = F.normalize(image_features, dim=-1)
             logit_scale = self.model.model.logit_scale.exp()
             logits = logit_scale * (image_features @ text_features.T)
-            probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).float()
 
+            # 多标签预测策略：
+            # 使用 softmax 获取概率分布，然后选择超过阈值的 top-k
+            probs = torch.softmax(logits, dim=-1)  # [batch, num_classes]
             batch_size = images.shape[0]
+
+            # 策略：选择概率超过阈值 且是 top-k 的类别
+            num_classes = len(self.class_names)
+            threshold = 1.0 / num_classes  # 基础阈值（均匀分布）
+
+            # 最多选择 top-3（因为最多是2个干扰的组合）
+            top_k = 3
+            topk_values, topk_indices = torch.topk(probs, k=top_k, dim=-1)
+
+            preds = torch.zeros(batch_size, num_classes, device=self.device)
+            for b in range(batch_size):
+                for j, idx in enumerate(topk_indices[b]):
+                    # 只选择概率超过阈值的 top-k
+                    if topk_values[b, j] > threshold:
+                        preds[b, idx] = 1.0
 
             # Debug: 显示第一个批次的详细信息
             if debug and not debug_done:
@@ -295,15 +322,16 @@ class CZSLEvaluator:
                     print(f"  [{i}] a radar signal with single jamming: {cls}")
 
                 # 显示预测结果
-                print("\nPredictions vs Labels (sigmoid > 0.5):")
+                print("\nPredictions vs Labels (softmax + top-k > threshold):")
                 for i in range(min(5, batch_size)):
                     true_label_indices = torch.where(labels[i] == 1)[0].tolist()
                     pred_label_indices = torch.where(preds[i] == 1)[0].tolist()
                     true_names = [self.class_names[idx] for idx in true_label_indices]
                     pred_names_list = [self.class_names[idx] for idx in pred_label_indices]
-                    probs_str = [f"{probs[i, idx].item():.3f}" for idx in range(len(self.class_names))]
+                    # 显示 top-5 概率
+                    top5_vals, top5_idx = torch.topk(probs[i], k=5)
                     print(f"  [{i}] True: {true_names} | Pred: {pred_names_list}")
-                    print(f"       Probs: {probs_str}")
+                    print(f"       Top-5: {[(self.class_names[idx.item()], f'{val.item():.3f}') for val, idx in zip(top5_vals, top5_idx)]}")
 
                 print("=" * 80 + "\n")
                 debug_done = True
@@ -646,8 +674,19 @@ class CZSLEvaluator:
             image_features = F.normalize(image_features, dim=-1)
             logit_scale = self.model.model.logit_scale.exp()
             logits = logit_scale * (image_features @ text_features.T)
-            probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).float()
+
+            # 多标签预测策略：softmax + top-k > threshold
+            probs = torch.softmax(logits, dim=-1)
+            num_classes = len(self.class_names)
+            threshold = 1.0 / num_classes
+            top_k = 3
+            topk_values, topk_indices = torch.topk(probs, k=top_k, dim=-1)
+
+            preds = torch.zeros(batch_size, num_classes, device=self.device)
+            for b in range(batch_size):
+                for j, idx in enumerate(topk_indices[b]):
+                    if topk_values[b, j] > threshold:
+                        preds[b, idx] = 1.0
 
             # 保存每张图像
             for i in range(batch_size):
