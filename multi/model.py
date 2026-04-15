@@ -366,9 +366,10 @@ class CLIPForCZSL(nn.Module):
 
         # 单干扰特征
         if include_single:
+            from multi.text_templates import get_inference_description
             for cls_name in self.class_names:
-                # 推理模板: a radar signal with {classname}
-                desc = f"a radar signal with {cls_name}"
+                # 使用与训练一致的格式（无参数版本）
+                desc = get_inference_description([cls_name])
 
                 tokens = clip.tokenize(desc, truncate=True).to(self.device)
                 features = self.encode_text(tokens)
@@ -378,11 +379,12 @@ class CLIPForCZSL(nn.Module):
 
         # 组合特征
         if max_combination_size >= 2:
+            from multi.text_templates import get_inference_description
             if seen_combinations:
                 combo_only = [c for c in seen_combinations if len(c) > 1]
                 for combo in combo_only:
-                    # 使用组合干扰模板: a radar signal with combined jamming: classname1, classname2
-                    combined_desc = f"a radar signal with combined jamming: {', '.join(combo)}"
+                    # 使用与训练一致的格式（无参数版本）
+                    combined_desc = get_inference_description(list(combo))
                     tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
                     features = self.encode_text(tokens)
                     features = F.normalize(features, dim=-1)
@@ -392,8 +394,8 @@ class CLIPForCZSL(nn.Module):
                 for i, j in combinations(range(len(self.class_names)), 2):
                     cls1, cls2 = self.class_names[i], self.class_names[j]
 
-                    # 使用组合干扰模板: a radar signal with combined jamming: classname1, classname2
-                    combined_desc = f"a radar signal with combined jamming: {cls1}, {cls2}"
+                    # 使用与训练一致的格式（无参数版本）
+                    combined_desc = get_inference_description([cls1, cls2])
                     tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
                     features = self.encode_text(tokens)
                     features = F.normalize(features, dim=-1)

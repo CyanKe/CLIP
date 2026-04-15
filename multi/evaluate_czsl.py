@@ -57,7 +57,8 @@ class CZSLEvaluator:
     def evaluate_zero_shot(
         self,
         data_loader: DataLoader,
-        use_combinations: bool = True
+        use_combinations: bool = True,
+        debug: bool = False
     ) -> dict:
         """
         零样本评估
@@ -80,7 +81,20 @@ class CZSLEvaluator:
 
         eval_bar = tqdm(data_loader, desc="Zero-Shot Evaluation")
 
-        for images, text_tokens, labels, texts, metas in eval_bar:
+        # Debug: 显示缓存的文本特征
+        if debug:
+            print("\n" + "=" * 80)
+            print("[DEBUG] Cached text features for inference:")
+            print("=" * 80)
+            cached_names = self.model._combination_names
+            for i, name in enumerate(cached_names[:20]):  # 只显示前20个
+                print(f"  [{i}] {name}")
+            if len(cached_names) > 20:
+                print(f"  ... ({len(cached_names) - 20} more)")
+            print("=" * 80 + "\n")
+
+        debug_done = False
+        for batch_idx, (images, _, text_tokens, labels, texts, metas) in enumerate(eval_bar):
             images = images.to(self.device)
             labels = labels.to(self.device)
 
@@ -124,6 +138,40 @@ class CZSLEvaluator:
 
             all_labels.append(labels.cpu())
             all_preds.append(preds.cpu())
+
+            # Debug: 显示第一个批次的详细信息
+            if debug and not debug_done:
+                print("\n" + "=" * 80)
+                print(f"[DEBUG] Batch {batch_idx} — batch_size={batch_size}")
+                print("=" * 80)
+                # 显示缓存的文本描述（推理用）
+                print("Cached text templates (for inference):")
+                for i, name in enumerate(self.model._combination_names[:10]):
+                    print(f"  [{i}] {name}")
+
+                # 显示训练时的文本描述
+                print("\nTraining texts (from data loader):")
+                for i, txt in enumerate(texts[:5]):
+                    print(f"  [{i}] {txt}")
+
+                # 显示预测结果
+                print("\nPredictions vs Labels:")
+                for i in range(min(5, batch_size)):
+                    true_label_indices = torch.where(labels[i] == 1)[0].tolist()
+                    pred_label_indices = torch.where(preds[i] == 1)[0].tolist()
+                    true_names = [self.class_names[idx] for idx in true_label_indices]
+                    pred_names_list = [self.class_names[idx] for idx in pred_label_indices]
+                    print(f"  [{i}] True: {true_names} | Pred: {pred_names_list}")
+
+                # 显示相似度分数分布
+                if use_combinations:
+                    print("\nTop-5 similarity scores for sample 0:")
+                    top5_vals, top5_idx = torch.topk(similarities[0], k=5)
+                    for val, idx in zip(top5_vals, top5_idx):
+                        print(f"  {self.model._combination_names[idx.item()]}: {val.item():.3f}")
+
+                print("=" * 80 + "\n")
+                debug_done = True
 
             # 计算组合匹配准确率
             for i in range(batch_size):
@@ -176,7 +224,8 @@ class CZSLEvaluator:
         self,
         data_loader: DataLoader,
         seen_combinations: list = None,
-        unseen_combinations: list = None
+        unseen_combinations: list = None,
+        debug: bool = False
     ) -> dict:
         """
         按组合类型评估（Seen vs Unseen）
@@ -201,7 +250,17 @@ class CZSLEvaluator:
 
         eval_bar = tqdm(data_loader, desc="Evaluating by Combination Type")
 
-        for images, text_tokens, labels, texts, metas in eval_bar:
+        # Debug: 显示缓存的文本特征
+        if debug:
+            print("\n" + "=" * 80)
+            print("[DEBUG] Cached text features for inference:")
+            print("=" * 80)
+            for i, name in enumerate(self.class_names):
+                print(f"  [{i}] {name}")
+            print("=" * 80 + "\n")
+
+        debug_done = False
+        for batch_idx, (images, _, text_tokens, labels, texts, metas) in enumerate(eval_bar):
             images = images.to(self.device)
             labels = labels.to(self.device)
 
@@ -218,6 +277,37 @@ class CZSLEvaluator:
             preds = (probs > 0.5).float()
 
             batch_size = images.shape[0]
+
+            # Debug: 显示第一个批次的详细信息
+            if debug and not debug_done:
+                print("\n" + "=" * 80)
+                print(f"[DEBUG] Batch {batch_idx} — batch_size={batch_size}")
+                print("=" * 80)
+
+                # 显示训练时的文本描述
+                print("Training texts (from data loader):")
+                for i, txt in enumerate(texts[:5]):
+                    print(f"  [{i}] {txt}")
+
+                # 显示推理用的缓存模板
+                print("\nInference templates (cached):")
+                for i, cls in enumerate(self.class_names):
+                    print(f"  [{i}] a radar signal with single jamming: {cls}")
+
+                # 显示预测结果
+                print("\nPredictions vs Labels (sigmoid > 0.5):")
+                for i in range(min(5, batch_size)):
+                    true_label_indices = torch.where(labels[i] == 1)[0].tolist()
+                    pred_label_indices = torch.where(preds[i] == 1)[0].tolist()
+                    true_names = [self.class_names[idx] for idx in true_label_indices]
+                    pred_names_list = [self.class_names[idx] for idx in pred_label_indices]
+                    probs_str = [f"{probs[i, idx].item():.3f}" for idx in range(len(self.class_names))]
+                    print(f"  [{i}] True: {true_names} | Pred: {pred_names_list}")
+                    print(f"       Probs: {probs_str}")
+
+                print("=" * 80 + "\n")
+                debug_done = True
+
             for i in range(batch_size):
                 true_comb = tuple(sorted(torch.where(labels[i] == 1)[0].tolist()))
                 pred_comb = tuple(sorted(torch.where(preds[i] == 1)[0].tolist()))
@@ -540,7 +630,7 @@ class CZSLEvaluator:
 
         eval_bar = tqdm(data_loader, desc="Saving STFT images")
 
-        for images, text_tokens, labels, texts, metas in eval_bar:
+        for images, _, text_tokens, labels, texts, metas in eval_bar:
             images = images.to(self.device)
             labels = labels.to(self.device)
 
@@ -660,7 +750,7 @@ def main():
                         help="Path to config file")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint")
-    parser.add_argument("--mode", type=str, default="zero_shot",
+    parser.add_argument("--mode", type=str, default="by_combination",
                         choices=["zero_shot", "by_combination"],
                         help="Evaluation mode")
     parser.add_argument("--split", type=str, default="test",
@@ -747,7 +837,7 @@ def main():
     # 评估
     if args.mode == "zero_shot":
         print(f"\nEvaluating on {args.split} set with zero-shot mode...")
-        results = evaluator.evaluate_zero_shot(data_loader, use_combinations=True)
+        results = evaluator.evaluate_zero_shot(data_loader, use_combinations=True, debug=True)
         evaluator.print_metrics(results["metrics"])
 
         # 从配置获取seen/unseen组合
@@ -824,7 +914,8 @@ def main():
         metrics = evaluator.evaluate_by_combination_type(
             data_loader,
             seen_combinations=seen_combinations,
-            unseen_combinations=unseen_combinations
+            unseen_combinations=unseen_combinations,
+            debug=True
         )
 
         print("\n" + "=" * 60)

@@ -53,11 +53,11 @@ def collate_fn(batch):
     labels = torch.stack(labels, dim=0)
 
     # 使用 metadata_template 生成文本描述并 tokenize
-    # 使用 'visual_param' 风格：视觉特征 + 参数强度
+    # 使用 'template' 风格：固定的视觉特征描述（与推理一致）
     texts = []
     for meta in metadata_list:
-        text = generate_text_descriptions(meta, style='simple')
-        # text = generate_short_description(meta, style='meta')
+        # 使用 template 风格，与推理时的缓存文本格式一致
+        text = generate_text_descriptions(meta, style='meta')
         texts.append(text)
 
     text_tokens = clip.tokenize(texts, truncate=True)

@@ -40,9 +40,9 @@ loss:
 
 # 数据配置
 data:
-  base_path: "D:/VScode/Jamming_signal_simulation/output/260414"
-  jnr_start: 10
-  jnr_end: 10
+  base_path: "D:/VScode/Jamming_signal_simulation/output/260415"
+  jnr_start: 0
+  jnr_end: 20
   jnr_step: 5
   num_workers: 4
   pin_memory: true

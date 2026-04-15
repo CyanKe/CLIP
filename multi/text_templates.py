@@ -120,6 +120,55 @@ def get_template_description(jam_type) -> str:
     return f"{name} looks like {template['base']}"
 
 
+def get_combined_template_description(jam_types: list) -> str:
+    """
+    生成组合干扰的模板描述
+
+    Args:
+        jam_types: 干扰类型列表，如 ["DFTJ", "ISRJ"]
+
+    Returns:
+        模板描述，如 "DFTJ and ISRJ combined: dense false targets with discontinuous signal slices"
+    """
+    if not jam_types:
+        return "a radar signal with unknown jamming"
+
+    if len(jam_types) == 1:
+        return get_template_description(jam_types[0])
+
+    # 组合情况：拼接各类型的名称和特征
+    names = [get_jam_type_name(jt) for jt in jam_types]
+    features = []
+    for jt in jam_types:
+        jam_id = get_jam_type_id(jt)
+        template = VISUAL_TEMPLATES.get(jam_id, {'base': 'unknown pattern'}) if jam_id else {'base': 'unknown pattern'}
+        features.append(template['base'])
+
+    return f"{' and '.join(names)} combined: {', '.join(features)}"
+
+
+def get_inference_description(jam_types: list) -> str:
+    """
+    生成推理用的描述（与训练格式一致，但不包含具体参数）
+
+    Args:
+        jam_types: 干扰类型列表，如 ["DFTJ"] 或 ["DFTJ", "ISRJ"]
+
+    Returns:
+        描述字符串，如 "a radar signal with single jamming: CSJ" 或
+        "a radar signal with combined jamming: CSJ, DFTJ"
+    """
+    if not jam_types:
+        return "a radar signal with unknown jamming"
+
+    names = [get_jam_type_name(jt) for jt in jam_types]
+
+    if len(names) == 1:
+        return f"a radar signal with single jamming: {names[0]}"
+    else:
+        return f"a radar signal with combined jamming: {', '.join(names)}"
+
+
 def get_meta_description(metadata: dict) -> str:
     """
     生成结合 metadata 的动态描述
@@ -227,7 +276,7 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all') -> dic
         if metadata and 'jam_types' in metadata:
             jam_types = _normalize_jam_types(metadata.get('jam_types'))
             if jam_types:
-                return get_template_description(jam_types[0])
+                return get_combined_template_description(jam_types)
         return "a radar signal with jamming"
 
     elif style == 'meta':
