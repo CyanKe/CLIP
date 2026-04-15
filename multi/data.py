@@ -33,6 +33,7 @@ def collate_fn(batch):
         stft_images, time_signals, text_tokens, labels, texts, metadata_list
     """
     from multi.text_templates import generate_text_descriptions
+    from multi.metadata_template import generate_short_description
     import clip
 
     # 检查第一个样本的长度以确定是否包含时域信号
@@ -55,7 +56,8 @@ def collate_fn(batch):
     # 使用 'visual_param' 风格：视觉特征 + 参数强度
     texts = []
     for meta in metadata_list:
-        text = generate_text_descriptions(meta, style='meta')
+        text = generate_text_descriptions(meta, style='simple')
+        # text = generate_short_description(meta, style='meta')
         texts.append(text)
 
     text_tokens = clip.tokenize(texts, truncate=True)
