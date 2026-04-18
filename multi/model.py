@@ -14,6 +14,7 @@ import math
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import clip
 import torchvision.models as models
+from multi.lora import apply_lora_to_model, freeze_non_lora_params, count_parameters
 
 
 class ResNet18Visual(nn.Module):
@@ -347,7 +348,8 @@ class CLIPForCZSL(nn.Module):
         self,
         max_combination_size: int = 2,
         include_single: bool = True,
-        seen_combinations: list = None
+        seen_combinations: list = None,
+        use_translation: bool = False
     ):
         """
         缓存所有类别和组合的文本特征
@@ -357,6 +359,7 @@ class CLIPForCZSL(nn.Module):
             max_combination_size: 最大组合大小
             include_single: 是否包含单干扰
             seen_combinations: 已见组合列表（用于 CZSL）
+            use_translation: 是否使用翻译后的类别名称（如 "Dense False Target Jamming"）
         """
         self.eval()
         from itertools import combinations
@@ -369,7 +372,7 @@ class CLIPForCZSL(nn.Module):
             from multi.text_templates import get_inference_description
             for cls_name in self.class_names:
                 # 使用与训练一致的格式（无参数版本）
-                desc = get_inference_description([cls_name])
+                desc = get_inference_description([cls_name], use_translation=use_translation)
 
                 tokens = clip.tokenize(desc, truncate=True).to(self.device)
                 features = self.encode_text(tokens)
@@ -384,7 +387,7 @@ class CLIPForCZSL(nn.Module):
                 combo_only = [c for c in seen_combinations if len(c) > 1]
                 for combo in combo_only:
                     # 使用与训练一致的格式（无参数版本）
-                    combined_desc = get_inference_description(list(combo))
+                    combined_desc = get_inference_description(list(combo), use_translation=use_translation)
                     tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
                     features = self.encode_text(tokens)
                     features = F.normalize(features, dim=-1)
@@ -395,7 +398,7 @@ class CLIPForCZSL(nn.Module):
                     cls1, cls2 = self.class_names[i], self.class_names[j]
 
                     # 使用与训练一致的格式（无参数版本）
-                    combined_desc = get_inference_description([cls1, cls2])
+                    combined_desc = get_inference_description([cls1, cls2], use_translation=use_translation)
                     tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
                     features = self.encode_text(tokens)
                     features = F.normalize(features, dim=-1)
@@ -412,6 +415,8 @@ class CLIPForCZSL(nn.Module):
             print(f"  - Seen combinations (from config): {len(all_names) - len(self.class_names)}")
         else:
             print(f"  - Combinations (all pairs): {len(all_names) - len(self.class_names)}")
+        if use_translation:
+            print(f"  - Using translated names: True")
 
     def get_cached_text_features(self) -> torch.Tensor:
         """获取缓存的文本特征"""
@@ -520,6 +525,34 @@ def create_czsl_model(config: dict, device: str = "cuda") -> CLIPForCZSL:
         use_time_domain=use_time_domain,
         time_seq_len=time_seq_len
     )
+
+    # LoRA 配置
+    lora_config = config.get("lora", {})
+    if lora_config.get("enabled", False):
+        print("\n" + "=" * 60)
+        print("Applying LoRA to model...")
+        print("=" * 60)
+
+        target_modules = lora_config.get("target_modules", ["attn"])
+        if isinstance(target_modules, str):
+            target_modules = [target_modules]
+
+        replaced = apply_lora_to_model(
+            model.model,
+            target_modules=target_modules,
+            rank=lora_config.get("rank", 8),
+            alpha=lora_config.get("alpha", 16.0),
+            dropout=lora_config.get("dropout", 0.0)
+        )
+
+        # 冻结非 LoRA 参数
+        freeze_non_lora_params(model.model)
+
+        # 统计参数
+        stats = count_parameters(model.model)
+        print(f"\nLoRA applied to {replaced} layers")
+        print(f"Trainable parameters: {stats['trainable']:,} ({stats['trainable_ratio']:.2%})")
+        print("=" * 60)
 
     return model
 

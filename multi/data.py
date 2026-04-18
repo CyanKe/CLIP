@@ -57,7 +57,9 @@ def collate_fn(batch):
     texts = []
     for meta in metadata_list:
         # 使用 template 风格，与推理时的缓存文本格式一致
-        text = generate_text_descriptions(meta, style='meta')
+        # text = generate_text_descriptions(meta, style='imagenet')
+        text = generate_short_description(meta,'meta')
+        text = generate_text_descriptions(meta,style = 'meta')
         texts.append(text)
 
     text_tokens = clip.tokenize(texts, truncate=True)
@@ -223,6 +225,7 @@ class STFTDataset(Dataset):
 
         # 5. 构建三通道张量
         stft_tensor = torch.from_numpy(np.stack([stft_real, stft_imag, stft_mag], axis=0)).float()
+        stft_tensor = torch.from_numpy(np.stack([stft_mag, stft_mag, stft_mag], axis=0)).float()
 
         # 6. Resize 到目标尺寸 (如果还不是 224x224)
         if stft_tensor.shape[-2:] != (self.image_size, self.image_size):

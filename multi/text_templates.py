@@ -6,6 +6,63 @@
 3. meta: 结合 metadata 的动态描述，如 "DFTJ with JNR=10dB, k=5"
 """
 
+import yaml
+from pathlib import Path
+
+# ============================================================================
+# 类别名称翻译字典（从 config.yaml 加载）
+# ============================================================================
+_LABEL_TRANSLATIONS = None
+
+def load_label_translations(config_path: str = None) -> dict:
+    """
+    从配置文件加载类别名称翻译字典
+
+    Args:
+        config_path: 配置文件路径，默认为 multi/config.yaml
+
+    Returns:
+        翻译字典，如 {"DFTJ": "Dense False Target Jamming", ...}
+    """
+    global _LABEL_TRANSLATIONS
+
+    if _LABEL_TRANSLATIONS is not None:
+        return _LABEL_TRANSLATIONS
+
+    if config_path is None:
+        config_path = Path(__file__).parent / "config.yaml"
+
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        _LABEL_TRANSLATIONS = config.get("label_translations", {})
+    except Exception as e:
+        print(f"Warning: Failed to load label translations: {e}")
+        _LABEL_TRANSLATIONS = {}
+
+    return _LABEL_TRANSLATIONS
+
+
+def get_translated_name(jam_type, use_translation: bool = True) -> str:
+    """
+    获取干扰类型的翻译名称
+
+    Args:
+        jam_type: 干扰类型名称（如 "DFTJ"）
+        use_translation: 是否使用翻译后的名称
+
+    Returns:
+        翻译后的名称（如 "Dense False Target Jamming"）或原始名称
+    """
+    name = get_jam_type_name(jam_type) if not isinstance(jam_type, str) else jam_type
+
+    if use_translation:
+        translations = load_label_translations()
+        return translations.get(name, name)
+
+    return name
+
+
 # ============================================================================
 # 干扰类型名称映射
 # ============================================================================
@@ -52,6 +109,92 @@ VISUAL_TEMPLATES = {
     15: {'base': 'comb-like diagonal lines', 'param': 'M'},
     16: {'base': 'phase coded pattern', 'param': None},
 }
+
+# ============================================================================
+# ImageNet 风格模板 (用于增强文本多样性)
+# ============================================================================
+IMAGENET_TEMPLATES = [
+    'a bad photo of a {}.',
+    'a photo of many {}.',
+    'a sculpture of a {}.',
+    'a photo of the hard to see {}.',
+    'a low resolution photo of the {}.',
+    'a rendering of a {}.',
+    'graffiti of a {}.',
+    'a bad photo of the {}.',
+    'a cropped photo of the {}.',
+    'a tattoo of a {}.',
+    'the embroidered {}.',
+    'a photo of a hard to see {}.',
+    'a bright photo of a {}.',
+    'a photo of a clean {}.',
+    'a photo of a dirty {}.',
+    'a dark photo of the {}.',
+    'a drawing of a {}.',
+    'a photo of my {}.',
+    'the plastic {}.',
+    'a photo of the cool {}.',
+    'a close-up photo of a {}.',
+    'a black and white photo of the {}.',
+    'a painting of the {}.',
+    'a painting of a {}.',
+    'a pixelated photo of the {}.',
+    'a sculpture of the {}.',
+    'a bright photo of the {}.',
+    'a cropped photo of a {}.',
+    'a plastic {}.',
+    'a photo of the dirty {}.',
+    'a jpeg corrupted photo of a {}.',
+    'a blurry photo of the {}.',
+    'a photo of the {}.',
+    'a good photo of the {}.',
+    'a rendering of the {}.',
+    'a {} in a video game.',
+    'a photo of one {}.',
+    'a doodle of a {}.',
+    'a close-up photo of the {}.',
+    'a photo of a {}.',
+    'the origami {}.',
+    'the {} in a video game.',
+    'a sketch of a {}.',
+    'a doodle of the {}.',
+    'a origami {}.',
+    'a low resolution photo of a {}.',
+    'the toy {}.',
+    'a rendition of the {}.',
+    'a photo of the clean {}.',
+    'a photo of a large {}.',
+    'a rendition of a {}.',
+    'a photo of a nice {}.',
+    'a photo of a weird {}.',
+    'a blurry photo of a {}.',
+    'a cartoon {}.',
+    'art of a {}.',
+    'a sketch of the {}.',
+    'a embroidered {}.',
+    'a pixelated photo of a {}.',
+    'itap of the {}.',
+    'a jpeg corrupted photo of the {}.',
+    'a good photo of a {}.',
+    'a plushie {}.',
+    'a photo of the nice {}.',
+    'a photo of the small {}.',
+    'a photo of the weird {}.',
+    'the cartoon {}.',
+    'art of the {}.',
+    'a drawing of the {}.',
+    'a photo of the large {}.',
+    'a black and white photo of a {}.',
+    'the plushie {}.',
+    'a dark photo of a {}.',
+    'itap of a {}.',
+    'graffiti of the {}.',
+    'a toy {}.',
+    'itap of my {}.',
+    'a photo of a cool {}.',
+    'a photo of a small {}.',
+    'a tattoo of the {}.',
+]
 
 
 def get_jam_type_name(jam_type) -> str:
@@ -147,21 +290,23 @@ def get_combined_template_description(jam_types: list) -> str:
     return f"{' and '.join(names)} combined: {', '.join(features)}"
 
 
-def get_inference_description(jam_types: list) -> str:
+def get_inference_description(jam_types: list, use_translation: bool = False) -> str:
     """
     生成推理用的描述（与训练格式一致，但不包含具体参数）
 
     Args:
         jam_types: 干扰类型列表，如 ["DFTJ"] 或 ["DFTJ", "ISRJ"]
+        use_translation: 是否使用翻译后的名称（如 "Dense False Target Jamming"）
 
     Returns:
         描述字符串，如 "a radar signal with single jamming: CSJ" 或
-        "a radar signal with combined jamming: CSJ, DFTJ"
+        "a radar signal with combined jamming: CSJ, DFTJ" 或
+        "a radar signal with single jamming: Dense False Target Jamming" (启用翻译时)
     """
     if not jam_types:
         return "a radar signal with unknown jamming"
 
-    names = [get_jam_type_name(jt) for jt in jam_types]
+    names = [get_translated_name(jt, use_translation) for jt in jam_types]
 
     if len(names) == 1:
         return f"a radar signal with single jamming: {names[0]}"
@@ -169,16 +314,18 @@ def get_inference_description(jam_types: list) -> str:
         return f"a radar signal with combined jamming: {', '.join(names)}"
 
 
-def get_meta_description(metadata: dict) -> str:
+def get_meta_description(metadata: dict, use_translation: bool = False) -> str:
     """
     生成结合 metadata 的动态描述
 
     Args:
         metadata: metadata 字典，包含 jam_types, JNR, jam_params 等
                   jam_types 格式支持: "DFTJ", ["DFTJ"], ["DFTJ", "AJ"]
+        use_translation: 是否使用翻译后的名称（如 "Dense False Target Jamming"）
 
     Returns:
-        动态描述，如 "DFTJ with JNR=10dB, k=5 false targets"
+        动态描述，如 "DFTJ with JNR=10dB, k=5 false targets" 或
+        "Dense False Target Jamming with JNR=10dB, k=5 false targets" (启用翻译时)
     """
     jam_types = metadata.get('jam_types', [])
     jam_params = metadata.get('jam_params', {})
@@ -196,7 +343,7 @@ def get_meta_description(metadata: dict) -> str:
     descriptions = []
 
     for jam_type in jam_types:
-        name = get_jam_type_name(jam_type)
+        name = get_translated_name(jam_type, use_translation)
         jam_id = get_jam_type_id(jam_type)
         template = VISUAL_TEMPLATES.get(jam_id, {'base': 'unknown pattern', 'param': None}) if jam_id else {'base': 'unknown pattern', 'param': None}
 
@@ -231,6 +378,25 @@ def get_meta_description(metadata: dict) -> str:
         return f"a radar signal with combined jamming: {', '.join(descriptions)}"
 
 
+def get_imagenet_descriptions(jam_type, context: str = "radar signal") -> list:
+    """
+    用 ImageNet 模板生成多样化描述
+
+    Args:
+        jam_type: 干扰类型编号或名称
+        context: 上下文描述，默认 "radar signal"
+
+    Returns:
+        描述列表，如 ["a photo of a radar signal with DFTJ.", ...]
+    """
+    if jam_type is None:
+        subject = context
+    else:
+        name = get_jam_type_name(jam_type)
+        subject = f"{context} with {name}"
+    return [t.format(subject) for t in IMAGENET_TEMPLATES]
+
+
 def _normalize_jam_types(jam_types) -> list:
     """
     规范化 jam_types 为列表格式
@@ -250,7 +416,7 @@ def _normalize_jam_types(jam_types) -> list:
     return []
 
 
-def generate_text_descriptions(metadata: dict = None, style: str = 'all') -> dict:
+def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_translation: bool = False) -> dict:
     """
     生成文本描述（支持 3 种策略）
 
@@ -261,6 +427,7 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all') -> dic
             - 'template': 模板描述
             - 'meta': 结合 metadata 的动态描述
             - 'all': 返回所有风格
+        use_translation: 是否使用翻译后的名称（如 "Dense False Target Jamming"）
 
     Returns:
         文本描述（str 或 dict）
@@ -269,7 +436,7 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all') -> dic
         if metadata and 'jam_types' in metadata:
             jam_types = _normalize_jam_types(metadata.get('jam_types'))
             if jam_types:
-                return get_simple_description(jam_types[0])
+                return get_translated_name(jam_types[0], use_translation)
         return "a radar signal"
 
     elif style == 'template':
@@ -281,8 +448,15 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all') -> dic
 
     elif style == 'meta':
         if metadata:
-            return get_meta_description(metadata)
+            return get_meta_description(metadata, use_translation=use_translation)
         return "a radar signal with jamming"
+
+    elif style == 'imagenet':
+        if metadata and 'jam_types' in metadata:
+            jam_types = _normalize_jam_types(metadata.get('jam_types'))
+            if jam_types:
+                return get_imagenet_descriptions(jam_types[0])
+        return get_imagenet_descriptions(None, context="radar signal with unknown jamming")
 
     elif style == 'all':
         result = {
@@ -293,10 +467,10 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all') -> dic
         if metadata and 'jam_types' in metadata:
             jam_types = _normalize_jam_types(metadata.get('jam_types'))
             if jam_types:
-                result['simple'] = get_simple_description(jam_types[0])
+                result['simple'] = get_translated_name(jam_types[0], use_translation)
                 result['template'] = get_template_description(jam_types[0])
         if metadata:
-            result['meta'] = get_meta_description(metadata)
+            result['meta'] = get_meta_description(metadata, use_translation=use_translation)
         return result
 
     return "a radar signal"

@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from multi.model import create_czsl_model, CLIPForCZSL
 from multi.data import create_czsl_dataloaders
+from multi.loss import create_loss_function, LabelAwareInfoNCELoss
 
 
 class CZSLTrainer:
@@ -60,6 +61,13 @@ class CZSLTrainer:
         self.checkpoint_config = config.get("checkpoint", {})
         self.save_dir = Path(self.checkpoint_config.get("save_dir", "checkpoints"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        # 初始化损失函数
+        self.loss_fn = create_loss_function(config)
+        self.use_label_aware_loss = isinstance(self.loss_fn, LabelAwareInfoNCELoss)
+        print(f"Using loss function: {type(self.loss_fn).__name__}")
+        if self.use_label_aware_loss:
+            print(f"  handle_zero_sum: {self.loss_fn.handle_zero_sum}")
 
     def train_epoch(self, debug: bool = False) -> dict:
         """训练一个 epoch - 使用标准 InfoNCE"""
@@ -115,16 +123,23 @@ class CZSLTrainer:
             # 对比学习前向传播 (传入时域信号)
             image_features, text_features = self.model(stft_images, text_tokens, time_signals)
 
-            # 计算相似度矩阵
-            logit_scale = self.model.model.logit_scale.exp()
-            logits_per_image = logit_scale * (image_features @ text_features.t())
-            logits_per_text = logits_per_image.t()
+            # 计算损失
+            if self.use_label_aware_loss:
+                # 使用标签感知损失函数
+                loss, logits_per_image, loss_info = self.loss_fn(
+                    image_features, text_features, labels
+                )
+                logits_per_text = logits_per_image.T
+            else:
+                # 标准 InfoNCE 损失：对角线为正样本对
+                logit_scale = self.model.model.logit_scale.exp()
+                logits_per_image = logit_scale * (image_features @ text_features.t())
+                logits_per_text = logits_per_image.t()
 
-            # InfoNCE 损失：对角线为正样本对
-            targets = torch.arange(batch_size, device=self.device)
-            loss_i2t = F.cross_entropy(logits_per_image, targets)
-            loss_t2i = F.cross_entropy(logits_per_text, targets)
-            loss = (loss_i2t + loss_t2i) / 2
+                targets = torch.arange(batch_size, device=self.device)
+                loss_i2t = F.cross_entropy(logits_per_image, targets)
+                loss_t2i = F.cross_entropy(logits_per_text, targets)
+                loss = (loss_i2t + loss_t2i) / 2
 
             loss.backward()
 
@@ -136,8 +151,11 @@ class CZSLTrainer:
 
             total_loss += loss.item() * batch_size
 
-            # 计算对比学习准确率
+            # 计算对比学习准确率（对角线准确率作为参考指标）
             with torch.no_grad():
+                # 对于 label-aware 模式，对角线准确率仅供参考
+                # 实际评估应使用 zero-shot 或 KNN
+                targets = torch.arange(batch_size, device=self.device)
                 pred_i2t = logits_per_image.argmax(dim=1)
                 pred_t2i = logits_per_text.argmax(dim=1)
                 total_correct += (pred_i2t == targets).sum().item()
@@ -204,17 +222,28 @@ class CZSLTrainer:
 
             image_features, text_features = self.model(stft_images, text_tokens, time_signals)
 
-            logit_scale = self.model.model.logit_scale.exp()
-            logits_per_image = logit_scale * (image_features @ text_features.t())
-            logits_per_text = logits_per_image.t()
+            # 计算损失
+            if self.use_label_aware_loss:
+                # 使用标签感知损失函数
+                loss, logits_per_image, loss_info = self.loss_fn(
+                    image_features, text_features, labels
+                )
+                logits_per_text = logits_per_image.T
+            else:
+                # 标准 InfoNCE 损失
+                logit_scale = self.model.model.logit_scale.exp()
+                logits_per_image = logit_scale * (image_features @ text_features.t())
+                logits_per_text = logits_per_image.t()
 
-            targets = torch.arange(batch_size, device=self.device)
-            loss_i2t = F.cross_entropy(logits_per_image, targets)
-            loss_t2i = F.cross_entropy(logits_per_text, targets)
-            loss = (loss_i2t + loss_t2i) / 2
+                targets = torch.arange(batch_size, device=self.device)
+                loss_i2t = F.cross_entropy(logits_per_image, targets)
+                loss_t2i = F.cross_entropy(logits_per_text, targets)
+                loss = (loss_i2t + loss_t2i) / 2
 
             total_loss += loss.item() * batch_size
 
+            # 计算对角线准确率（仅供参考）
+            targets = torch.arange(batch_size, device=self.device)
             pred_i2t = logits_per_image.argmax(dim=1)
             pred_t2i = logits_per_text.argmax(dim=1)
             total_correct += (pred_i2t == targets).sum().item()

@@ -2,11 +2,11 @@
 损失函数模块 - 支持多标签分类和对比学习
 包含CLIP风格的InfoNCE对比损失用于CZSL
 """
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
-
+from typing import Tuple
 
 class InfoNCELoss(nn.Module):
     """
@@ -41,7 +41,6 @@ class InfoNCELoss(nn.Module):
         self,
         image_features: torch.Tensor,
         text_features: torch.Tensor,
-        labels: torch.Tensor = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         计算InfoNCE损失
@@ -49,8 +48,6 @@ class InfoNCELoss(nn.Module):
         Args:
             image_features: 图像特征 [batch_size, embed_dim]
             text_features: 文本特征 [batch_size, embed_dim]
-            labels: 可选的标签（用于多标签扩展）
-
         Returns:
             loss: 对比损失
             logits: 相似度矩阵
@@ -62,7 +59,7 @@ class InfoNCELoss(nn.Module):
         text_features = F.normalize(text_features, dim=-1)
 
         # 获取温度缩放因子
-        logit_scale = self.logit_scale.exp()
+        logit_scale = self.logit_scale.exp().clamp(max=100)
 
         # 计算相似度矩阵
         # [batch_size, batch_size]
@@ -84,66 +81,212 @@ class InfoNCELoss(nn.Module):
 
         return loss, logits_per_image
 
-
-class MultiLabelInfoNCELoss(nn.Module):
+class LabelAwareInfoNCELoss(nn.Module):
     """
-    多标签InfoNCE损失
-    支持一个图像对应多个文本描述的场景
+    标签感知的软目标 InfoNCE 损失 (Soft-Target CLIP Loss)
+    解决小类别/大 Batch Size 场景下的同类互斥 (False Negative) 问题
     """
 
     def __init__(
         self,
         temperature: float = 0.07,
-        label_smoothing: float = 0.0
+        learnable_temperature: bool = True,
+        label_smoothing: float = 0.0,
+        max_temperature: float = 100.0
     ):
-        """
-        初始化
-
-        Args:
-            temperature: 温度参数
-            label_smoothing: 标签平滑系数
-        """
         super().__init__()
-        self.temperature = temperature
         self.label_smoothing = label_smoothing
+        self.max_temperature = max_temperature
+
+        init_val = math.log(1 / temperature)
+        if learnable_temperature:
+            self.logit_scale = nn.Parameter(torch.tensor(init_val))
+        else:
+            self.register_buffer('logit_scale', torch.tensor(init_val))
+
+    def _build_target_matrix(self, labels: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        """
+        构建软标签目标矩阵
+        Returns:
+            target_matrix: 归一化后的目标分布矩阵 [batch_size, batch_size]
+            avg_pos: 平均每个样本的正样本数量 (用于监控)
+        """
+        batch_size = labels.shape[0]
+
+        if labels.dim() == 2:
+            # 判断多热/单热标签是否完全相同 [batch, batch]
+            # 如果需要"部分重合就算正样本"，这里可以改为计算余弦相似度或交并比
+            label_equality = (labels.unsqueeze(1) == labels.unsqueeze(0)).all(dim=-1).float()
+        else:
+            # 1D labels: 直接判断类别ID是否相等
+            label_equality = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
+
+        # 记录归一化前的平均正样本数（自身也算1个）
+        avg_pos = label_equality.sum(dim=1).mean().item()
+
+        # 归一化每行，使其成为概率分布 (因为对角线必为1，所以分母不可能为0)
+        row_sums = label_equality.sum(dim=1, keepdim=True)
+        target_matrix = label_equality / row_sums
+
+        return target_matrix, avg_pos
 
     def forward(
         self,
         image_features: torch.Tensor,
         text_features: torch.Tensor,
         labels: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
-        计算多标签InfoNCE损失
-
         Args:
             image_features: 图像特征 [batch_size, embed_dim]
-            text_features: 文本特征 [num_texts, embed_dim]
-            labels: 多标签指示 [batch_size, num_texts]
-                   labels[i, j] = 1 表示图像i与文本j匹配
+            text_features: 文本特征 [batch_size, embed_dim]
+            labels: 标签 [batch_size, num_classes] 或 [batch_size]
 
         Returns:
-            损失值
+            loss: 损失值
+            logits_per_image: 相似度矩阵
+            info_dict: 监控信息
         """
-        batch_size = image_features.shape[0]
-        num_texts = text_features.shape[0]
-
-        # 归一化
+        # 1. 特征归一化
         image_features = F.normalize(image_features, dim=-1)
         text_features = F.normalize(text_features, dim=-1)
 
-        # 计算相似度 [batch_size, num_texts]
-        logits = (image_features @ text_features.t()) / self.temperature
+        # 2. 温度缩放 (加入 clamp 防止爆炸)
+        logit_scale = self.logit_scale.exp().clamp(max=self.max_temperature)
 
-        # 标签平滑
-        if self.label_smoothing > 0:
-            labels = labels * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+        # 3. 计算 Logits
+        logits_per_image = logit_scale * (image_features @ text_features.T)
+        logits_per_text = logits_per_image.T
 
-        # 使用二元交叉熵损失
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        # 4. 构建目标矩阵
+        target_matrix, avg_pos_pairs = self._build_target_matrix(labels)
 
-        return loss
+        # 5. 计算交叉熵损失
+        # 注意: PyTorch 的 F.cross_entropy 原生支持 Target 为概率分布 (软标签)
+        # 且原生支持 label_smoothing 参数
+        loss_i = F.cross_entropy(
+            logits_per_image, 
+            target_matrix, 
+            label_smoothing=self.label_smoothing
+        )
+        # 注意：这里也是传入 target_matrix，而不是 target_matrix.T
+        loss_t = F.cross_entropy(
+            logits_per_text, 
+            target_matrix, 
+            label_smoothing=self.label_smoothing
+        )
 
+        total_loss = (loss_i + loss_t) / 2.0
+
+        # 6. 监控字典
+        info_dict = {
+            "loss_i2t": loss_i.item(),
+            "loss_t2i": loss_t.item(),
+            "logit_scale": logit_scale.item(),
+            "avg_positive_pairs": avg_pos_pairs  # 真实的正样本数量
+        }
+
+        return total_loss, logits_per_image, info_dict
+
+class MultiLabelInfoNCELoss(nn.Module):
+    """
+    多标签感知的软目标 InfoNCE 损失 (Multi-Label Soft-CLIP Loss)
+    """
+
+    def __init__(
+        self,
+        temperature: float = 0.07,
+        learnable_temperature: bool = True,
+        label_smoothing: float = 0.0,
+        max_temperature: float = 100.0,
+        similarity_metric: str = "iou"  # 新增: 'iou' 或 'dot'
+    ):
+        super().__init__()
+        self.label_smoothing = label_smoothing
+        self.max_temperature = max_temperature
+        
+        assert similarity_metric in ["iou", "dot"], "Metric must be 'iou' or 'dot'"
+        self.similarity_metric = similarity_metric
+
+        init_val = math.log(1 / temperature)
+        if learnable_temperature:
+            self.logit_scale = nn.Parameter(torch.tensor(init_val))
+        else:
+            self.register_buffer('logit_scale', torch.tensor(init_val))
+
+    def _build_target_matrix(self, labels: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        """
+        构建多标签软目标矩阵
+        Args:
+            labels: Multi-Hot 标签矩阵 [batch_size, num_classes], 值为 0 或 1
+        """
+        # 确保标签是浮点数，用于矩阵计算
+        labels = labels.float()
+        
+        # 1. 高效计算交集 (Intersection)
+        # 矩阵乘法 labels @ labels.T 直接得到两两样本之间共同标签的数量
+        # intersection 形状: [batch_size, batch_size]
+        intersection = torch.matmul(labels, labels.T)
+
+        if self.similarity_metric == "iou":
+            # 2. 计算并集 (Union)
+            # 公式: |A U B| = |A| + |B| - |A ∩ B|
+            label_sums = labels.sum(dim=-1) # [batch_size]
+            # 利用广播机制计算每对样本的 |A| + |B|
+            union = label_sums.unsqueeze(1) + label_sums.unsqueeze(0) - intersection
+            
+            # 避免除以0 (如果某样本一个标签都没有)
+            union = union.clamp(min=1e-8)
+            
+            # 计算 IoU: [batch_size, batch_size]
+            similarity = intersection / union
+        else:
+            # 直接使用内积 (交集数量)
+            similarity = intersection
+
+        # 3. 统计指标: 平均有多少个样本具有共享标签(>0)
+        avg_pos = (similarity > 0).float().sum(dim=1).mean().item()
+
+        # 4. 按行归一化，变成概率分布
+        # 每一行的和必须为1，才能供 F.cross_entropy 使用
+        row_sums = similarity.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        target_matrix = similarity / row_sums
+
+        return target_matrix, avg_pos
+
+    def forward(
+        self,
+        image_features: torch.Tensor,
+        text_features: torch.Tensor,
+        labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        
+        # [前向传播代码与之前完全一致]
+        image_features = F.normalize(image_features, dim=-1)
+        text_features = F.normalize(text_features, dim=-1)
+
+        logit_scale = self.logit_scale.exp().clamp(max=self.max_temperature)
+
+        logits_per_image = logit_scale * (image_features @ text_features.T)
+        logits_per_text = logits_per_image.T
+
+        # 获取基于多标签计算出来的目标概率矩阵
+        target_matrix, avg_pos_pairs = self._build_target_matrix(labels)
+
+        # 计算交叉熵 (PyTorch原生支持软标签 Target)
+        loss_i = F.cross_entropy(logits_per_image, target_matrix, label_smoothing=self.label_smoothing)
+        loss_t = F.cross_entropy(logits_per_text, target_matrix, label_smoothing=self.label_smoothing)
+
+        total_loss = (loss_i + loss_t) / 2.0
+
+        info_dict = {
+            "loss_i2t": loss_i.item(),
+            "loss_t2i": loss_t.item(),
+            "logit_scale": logit_scale.item(),
+            "avg_positive_pairs": avg_pos_pairs 
+        }
+
+        return total_loss, logits_per_image, info_dict
 
 class CZSLContrastiveLoss(nn.Module):
     """
@@ -225,7 +368,6 @@ class CZSLContrastiveLoss(nn.Module):
         """获取温度缩放因子"""
         return self.contrastive_loss.logit_scale.exp()
 
-
 class MultiLabelContrastiveLoss(nn.Module):
     """
     多标签对比损失
@@ -288,7 +430,6 @@ class MultiLabelContrastiveLoss(nn.Module):
 
         return loss
 
-
 class AsymmetricLoss(nn.Module):
     """
     非对称损失 (ASL)
@@ -348,7 +489,6 @@ class AsymmetricLoss(nn.Module):
         loss = -pos_loss - neg_loss
         return loss.mean()
 
-
 class FocalLoss(nn.Module):
     """
     Focal Loss for Multi-label Classification
@@ -403,7 +543,6 @@ class FocalLoss(nn.Module):
         elif self.reduction == "sum":
             return loss.sum()
         return loss
-
 
 class CombinedLoss(nn.Module):
     """
@@ -467,7 +606,6 @@ class CombinedLoss(nn.Module):
 
         return total_loss
 
-
 def create_loss_function(config: dict) -> nn.Module:
     """
     根据配置创建损失函数
@@ -485,6 +623,13 @@ def create_loss_function(config: dict) -> nn.Module:
         return InfoNCELoss(
             temperature=loss_config.get("temperature", 0.07),
             learnable_temperature=loss_config.get("learnable_temperature", True)
+        )
+    elif loss_type == "label_aware_infonce":
+        return LabelAwareInfoNCELoss(
+            temperature=loss_config.get("temperature", 0.07),
+            learnable_temperature=loss_config.get("learnable_temperature", True),
+            label_smoothing=loss_config.get("label_smoothing", 0.0),
+            max_temperature= 100.0,
         )
     elif loss_type == "multilabel_infonce":
         return MultiLabelInfoNCELoss(

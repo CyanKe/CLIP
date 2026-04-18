@@ -1,6 +1,8 @@
 """
 CZSL评估脚本 - 支持零样本组合识别评估
 python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode zero_shot
+
+ python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode zero_shot --split test --visualize --output_dir results --save_stft
 """
 # pylint: disable=no-member
 
@@ -259,6 +261,11 @@ class CZSLEvaluator:
         seen_set = set(tuple(sorted(c)) for c in (seen_combinations or []))
         unseen_set = set(tuple(sorted(c)) for c in (unseen_combinations or []))
 
+        # 收集所有预测结果（用于保存混淆矩阵等）
+        all_labels = []
+        all_preds = []
+        all_features = []
+
         eval_bar = tqdm(data_loader, desc="Evaluating by Combination Type")
 
         # Debug: 显示缓存的文本特征
@@ -304,6 +311,11 @@ class CZSLEvaluator:
                     # 只选择概率超过阈值的 top-k
                     if topk_values[b, j] > threshold:
                         preds[b, idx] = 1.0
+
+            # 收集预测结果
+            all_labels.append(labels.cpu())
+            all_preds.append(preds.cpu())
+            all_features.append(image_features.cpu().numpy())
 
             # Debug: 显示第一个批次的详细信息
             if debug and not debug_done:
@@ -365,7 +377,17 @@ class CZSLEvaluator:
             "other_samples": other_results["total"]
         }
 
-        return metrics
+        # 合并所有结果
+        all_labels = torch.cat(all_labels).numpy()
+        all_preds = torch.cat(all_preds).numpy()
+        all_features = np.concatenate(all_features, axis=0)
+
+        return {
+            "metrics": metrics,
+            "labels": all_labels,
+            "predictions": all_preds,
+            "features": all_features
+        }
 
     def print_metrics(self, metrics: dict):
         """打印评估指标"""
@@ -574,6 +596,98 @@ class CZSLEvaluator:
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"t-SNE plot saved to {save_path}")
+        else:
+            plt.show()
+        plt.close()
+
+    def plot_feature_umap(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+        save_path: str = None,
+        seen_combinations: list = None,
+        unseen_combinations: list = None
+    ):
+        """
+        绘制特征的UMAP可视化
+
+        Args:
+            features: 特征向量 [num_samples, embed_dim]
+            labels: 标签 [num_samples, num_classes]
+            save_path: 保存路径
+            seen_combinations: 已见组合索引列表
+            unseen_combinations: 未见组合索引列表
+        """
+        try:
+            import umap
+        except ImportError:
+            print("UMAP not installed. Install with: pip install umap-learn")
+            return
+
+        print("Computing UMAP projection...")
+
+        # UMAP降维
+        reducer = umap.UMAP(
+            n_components=2,
+            random_state=42,
+            n_neighbors=15,
+            min_dist=0.1
+        )
+        features_2d = reducer.fit_transform(features)
+
+        # 将多标签转换为组合名称
+        comb_labels = []
+        for label in labels:
+            active = tuple(sorted(np.where(label == 1)[0].tolist()))
+            comb_labels.append(active)
+
+        # 转换为名称
+        seen_set = set(tuple(sorted(c)) for c in (seen_combinations or []))
+        unseen_set = set(tuple(sorted(c)) for c in (unseen_combinations or []))
+
+        unique_combs = sorted(set(comb_labels))
+        comb_to_name = {}
+        for comb in unique_combs:
+            if len(comb) == 0:
+                comb_to_name[comb] = "None"
+            else:
+                comb_to_name[comb] = "+".join([self.class_names[i] for i in comb])
+
+        # 为每个组合分配颜色
+        num_combs = len(unique_combs)
+        colors = plt.cm.tab20(np.linspace(0, 1, max(20, num_combs)))
+
+        # 绘图
+        fig, ax = plt.subplots(figsize=(14, 10))
+
+        for idx, comb in enumerate(unique_combs):
+            mask = np.array([c == comb for c in comb_labels])
+            if mask.sum() > 0:
+                name = comb_to_name[comb]
+                # 添加标记
+                if comb in seen_set:
+                    name = f"[S] {name}"
+                    marker = 'o'
+                elif comb in unseen_set:
+                    name = f"[U] {name}"
+                    marker = '^'
+                else:
+                    marker = 's'
+
+                ax.scatter(features_2d[mask, 0], features_2d[mask, 1],
+                          c=[colors[idx % 20]], label=name, alpha=0.6, s=30, marker=marker)
+
+        ax.set_xlabel('UMAP 1')
+        ax.set_ylabel('UMAP 2')
+        ax.set_title('Feature Space Visualization (UMAP)\n[S]=Seen, [U]=Unseen, □=Other')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"UMAP plot saved to {save_path}")
         else:
             plt.show()
         plt.close()
@@ -918,6 +1032,15 @@ def main():
                 unseen_combinations=unseen_combinations
             )
 
+            # UMAP可视化
+            evaluator.plot_feature_umap(
+                results["features"],
+                results["labels"],
+                save_path=str(output_dir / f"czsl_umap_{args.split}.png"),
+                seen_combinations=seen_combinations,
+                unseen_combinations=unseen_combinations
+            )
+
             # 标签共现矩阵
             evaluator.plot_label_cooccurrence(
                 results["labels"],
@@ -950,12 +1073,14 @@ def main():
         print(f"Seen combinations: {len(seen_combinations)}")
         print(f"Unseen combinations: {len(unseen_combinations)}")
 
-        metrics = evaluator.evaluate_by_combination_type(
+        results = evaluator.evaluate_by_combination_type(
             data_loader,
             seen_combinations=seen_combinations,
             unseen_combinations=unseen_combinations,
             debug=True
         )
+
+        metrics = results["metrics"]
 
         print("\n" + "=" * 60)
         print("Evaluation by Combination Type")
@@ -965,6 +1090,23 @@ def main():
         print(f"Other Accuracy:   {metrics['other_accuracy']:.4f} ({metrics['other_samples']} samples)")
 
         # 保存结果
+        np.savez(
+            str(output_dir / f"czsl_results_{args.split}.npz"),
+            labels=results["labels"],
+            predictions=results["predictions"],
+            features=results["features"]
+        )
+
+        # 绘制混淆矩阵
+        evaluator.plot_confusion_by_combination(
+            results["labels"],
+            results["predictions"],
+            save_path=str(output_dir / f"czsl_confusion_{args.split}.png"),
+            seen_combinations=seen_combinations,
+            unseen_combinations=unseen_combinations
+        )
+
+        # 保存文本结果
         with open(output_dir / "combination_results.txt", 'w') as f:
             f.write("Evaluation by Combination Type\n")
             f.write("=" * 40 + "\n")

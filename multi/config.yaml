@@ -5,13 +5,13 @@
 # CLIP模型配置
 model:
   clip_model: "ViT-B/32"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14, resnet18
-  freeze_vision: false           # 冻结视觉编码器（避免FP16梯度问题）
-  freeze_text: false             # 是否冻结文本编码器
-  # vision_layers_unfreeze: 2     # 不解冻视觉编码器
+  freeze_vision: false         # 设为 false 以启用部分解冻
+  vision_layers_unfreeze: 2    # 只解冻视觉编码器最后2层
+  freeze_text: true            # 冻结文本编码器
 
 # 训练配置
 train:
-  batch_size: 8
+  batch_size: 32
   epochs: 5
   lr: 0.00001                     # 1e-5
   weight_decay: 0.01
@@ -31,12 +31,11 @@ train:
 
 # 损失函数配置
 loss:
-  type: "infonce"     # czsl_contrastive, infonce, multilabel_infonce, asymmetric, bce
-  temperature: 0.07            # 对比损失温度参数
-  label_smoothing: 0.0         # 标签平滑
-  contrastive_weight: 1.0      # 对比损失权重
-  classification_weight: 0.0   # 分类损失权重（0表示纯对比学习）
-  learnable_temperature: true  # 是否学习温度参数
+  type: "multilabel_infonce"   # label_aware_infonce, infonce, multilabel_infonce, asymmetric, bce
+  temperature: 0.07             # 对比损失温度参数
+  label_smoothing: 0.0          # 标签平滑
+  learnable_temperature: true   # 是否学习温度参数
+  handle_zero_sum: "self_only"  # 处理无同类样本的策略: self_only, uniform, skip
 
 # 数据配置
 data:
@@ -56,6 +55,15 @@ data:
 
 # 模型开关配置
 use_time_domain: false          # 是否使用时域信号进行消融实验
+
+# LoRA 微调配置（禁用，改用解冻最后N层策略）
+lora:
+  enabled: false                # 是否启用 LoRA
+  target_modules:               # 目标模块（Attention 层）
+    - "attn"
+  rank: 8                       # LoRA 秩
+  alpha: 16.0                   # LoRA 缩放因子
+  dropout: 0.0                  # LoRA Dropout
 
 # ============================================================================
 # 日志配置
@@ -106,6 +114,26 @@ jamming_classes:
   - name: "PJ"
 
 # ============================================================================
+# 类别名称翻译字典 (缩写 -> 全称)
+# 用于生成更具语义的文本描述，提升 CLIP 的理解能力
+# ============================================================================
+label_translations:
+  DFTJ: "Dense False Target Jamming"           # 密集假目标干扰
+  ISRJ: "Interrupted Sampling Repeater Jamming" # 间歇采样转发干扰
+  AJ: "Aim-point Jamming"                       # 瞄准式干扰
+  BJ: "Barrage Jamming"                         # 阻塞式干扰
+  SJ: "Sweep Jamming"                           # 扫频干扰
+  NCJ: "Noise FM Jamming"                       # 噪声调频干扰
+  NPJ: "Noise PM Jamming"                       # 噪声调相干扰
+  SMSPJ: "Smoothed Pseudo Wigner-Ville Jamming" # 平滑伪Wigner-Ville干扰
+  "C&IJ": "Chopping and Interleaved Jamming"    # 切割交错干扰
+  NFMJ: "Noise Frequency Modulation Jamming"    # 噪声调频干扰
+  NPMJ: "Noise Phase Modulation Jamming"        # 噪声调相干扰
+  NAMJ: "Noise Amplitude Modulation Jamming"    # 噪声调幅干扰
+  CSJ: "Comb Spectrum Jamming"                  # 梳状谱干扰
+  PJ: "Phase Jamming"                           # 相位干扰
+
+# ============================================================================
 # CZSL 配置 - 组合零样本学习
 # czsl.seen_combinations: 训练时可见的组合
 # czsl.unseen_combinations: 仅测试时评估的零样本组合
@@ -137,63 +165,61 @@ czsl:
     - ["NAMJ"]
     - ["PJ"]
 
-
   # 合作为seen（训练时可见）
 
   unseen_combinations:
   # 未见组合（用于零样本测试）
   # 这些组合在训练时不出现，但测试时需要识别
 
-    # - ["DFTJ", "AJ"]
-    # - ["DFTJ", "BJ"]
-    # - ["DFTJ", "SJ"]
-    # - ["DFTJ", "NCJ"]
-    # - ["DFTJ", "NPJ"]
-    # - ["DFTJ", "NAMJ"]
-    # - ["DFTJ", "NPMJ"]
-    # - ["DFTJ", "NFMJ"]
-    # - ["DFTJ", "PJ"]
+    - ["DFTJ", "AJ"]
+    - ["DFTJ", "BJ"]
+    - ["DFTJ", "SJ"]
+    - ["DFTJ", "NCJ"]
+    - ["DFTJ", "NPJ"]
+    - ["DFTJ", "NAMJ"]
+    - ["DFTJ", "NPMJ"]
+    - ["DFTJ", "NFMJ"]
+    - ["DFTJ", "PJ"]
 
-    # - ["ISRJ", "AJ"]
-    # - ["ISRJ", "BJ"]
-    # - ["ISRJ", "SJ"]
-    # - ["ISRJ", "NCJ"]
-    # - ["ISRJ", "NPJ"]
-    # - ["ISRJ", "NAMJ"]
-    # - ["ISRJ", "NPMJ"]
-    # - ["ISRJ", "NFMJ"]
-    # - ["ISRJ", "PJ"]
+    - ["ISRJ", "AJ"]
+    - ["ISRJ", "BJ"]
+    - ["ISRJ", "SJ"]
+    - ["ISRJ", "NCJ"]
+    - ["ISRJ", "NPJ"]
+    - ["ISRJ", "NAMJ"]
+    - ["ISRJ", "NPMJ"]
+    - ["ISRJ", "NFMJ"]
+    - ["ISRJ", "PJ"]
 
-    # - ["SMSPJ", "AJ"]
-    # - ["SMSPJ", "BJ"]
-    # - ["SMSPJ", "SJ"]
-    # - ["SMSPJ", "NCJ"]
-    # - ["SMSPJ", "NPJ"]
-    # - ["SMSPJ", "NAMJ"]
-    # - ["SMSPJ", "NPMJ"]
-    # - ["SMSPJ", "NFMJ"]
-    # - ["SMSPJ", "PJ"]
+    - ["SMSPJ", "AJ"]
+    - ["SMSPJ", "BJ"]
+    - ["SMSPJ", "SJ"]
+    - ["SMSPJ", "NCJ"]
+    - ["SMSPJ", "NPJ"]
+    - ["SMSPJ", "NAMJ"]
+    - ["SMSPJ", "NPMJ"]
+    - ["SMSPJ", "NFMJ"]
+    - ["SMSPJ", "PJ"]
 
-    # - ["C&IJ", "AJ"]
-    # - ["C&IJ", "BJ"]
-    # - ["C&IJ", "SJ"]
-    # - ["C&IJ", "NCJ"]
-    # - ["C&IJ", "NPJ"]
-    # - ["C&IJ", "NAMJ"]
-    # - ["C&IJ", "NPMJ"]
-    # - ["C&IJ", "NFMJ"]
-    # - ["C&IJ", "PJ"]
+    - ["C&IJ", "AJ"]
+    - ["C&IJ", "BJ"]
+    - ["C&IJ", "SJ"]
+    - ["C&IJ", "NCJ"]
+    - ["C&IJ", "NPJ"]
+    - ["C&IJ", "NAMJ"]
+    - ["C&IJ", "NPMJ"]
+    - ["C&IJ", "NFMJ"]
+    - ["C&IJ", "PJ"]
 
-    # - ["CSJ", "AJ"]
-    # - ["CSJ", "BJ"]
-    # - ["CSJ", "SJ"]
-    # - ["CSJ", "NCJ"]
-    # - ["CSJ", "NPJ"]
-    # - ["CSJ", "NAMJ"]
-    # - ["CSJ", "NPMJ"]
-    # - ["CSJ", "NFMJ"]
-    # - ["CSJ", "PJ"]
-
+    - ["CSJ", "AJ"]
+    - ["CSJ", "BJ"]
+    - ["CSJ", "SJ"]
+    - ["CSJ", "NCJ"]
+    - ["CSJ", "NPJ"]
+    - ["CSJ", "NAMJ"]
+    - ["CSJ", "NPMJ"]
+    - ["CSJ", "NFMJ"]
+    - ["CSJ", "PJ"]
 
   # 数据划分参数
   unseen_ratio: 0          # 自动划分时unseen比例
