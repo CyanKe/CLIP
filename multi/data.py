@@ -33,7 +33,6 @@ def collate_fn(batch):
         stft_images, time_signals, text_tokens, labels, texts, metadata_list
     """
     from multi.text_templates import generate_text_descriptions
-    from multi.metadata_template import generate_short_description
     import clip
 
     # 检查第一个样本的长度以确定是否包含时域信号
@@ -53,13 +52,12 @@ def collate_fn(batch):
     labels = torch.stack(labels, dim=0)
 
     # 使用 metadata_template 生成文本描述并 tokenize
-    # 使用 'template' 风格：固定的视觉特征描述（与推理一致）
+    # 使用 'class_only' 风格：只包含干扰类型，不包含 JNR
+    # 这样同一干扰类型的所有样本共享相同的文本描述，避免特征空间分裂
     texts = []
     for meta in metadata_list:
-        # 使用 template 风格，与推理时的缓存文本格式一致
-        # text = generate_text_descriptions(meta, style='imagenet')
-        text = generate_short_description(meta,'meta')
-        text = generate_text_descriptions(meta,style = 'meta')
+        # 使用 class_only 风格，与推理时的缓存文本格式一致
+        text = generate_text_descriptions(meta, style='class_only')
         texts.append(text)
 
     text_tokens = clip.tokenize(texts, truncate=True)

@@ -314,6 +314,35 @@ def get_inference_description(jam_types: list, use_translation: bool = False) ->
         return f"a radar signal with combined jamming: {', '.join(names)}"
 
 
+def get_class_only_description(metadata: dict, use_translation: bool = False) -> str:
+    """
+    生成只包含干扰类型的描述（不包含 JNR 等参数）
+
+    这个风格用于训练，确保同一干扰类型的所有样本共享相同的文本描述，
+    避免因 JNR 不同而导致特征空间分裂。
+
+    Args:
+        metadata: metadata 字典，包含 jam_types 等
+        use_translation: 是否使用翻译后的名称
+
+    Returns:
+        描述字符串，如 "a radar signal with single jamming: DFTJ"
+    """
+    jam_types = metadata.get('jam_types', [])
+
+    # 确保 jam_types 是列表
+    if isinstance(jam_types, str):
+        jam_types = [jam_types] if jam_types else []
+    elif not isinstance(jam_types, list):
+        jam_types = []
+
+    if not jam_types:
+        return "a radar signal with unknown jamming"
+
+    # 使用推理描述格式，保持一致性
+    return get_inference_description(jam_types, use_translation=use_translation)
+
+
 def get_meta_description(metadata: dict, use_translation: bool = False) -> str:
     """
     生成结合 metadata 的动态描述
@@ -416,16 +445,18 @@ def _normalize_jam_types(jam_types) -> list:
     return []
 
 
-def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_translation: bool = False) -> dict:
+def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_translation: bool = False):
     """
-    生成文本描述（支持 3 种策略）
+    生成文本描述（支持多种策略）
 
     Args:
         metadata: metadata 字典（可选，用于 meta 风格）
         style: 描述风格
             - 'simple': 简单类别名
             - 'template': 模板描述
-            - 'meta': 结合 metadata 的动态描述
+            - 'meta': 结合 metadata 的动态描述（包含 JNR 等参数）
+            - 'class_only': 只包含干扰类型的描述（推荐用于训练，不含 JNR）
+            - 'imagenet': ImageNet 风格多样化描述
             - 'all': 返回所有风格
         use_translation: 是否使用翻译后的名称（如 "Dense False Target Jamming"）
 
@@ -451,6 +482,12 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_tr
             return get_meta_description(metadata, use_translation=use_translation)
         return "a radar signal with jamming"
 
+    elif style == 'class_only':
+        # 推荐用于训练：只包含干扰类型，不包含 JNR
+        if metadata:
+            return get_class_only_description(metadata, use_translation=use_translation)
+        return "a radar signal with unknown jamming"
+
     elif style == 'imagenet':
         if metadata and 'jam_types' in metadata:
             jam_types = _normalize_jam_types(metadata.get('jam_types'))
@@ -463,6 +500,7 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_tr
             'simple': 'a radar signal',
             'template': 'a radar signal with jamming',
             'meta': 'a radar signal with jamming',
+            'class_only': 'a radar signal with unknown jamming',
         }
         if metadata and 'jam_types' in metadata:
             jam_types = _normalize_jam_types(metadata.get('jam_types'))
@@ -471,6 +509,7 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_tr
                 result['template'] = get_template_description(jam_types[0])
         if metadata:
             result['meta'] = get_meta_description(metadata, use_translation=use_translation)
+            result['class_only'] = get_class_only_description(metadata, use_translation=use_translation)
         return result
 
     return "a radar signal"
