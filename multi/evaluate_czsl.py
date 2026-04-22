@@ -2,7 +2,10 @@
 CZSL评估脚本 - 支持零样本组合识别评估
 python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode zero_shot
 
- python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode zero_shot --split test --visualize --output_dir results --save_stft
+python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode zero_shot --split test --visualize --output_dir results
+ --save_stft
+
+python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode by_jnr --split test --output_dir results
 """
 # pylint: disable=no-member
 
@@ -27,8 +30,74 @@ from sklearn.manifold import TSNE
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from multi.model import create_czsl_model, CLIPForCZSL
-from multi.data import create_czsl_dataloaders
+from multi.data import create_czsl_dataloaders, STFTDataset, collate_fn
 import clip
+
+
+def create_jnr_dataloaders(
+    config: dict,
+    split: str = 'test',
+    normalization_stats: dict = None,
+    batch_size: int = 16,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+) -> dict:
+    """
+    为每个JNR级别创建独立的数据加载器
+
+    Args:
+        config: 配置字典
+        split: 数据划分 ('train', 'val', 'test')
+        normalization_stats: 归一化统计量
+        batch_size: 批次大小
+        num_workers: worker数量
+        pin_memory: 是否pin memory
+
+    Returns:
+        字典 {jnr_level: DataLoader}
+    """
+    data_config = config.get('data', {})
+    base_path = data_config.get('base_path')
+    jnr_start = data_config.get('jnr_start', 0)
+    jnr_end = data_config.get('jnr_end', 20)
+    jnr_step = data_config.get('jnr_step', 5)
+
+    class_names = [cls['name'] for cls in config.get('jamming_classes', [])]
+    jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
+
+    jnr_loaders = {}
+
+    for jnr in jnr_levels:
+        jnr_folder = f"JNR_{'+' if jnr >= 0 else ''}{jnr}"
+        data_folder = os.path.join(base_path, jnr_folder)
+
+        stft_file = os.path.join(data_folder, f'{split}_echo_stfts.mat')
+        metadata_file = os.path.join(data_folder, f'{split}_echo_metadata.json')
+
+        if not os.path.exists(stft_file) or not os.path.exists(metadata_file):
+            print(f"Warning: Data not found for {jnr_folder}/{split}, skipping...")
+            continue
+
+        dataset = STFTDataset(
+            stft_file=stft_file,
+            metadata_file=metadata_file,
+            normalization_stats=normalization_stats,
+            class_names=class_names,
+        )
+
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,  # 评估时不打乱
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=collate_fn,
+        )
+
+        jnr_loaders[jnr] = loader
+        print(f"Loaded {split} data from {jnr_folder}: {len(dataset)} samples")
+
+    return jnr_loaders
 
 
 class CZSLEvaluator:
@@ -738,6 +807,269 @@ class CZSLEvaluator:
             plt.show()
         plt.close()
 
+    @torch.no_grad()
+    def evaluate_by_jnr(
+        self,
+        jnr_loaders: dict,
+        seen_combinations: list = None,
+        unseen_combinations: list = None,
+        debug: bool = False
+    ) -> dict:
+        """
+        按JNR级别分别评估
+
+        Args:
+            jnr_loaders: 字典 {jnr_level: DataLoader}
+            seen_combinations: 已见组合索引列表
+            unseen_combinations: 未见组合索引列表
+            debug: 是否显示调试信息
+
+        Returns:
+            各JNR级别的评估结果
+        """
+        results = {}
+        seen_set = set(tuple(sorted(c)) for c in (seen_combinations or []))
+        unseen_set = set(tuple(sorted(c)) for c in (unseen_combinations or []))
+        num_classes = len(self.class_names)
+
+        for jnr, data_loader in sorted(jnr_loaders.items()):
+            print(f"\nEvaluating JNR={jnr}...")
+
+            all_labels = []
+            all_preds = []
+            seen_correct, seen_total = 0, 0
+            unseen_correct, unseen_total = 0, 0
+
+            # 每个类别的统计: TP, FP, FN, TN
+            class_stats = np.zeros((num_classes, 4), dtype=np.int64)
+
+            for images, _, _, labels, _, _ in tqdm(
+                data_loader, desc=f"JNR={jnr}"
+            ):
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                if images.shape[-1] != 224:
+                    images = nn.functional.interpolate(
+                        images, size=(224, 224), mode='bilinear', align_corners=False
+                    )
+
+                # 预测
+                text_features = self.model.get_cached_text_features()
+                image_features = self.model.encode_image(images)
+                image_features = F.normalize(image_features, dim=-1)
+                logit_scale = self.model.model.logit_scale.exp()
+                logits = logit_scale * (image_features @ text_features.T)
+
+                # 多标签预测
+                probs = torch.softmax(logits, dim=-1)
+                batch_size = images.shape[0]
+                threshold = 1.0 / num_classes
+                top_k = 3
+                topk_values, topk_indices = torch.topk(probs, k=top_k, dim=-1)
+
+                preds = torch.zeros(batch_size, num_classes, device=self.device)
+                for b in range(batch_size):
+                    for j, idx in enumerate(topk_indices[b]):
+                        if topk_values[b, j] > threshold:
+                            preds[b, idx] = 1.0
+
+                all_labels.append(labels.cpu())
+                all_preds.append(preds.cpu())
+
+                # 统计每个类别的 TP, FP, FN
+                for c in range(num_classes):
+                    true_c = labels[:, c].cpu().numpy()
+                    pred_c = preds[:, c].cpu().numpy()
+                    class_stats[c, 0] += np.sum((true_c == 1) & (pred_c == 1))  # TP
+                    class_stats[c, 1] += np.sum((true_c == 0) & (pred_c == 1))  # FP
+                    class_stats[c, 2] += np.sum((true_c == 1) & (pred_c == 0))  # FN
+                    class_stats[c, 3] += np.sum((true_c == 0) & (pred_c == 0))  # TN
+
+                # 统计seen/unseen准确率
+                for i in range(batch_size):
+                    true_comb = tuple(
+                        sorted(torch.where(labels[i] == 1)[0].tolist())
+                    )
+                    pred_comb = tuple(
+                        sorted(torch.where(preds[i] == 1)[0].tolist())
+                    )
+                    is_correct = (true_comb == pred_comb)
+
+                    if true_comb in seen_set:
+                        seen_total += 1
+                        if is_correct:
+                            seen_correct += 1
+                    elif true_comb in unseen_set:
+                        unseen_total += 1
+                        if is_correct:
+                            unseen_correct += 1
+
+            # 计算指标
+            all_labels = torch.cat(all_labels).numpy()
+            all_preds = torch.cat(all_preds).numpy()
+
+            # 计算每个类别的准确率 (recall)
+            per_class_recall = np.zeros(num_classes)
+            per_class_precision = np.zeros(num_classes)
+            per_class_f1 = np.zeros(num_classes)
+            for c in range(num_classes):
+                tp, fp, fn, tn = class_stats[c]
+                per_class_recall[c] = tp / (tp + fn) if (tp + fn) > 0 else 0
+                per_class_precision[c] = tp / (tp + fp) if (tp + fp) > 0 else 0
+                if per_class_precision[c] + per_class_recall[c] > 0:
+                    per_class_f1[c] = 2 * per_class_precision[c] * per_class_recall[c] / (
+                        per_class_precision[c] + per_class_recall[c]
+                    )
+
+            results[jnr] = {
+                "combination_accuracy": seen_correct + unseen_correct,
+                "total_samples": seen_total + unseen_total,
+                "seen_accuracy": seen_correct / seen_total if seen_total > 0 else 0,
+                "seen_samples": seen_total,
+                "unseen_accuracy": unseen_correct / unseen_total if unseen_total > 0 else 0,
+                "unseen_samples": unseen_total,
+                "f1_macro": f1_score(all_labels, all_preds, average='macro', zero_division=0),
+                "f1_micro": f1_score(all_labels, all_preds, average='micro', zero_division=0),
+                "precision_macro": precision_score(
+                    all_labels, all_preds, average='macro', zero_division=0
+                ),
+                "recall_macro": recall_score(
+                    all_labels, all_preds, average='macro', zero_division=0
+                ),
+                "per_class_recall": per_class_recall,
+                "per_class_precision": per_class_precision,
+                "per_class_f1": per_class_f1,
+            }
+
+        return results
+
+    def print_jnr_results(self, results: dict, save_path: str = None):
+        """打印并保存JNR评估结果"""
+        # 打印总体结果
+        print("\n" + "=" * 80)
+        print("Evaluation Results by JNR Level")
+        print("=" * 80)
+        print(f"{'JNR':>6} | {'Accuracy':>10} | {'F1_Macro':>10} | "
+              f"{'Seen_Acc':>10} | {'Unseen_Acc':>10} | {'Samples':>8}")
+        print("-" * 80)
+
+        lines = []
+        for jnr, metrics in sorted(results.items()):
+            acc = (metrics["combination_accuracy"] / metrics["total_samples"]
+                   if metrics["total_samples"] > 0 else 0)
+            print(f"{jnr:>6} | {acc:>10.4f} | {metrics['f1_macro']:>10.4f} | "
+                  f"{metrics['seen_accuracy']:>10.4f} | "
+                  f"{metrics['unseen_accuracy']:>10.4f} | "
+                  f"{metrics['total_samples']:>8}")
+            lines.append(f"{jnr},{acc:.4f},{metrics['f1_macro']:.4f},"
+                        f"{metrics['seen_accuracy']:.4f},"
+                        f"{metrics['unseen_accuracy']:.4f},"
+                        f"{metrics['total_samples']}")
+
+        if save_path:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write("JNR,Accuracy,F1_Macro,Seen_Acc,Unseen_Acc,Samples\n")
+                f.write("\n".join(lines))
+            print(f"\nResults saved to {save_path}")
+
+        # 打印每个类别的准确率 (Recall)
+        print("\n" + "=" * 80)
+        print("Per-Class Recall (Detection Rate) by JNR Level")
+        print("=" * 80)
+        header = f"{'JNR':>6} | " + " | ".join(f"{name:>8}" for name in self.class_names)
+        print(header)
+        print("-" * len(header))
+
+        per_class_lines = []
+        for jnr, metrics in sorted(results.items()):
+            recalls = metrics.get("per_class_recall", [])
+            row = f"{jnr:>6} | " + " | ".join(f"{r:>8.4f}" for r in recalls)
+            print(row)
+            per_class_lines.append(
+                f"{jnr}," + ",".join(f"{r:.4f}" for r in recalls)
+            )
+
+        # 保存每个类别的结果
+        if save_path:
+            per_class_path = save_path.replace('.csv', '_per_class.csv')
+            with open(per_class_path, 'w', encoding='utf-8') as f:
+                f.write("JNR," + ",".join(self.class_names) + "\n")
+                f.write("\n".join(per_class_lines))
+            print(f"\nPer-class results saved to {per_class_path}")
+
+    def plot_jnr_metrics(self, results: dict, save_path: str = None):
+        """绘制JNR指标曲线图"""
+        jnrs = sorted(results.keys())
+        accuracies = []
+        f1_macros = []
+        seen_accs = []
+        unseen_accs = []
+
+        for jnr in jnrs:
+            m = results[jnr]
+            acc = (m["combination_accuracy"] / m["total_samples"]
+                   if m["total_samples"] > 0 else 0)
+            accuracies.append(acc)
+            f1_macros.append(m["f1_macro"])
+            seen_accs.append(m["seen_accuracy"])
+            unseen_accs.append(m["unseen_accuracy"])
+
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+        # 准确率曲线
+        axes[0, 0].plot(jnrs, accuracies, 'b-o', label='Overall Accuracy', linewidth=2)
+        axes[0, 0].plot(jnrs, seen_accs, 'g-s', label='Seen Accuracy', linewidth=2)
+        axes[0, 0].plot(jnrs, unseen_accs, 'r-^', label='Unseen Accuracy', linewidth=2)
+        axes[0, 0].set_xlabel('JNR (dB)')
+        axes[0, 0].set_ylabel('Accuracy')
+        axes[0, 0].set_title('Accuracy vs JNR Level')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+
+        # F1曲线
+        axes[0, 1].plot(jnrs, f1_macros, 'b-o', label='F1 Macro', linewidth=2)
+        axes[0, 1].set_xlabel('JNR (dB)')
+        axes[0, 1].set_ylabel('F1 Score')
+        axes[0, 1].set_title('F1 Score vs JNR Level')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+
+        # 每个类别的召回率曲线
+        ax = axes[1, 0]
+        for c, name in enumerate(self.class_names):
+            recalls = [results[jnr].get("per_class_recall", [0] * len(self.class_names))[c]
+                       for jnr in jnrs]
+            ax.plot(jnrs, recalls, '-o', label=name, linewidth=1.5, markersize=4)
+        ax.set_xlabel('JNR (dB)')
+        ax.set_ylabel('Recall (Detection Rate)')
+        ax.set_title('Per-Class Recall vs JNR Level')
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+        # 每个类别的F1曲线
+        ax = axes[1, 1]
+        for c, name in enumerate(self.class_names):
+            f1s = [results[jnr].get("per_class_f1", [0] * len(self.class_names))[c]
+                   for jnr in jnrs]
+            ax.plot(jnrs, f1s, '-o', label=name, linewidth=1.5, markersize=4)
+        ax.set_xlabel('JNR (dB)')
+        ax.set_ylabel('F1 Score')
+        ax.set_title('Per-Class F1 Score vs JNR Level')
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"JNR metrics plot saved to {save_path}")
+        else:
+            plt.show()
+        plt.close()
+
     def save_stft_predictions(
         self,
         data_loader: DataLoader,
@@ -904,7 +1236,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint")
     parser.add_argument("--mode", type=str, default="by_combination",
-                        choices=["zero_shot", "by_combination"],
+                        choices=["zero_shot", "by_combination", "by_jnr"],
                         help="Evaluation mode")
     parser.add_argument("--split", type=str, default="test",
                         choices=["train", "val", "test"],
@@ -1113,6 +1445,53 @@ def main():
             f.write(f"Seen Accuracy:    {metrics['seen_accuracy']:.4f} ({metrics['seen_samples']} samples)\n")
             f.write(f"Unseen Accuracy:  {metrics['unseen_accuracy']:.4f} ({metrics['unseen_samples']} samples)\n")
             f.write(f"Other Accuracy:   {metrics['other_accuracy']:.4f} ({metrics['other_samples']} samples)\n")
+
+    elif args.mode == "by_jnr":
+        # 从配置获取seen/unseen组合
+        czsl_config = config.get("czsl", {})
+        seen_comb_names = czsl_config.get("seen_combinations", [])
+        unseen_comb_names = czsl_config.get("unseen_combinations", [])
+        seen_combinations = convert_combination_names_to_indices(seen_comb_names, class_names)
+        unseen_combinations = convert_combination_names_to_indices(unseen_comb_names, class_names)
+
+        print(f"\nEvaluating by JNR level on {args.split} set...")
+
+        # 加载归一化统计量
+        stats_file = os.path.join(os.path.dirname(args.config), 'normalization_stats.json')
+        if os.path.exists(stats_file):
+            with open(stats_file, 'r') as f:
+                import json
+                normalization_stats = json.load(f)
+        else:
+            normalization_stats = None
+
+        # 为每个JNR创建独立的数据加载器
+        jnr_loaders = create_jnr_dataloaders(
+            config=config,
+            split=args.split,
+            normalization_stats=normalization_stats,
+            batch_size=config.get('train', {}).get('batch_size', 32),
+            num_workers=config.get('data', {}).get('num_workers', 4),
+        )
+
+        # 按JNR评估
+        results = evaluator.evaluate_by_jnr(
+            jnr_loaders,
+            seen_combinations=seen_combinations,
+            unseen_combinations=unseen_combinations,
+        )
+
+        # 打印和保存结果
+        evaluator.print_jnr_results(
+            results,
+            save_path=str(output_dir / f"jnr_results_{args.split}.csv")
+        )
+
+        # 绘制JNR指标曲线
+        evaluator.plot_jnr_metrics(
+            results,
+            save_path=str(output_dir / f"jnr_metrics_{args.split}.png")
+        )
 
 
 if __name__ == "__main__":

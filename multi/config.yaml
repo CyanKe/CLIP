@@ -4,7 +4,7 @@
 
 # CLIP模型配置
 model:
-  clip_model: "ViT-B/32"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14, resnet18
+  clip_model: "RN50"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14, resnet18
   freeze_vision: false         # 设为 false 以启用部分解冻
   vision_layers_unfreeze: 2    # 只解冻视觉编码器最后2层
   freeze_text: true            # 冻结文本编码器
@@ -41,7 +41,7 @@ loss:
 data:
   base_path: "D:/VScode/Jamming_signal_simulation/output/260415"
   jnr_start: 0
-  jnr_end: 20
+  jnr_end: 50
   jnr_step: 5
   num_workers: 4
   pin_memory: true

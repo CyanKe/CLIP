@@ -90,6 +90,8 @@ class STFTDataset(Dataset):
         image_size: int = 224,
         apply_clip_norm: bool = True,
         class_names: list = None,
+        normalize_mode: str = 'per_sample', # 'global'  'per_sample'
+        normalize_method: str = 'p99', #'p99' 'p95' 或 'max'
     ):
         """
         Args:
@@ -137,6 +139,8 @@ class STFTDataset(Dataset):
 
         self.image_size = image_size
         self.apply_clip_norm = apply_clip_norm
+        self.normalize_mode = normalize_mode
+        self.normalize_method = normalize_method
 
         if apply_clip_norm:
             self.clip_norm = transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
@@ -214,17 +218,35 @@ class STFTDataset(Dataset):
         stft_complex = raw_stft['real'] + 1j * raw_stft['imag']
 
         # 3. 提取三通道：实部、虚部、幅度
-        stft_real = np.real(stft_complex).T  # 转置到 (224, 225)
-        stft_imag = np.imag(stft_complex).T
-        stft_mag = np.abs(stft_complex).T
+        # 4. 归一化
+        if self.normalize_mode == 'per_sample':
+            # 样本级归一化
+            mag = np.abs(stft_complex)
+            if self.normalize_method == 'max':
+                ref = np.max(mag)
+            elif self.normalize_method == 'p95':
+                ref = np.percentile(mag, 95)
+            else:  # p99
+                ref = np.percentile(mag, 99)
 
-        # 4. 归一化到 [0, 1] (使用全局统计量)
-        stft_real = np.clip(stft_real, -self.norm_scale_real, self.norm_scale_real) / self.norm_scale_real
-        stft_imag = np.clip(stft_imag, -self.norm_scale_imag, self.norm_scale_imag) / self.norm_scale_imag
-        stft_mag = np.clip(stft_mag, 0, self.norm_scale_mag) / self.norm_scale_mag
+            if ref > 0:
+                stft_complex = stft_complex / ref
+
+            stft_real = np.real(stft_complex).T
+            stft_imag = np.imag(stft_complex).T
+            stft_mag = np.abs(stft_complex).T
+        else:
+            # 全局归一化
+            stft_real = np.real(stft_complex).T
+            stft_imag = np.imag(stft_complex).T
+            stft_mag = np.abs(stft_complex).T
+
+            stft_real = np.clip(stft_real, -self.norm_scale_real, self.norm_scale_real) / self.norm_scale_real
+            stft_imag = np.clip(stft_imag, -self.norm_scale_imag, self.norm_scale_imag) / self.norm_scale_imag
+            stft_mag = np.clip(stft_mag, 0, self.norm_scale_mag) / self.norm_scale_mag
 
         # 5. 构建三通道张量
-        stft_tensor = torch.from_numpy(np.stack([stft_real, stft_imag, stft_mag], axis=0)).float()
+        # stft_tensor = torch.from_numpy(np.stack([stft_real, stft_imag, stft_mag], axis=0)).float()
         stft_tensor = torch.from_numpy(np.stack([stft_mag, stft_mag, stft_mag], axis=0)).float()
 
         # 6. Resize 到目标尺寸 (如果还不是 224x224)

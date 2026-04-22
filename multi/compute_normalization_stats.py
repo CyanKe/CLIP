@@ -26,7 +26,7 @@ def compute_normalization_stats(
 
     for jnr in jnr_levels:
         jnr_folder = f"JNR_{jnr}"
-        stft_file = os.path.join(base_path, jnr_folder, 'train_echo_stfts.mat')
+        stft_file = os.path.join(base_path, jnr_folder, 'test_echo_stfts.mat')
 
         if not os.path.exists(stft_file):
             print(f"Warning: {stft_file} not found, skipping...")
@@ -136,13 +136,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--base_path",
         type=str,
-        default="D:/VScode/Jamming_signal_simulation/output/260414"
+        default="D:/VScode/Jamming_signal_simulation/output/260421"
     )
     parser.add_argument(
         "--jnr_levels",
         type=str,
         nargs="+",
-        default=["+10"]
+        default=["+30"]
     )
     parser.add_argument(
         "--output",
