@@ -973,30 +973,75 @@ class CZSLEvaluator:
                 f.write("\n".join(lines))
             print(f"\nResults saved to {save_path}")
 
-        # 打印每个类别的准确率 (Recall)
+        # 打印每个类别的指标 (Recall, Precision, F1)
         print("\n" + "=" * 80)
-        print("Per-Class Recall (Detection Rate) by JNR Level")
+        print("Per-Class Recall by JNR Level")
         print("=" * 80)
         header = f"{'JNR':>6} | " + " | ".join(f"{name:>8}" for name in self.class_names)
         print(header)
         print("-" * len(header))
 
-        per_class_lines = []
+        per_class_recall_lines = []
         for jnr, metrics in sorted(results.items()):
             recalls = metrics.get("per_class_recall", [])
             row = f"{jnr:>6} | " + " | ".join(f"{r:>8.4f}" for r in recalls)
             print(row)
-            per_class_lines.append(
+            per_class_recall_lines.append(
                 f"{jnr}," + ",".join(f"{r:.4f}" for r in recalls)
+            )
+
+        print("\n" + "=" * 80)
+        print("Per-Class Precision by JNR Level")
+        print("=" * 80)
+        print(header)
+        print("-" * len(header))
+
+        per_class_precision_lines = []
+        for jnr, metrics in sorted(results.items()):
+            precisions = metrics.get("per_class_precision", [])
+            row = f"{jnr:>6} | " + " | ".join(f"{p:>8.4f}" for p in precisions)
+            print(row)
+            per_class_precision_lines.append(
+                f"{jnr}," + ",".join(f"{p:.4f}" for p in precisions)
+            )
+
+        print("\n" + "=" * 80)
+        print("Per-Class F1 by JNR Level")
+        print("=" * 80)
+        print(header)
+        print("-" * len(header))
+
+        per_class_f1_lines = []
+        for jnr, metrics in sorted(results.items()):
+            f1s = metrics.get("per_class_f1", [])
+            row = f"{jnr:>6} | " + " | ".join(f"{f:>8.4f}" for f in f1s)
+            print(row)
+            per_class_f1_lines.append(
+                f"{jnr}," + ",".join(f"{f:.4f}" for f in f1s)
             )
 
         # 保存每个类别的结果
         if save_path:
-            per_class_path = save_path.replace('.csv', '_per_class.csv')
-            with open(per_class_path, 'w', encoding='utf-8') as f:
+            # Recall
+            recall_path = save_path.replace('.csv', '_per_class_recall.csv')
+            with open(recall_path, 'w', encoding='utf-8') as f:
                 f.write("JNR," + ",".join(self.class_names) + "\n")
-                f.write("\n".join(per_class_lines))
-            print(f"\nPer-class results saved to {per_class_path}")
+                f.write("\n".join(per_class_recall_lines))
+            print(f"\nPer-class recall saved to {recall_path}")
+
+            # Precision
+            precision_path = save_path.replace('.csv', '_per_class_precision.csv')
+            with open(precision_path, 'w', encoding='utf-8') as f:
+                f.write("JNR," + ",".join(self.class_names) + "\n")
+                f.write("\n".join(per_class_precision_lines))
+            print(f"Per-class precision saved to {precision_path}")
+
+            # F1
+            f1_path = save_path.replace('.csv', '_per_class_f1.csv')
+            with open(f1_path, 'w', encoding='utf-8') as f:
+                f.write("JNR," + ",".join(self.class_names) + "\n")
+                f.write("\n".join(per_class_f1_lines))
+            print(f"Per-class F1 saved to {f1_path}")
 
     def plot_jnr_metrics(self, results: dict, save_path: str = None):
         """绘制JNR指标曲线图"""

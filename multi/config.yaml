@@ -4,7 +4,7 @@
 
 # CLIP模型配置
 model:
-  clip_model: "RN50"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14, resnet18
+  clip_model: "ViT-B/32"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14, resnet18
   freeze_vision: false         # 设为 false 以启用部分解冻
   vision_layers_unfreeze: 2    # 只解冻视觉编码器最后2层
   freeze_text: true            # 冻结文本编码器
@@ -39,7 +39,7 @@ loss:
 
 # 数据配置
 data:
-  base_path: "D:/VScode/Jamming_signal_simulation/output/260415"
+  base_path: "D:/VScode/Jamming_signal_simulation/output/260422"
   jnr_start: 0
   jnr_end: 50
   jnr_step: 5
@@ -165,12 +165,6 @@ czsl:
     - ["NAMJ"]
     - ["PJ"]
 
-  # 合作为seen（训练时可见）
-
-  unseen_combinations:
-  # 未见组合（用于零样本测试）
-  # 这些组合在训练时不出现，但测试时需要识别
-
     - ["DFTJ", "AJ"]
     - ["DFTJ", "BJ"]
     - ["DFTJ", "SJ"]
@@ -221,6 +215,14 @@ czsl:
     - ["CSJ", "NFMJ"]
     - ["CSJ", "PJ"]
 
+
+  # 合作为seen（训练时可见）
+
+  unseen_combinations:
+  # 未见组合（用于零样本测试）
+  # 这些组合在训练时不出现，但测试时需要识别
+
+
   # 数据划分参数
   unseen_ratio: 0          # 自动划分时unseen比例
   split_seed: 42             # 划分随机种子
@@ -229,4 +231,4 @@ czsl:
   zero_shot:
     use_combinations: true   # 是否使用组合特征
     max_combination_size: 2  # 最大组合大小
-    threshold: 0.5           # 多标签预测阈值
+    threshold: 0.14      # 多标签预测阈值
