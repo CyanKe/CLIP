@@ -606,6 +606,103 @@ class CombinedLoss(nn.Module):
 
         return total_loss
 
+
+class DualBranchContrastiveLoss(nn.Module):
+    """
+    双分支对比损失 - 用于欺骗/压制干扰分类
+
+    架构:
+    - 欺骗分支: 独立计算 InfoNCE 损失
+    - 压制分支: 独立计算 InfoNCE 损失
+    - 总损失 = deception_loss + suppression_loss
+    """
+
+    def __init__(
+        self,
+        temperature: float = 0.07,
+        learnable_temperature: bool = True,
+        label_smoothing: float = 0.0,
+        deception_weight: float = 1.0,
+        suppression_weight: float = 1.0
+    ):
+        """
+        初始化双分支对比损失
+
+        Args:
+            temperature: 温度参数
+            learnable_temperature: 是否学习温度参数
+            label_smoothing: 标签平滑系数
+            deception_weight: 欺骗分支损失权重
+            suppression_weight: 压制分支损失权重
+        """
+        super().__init__()
+        self.deception_weight = deception_weight
+        self.suppression_weight = suppression_weight
+
+        # 欺骗分支损失
+        self.deception_loss = LabelAwareInfoNCELoss(
+            temperature=temperature,
+            learnable_temperature=learnable_temperature,
+            label_smoothing=label_smoothing
+        )
+
+        # 压制分支损失
+        self.suppression_loss = LabelAwareInfoNCELoss(
+            temperature=temperature,
+            learnable_temperature=learnable_temperature,
+            label_smoothing=label_smoothing
+        )
+
+    def forward(
+        self,
+        image_features: torch.Tensor,
+        text_features_deception: torch.Tensor,
+        text_features_suppression: torch.Tensor,
+        labels_deception: torch.Tensor,
+        labels_suppression: torch.Tensor
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        计算双分支对比损失
+
+        Args:
+            image_features: 图像特征 [batch_size, embed_dim]
+            text_features_deception: 欺骗分支文本特征 [batch_size, embed_dim]
+            text_features_suppression: 压制分支文本特征 [batch_size, embed_dim]
+            labels_deception: 欺骗分支标签 [batch_size, num_deception_classes]
+            labels_suppression: 压制分支标签 [batch_size, num_suppression_classes]
+
+        Returns:
+            total_loss: 总损失
+            info_dict: 监控信息字典
+        """
+        # 欺骗分支损失
+        loss_deception, logits_deception, info_deception = self.deception_loss(
+            image_features, text_features_deception, labels_deception
+        )
+
+        # 压制分支损失
+        loss_suppression, logits_suppression, info_suppression = self.suppression_loss(
+            image_features, text_features_suppression, labels_suppression
+        )
+
+        # 加权求和
+        total_loss = (self.deception_weight * loss_deception +
+                      self.suppression_weight * loss_suppression)
+
+        # 汇总监控信息
+        info_dict = {
+            "loss_deception": loss_deception.item(),
+            "loss_suppression": loss_suppression.item(),
+            "total_loss": total_loss.item(),
+            "logit_scale_deception": info_deception["logit_scale"],
+            "logit_scale_suppression": info_suppression["logit_scale"],
+            "avg_pos_deception": info_deception["avg_positive_pairs"],
+            "avg_pos_suppression": info_suppression["avg_positive_pairs"],
+        }
+
+        return total_loss, info_dict
+
+
 def create_loss_function(config: dict) -> nn.Module:
     """
     根据配置创建损失函数

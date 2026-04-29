@@ -515,6 +515,117 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_tr
     return "a radar signal"
 
 
+# ============================================================================
+# 双分支文本生成函数 (用于欺骗/压制干扰分类)
+# ============================================================================
+
+def get_dual_branch_descriptions(
+    jam_types: list,
+    deception_classes: list,
+    suppression_classes: list,
+    use_translation: bool = False
+) -> tuple:
+    """
+    为双分支分类器生成文本描述
+
+    Args:
+        jam_types: 干扰类型列表，如 ["DFTJ"] 或 ["DFTJ", "AJ"]
+        deception_classes: 欺骗干扰类型列表，如 ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"]
+        suppression_classes: 压制干扰类型列表，如 ["AJ", "BJ", "SJ", ...]
+        use_translation: 是否使用翻译后的名称
+
+    Returns:
+        (deception_desc, suppression_desc) 元组
+        - deception_desc: 欺骗干扰描述或 "a radar signal without deception jamming"
+        - suppression_desc: 压制干扰描述或 "a radar signal without suppression jamming"
+    """
+    # 规范化 jam_types
+    if isinstance(jam_types, str):
+        jam_types = [jam_types] if jam_types else []
+    elif not isinstance(jam_types, list):
+        jam_types = []
+
+    # 找出欺骗干扰和压制干扰
+    deception_jamming = [jt for jt in jam_types if jt in deception_classes]
+    suppression_jamming = [jt for jt in jam_types if jt in suppression_classes]
+
+    # 生成欺骗分支描述
+    if deception_jamming:
+        names = [get_translated_name(jt, use_translation) for jt in deception_jamming]
+        if len(names) == 1:
+            deception_desc = f"a radar signal with deception jamming: {names[0]}"
+        else:
+            deception_desc = f"a radar signal with combined deception jamming: {', '.join(names)}"
+    else:
+        deception_desc = "a radar signal without deception jamming"
+
+    # 生成压制分支描述
+    if suppression_jamming:
+        names = [get_translated_name(jt, use_translation) for jt in suppression_jamming]
+        if len(names) == 1:
+            suppression_desc = f"a radar signal with suppression jamming: {names[0]}"
+        else:
+            suppression_desc = f"a radar signal with combined suppression jamming: {', '.join(names)}"
+    else:
+        suppression_desc = "a radar signal without suppression jamming"
+
+    return deception_desc, suppression_desc
+
+
+def get_dual_branch_inference_descriptions(
+    deception_classes: list,
+    suppression_classes: list,
+    use_translation: bool = False
+) -> dict:
+    """
+    生成双分支推理用的所有文本描述
+
+    Args:
+        deception_classes: 欺骗干扰类型列表
+        suppression_classes: 压制干扰类型列表
+        use_translation: 是否使用翻译后的名称
+
+    Returns:
+        dict:
+            - 'deception': 欺骗分支描述列表 (含各类欺骗 + 无欺骗)
+            - 'suppression': 压制分支描述列表 (含各类压制 + 无压制)
+            - 'deception_names': 欺骗分支类别名称列表
+            - 'suppression_names': 压制分支类别名称列表
+    """
+    deception_descriptions = []
+    deception_names = []
+
+    # 欺骗干扰类型
+    for cls in deception_classes:
+        name = get_translated_name(cls, use_translation)
+        deception_descriptions.append(f"a radar signal with deception jamming: {name}")
+        deception_names.append(cls)
+
+    # 无欺骗干扰
+    deception_descriptions.append("a radar signal without deception jamming")
+    deception_names.append("无欺骗干扰")
+
+    suppression_descriptions = []
+    suppression_names = []
+
+    # 压制干扰类型
+    for cls in suppression_classes:
+        name = get_translated_name(cls, use_translation)
+        suppression_descriptions.append(f"a radar signal with suppression jamming: {name}")
+        suppression_names.append(cls)
+
+    # 无压制干扰
+    suppression_descriptions.append("a radar signal without suppression jamming")
+    suppression_names.append("无压制干扰")
+
+    return {
+        'deception': deception_descriptions,
+        'suppression': suppression_descriptions,
+        'deception_names': deception_names,
+        'suppression_names': suppression_names
+    }
+
+
 if __name__ == "__main__":
     # 测试文本生成
 

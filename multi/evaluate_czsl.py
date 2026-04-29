@@ -500,13 +500,24 @@ class CZSLEvaluator:
         """
         # 确定使用哪些组合
         if seen_combinations is not None or unseen_combinations is not None:
-            # 使用配置中定义的组合
+            # 使用配置中定义的组合，保持配置顺序
             configured_combs = []
+
+            # 先添加 seen_combinations（保持配置顺序）
             if seen_combinations:
-                configured_combs.extend([tuple(sorted(c)) for c in seen_combinations])
+                for comb in seen_combinations:
+                    comb_tuple = tuple(sorted(comb))
+                    if comb_tuple not in configured_combs:
+                        configured_combs.append(comb_tuple)
+
+            # 再添加 unseen_combinations（保持配置顺序）
             if unseen_combinations:
-                configured_combs.extend([tuple(sorted(c)) for c in unseen_combinations])
-            unique_combs = sorted(set(configured_combs))
+                for comb in unseen_combinations:
+                    comb_tuple = tuple(sorted(comb))
+                    if comb_tuple not in configured_combs:
+                        configured_combs.append(comb_tuple)
+
+            unique_combs = configured_combs
             print(f"\nUsing configured combinations: {len(unique_combs)} "
                   f"(Seen: {len(seen_combinations or [])}, Unseen: {len(unseen_combinations or [])})")
         else:

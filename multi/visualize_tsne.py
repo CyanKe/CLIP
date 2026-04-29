@@ -18,6 +18,10 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
+
+# 配置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'KaiTi']
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

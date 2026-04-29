@@ -268,12 +268,379 @@ class STFTDataset(Dataset):
 
         return stft_tensor, label_tensor, metadata
 
+
+# ============================================================================
+# 双分支数据加载 - 用于欺骗/压制干扰分类
+# ============================================================================
+
+class DualBranchSTFTDataset(Dataset):
+    """
+    双分支 STFT 数据集 - 用于欺骗/压制干扰分类
+
+    标签生成策略:
+    - 欺骗干扰样本: labels_deception = [1,0,0,...], labels_suppression = [0,0,...,1] (无压制)
+    - 压制干扰样本: labels_deception = [0,0,...,1] (无欺骗), labels_suppression = [1,0,...]
+    """
+
+    def __init__(
+        self,
+        stft_file: str,
+        metadata_file: str,
+        stft_var_name: str = 'all_stfts',
+        normalization_stats: dict = None,
+        image_size: int = 224,
+        apply_clip_norm: bool = True,
+        deception_classes: list = None,
+        suppression_classes: list = None,
+        normalize_mode: str = 'per_sample',
+        normalize_method: str = 'p99',
+    ):
+        """
+        Args:
+            stft_file: STFT 数据文件路径
+            metadata_file: metadata 文件路径
+            deception_classes: 欺骗干扰类型列表
+            suppression_classes: 压制干扰类型列表
+        """
+        super().__init__()
+
+        self.stft_file = stft_file
+        self.metadata_file = metadata_file
+        self.stft_var_name = stft_var_name
+
+        # 延迟加载 STFT 样本数
+        with h5py.File(stft_file, 'r') as f:
+            self.num_samples = f[stft_var_name].shape[2]
+
+        # 干扰类型分组
+        self.deception_classes = deception_classes or ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"]
+        self.suppression_classes = suppression_classes or ["AJ", "BJ", "SJ", "NCJ", "NPJ", "NFMJ", "NPMJ", "NAMJ", "PJ"]
+
+        # 类别数 (含 "无XX干扰")
+        self.num_deception_classes = len(self.deception_classes) + 1  # +1 for "无欺骗干扰"
+        self.num_suppression_classes = len(self.suppression_classes) + 1  # +1 for "无压制干扰"
+
+        # 加载 metadata
+        if metadata_file and os.path.exists(metadata_file):
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                self._metadata = json.load(f)
+            # 构建双分支标签
+            self._labels_deception, self._labels_suppression = self._build_dual_branch_labels()
+        else:
+            raise ValueError(f"Metadata file required: {metadata_file}")
+
+        # 归一化参数
+        if normalization_stats is None:
+            normalization_stats = {
+                'real_max': 450.0,
+                'imag_max': 450.0,
+                'mag_max': 455.0,
+            }
+        self.norm_scale_mag = normalization_stats.get('mag_max', 455.0)
+
+        self.image_size = image_size
+        self.apply_clip_norm = apply_clip_norm
+        self.normalize_mode = normalize_mode
+        self.normalize_method = normalize_method
+
+        if apply_clip_norm:
+            self.clip_norm = transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
+        else:
+            self.clip_norm = None
+
+        self._h5_file = None
+
+    def _build_dual_branch_labels(self) -> tuple:
+        """
+        构建双分支标签
+
+        Returns:
+            labels_deception: [num_samples, num_deception_classes]
+            labels_suppression: [num_samples, num_suppression_classes]
+        """
+        labels_deception = np.zeros((self.num_samples, self.num_deception_classes), dtype=np.float32)
+        labels_suppression = np.zeros((self.num_samples, self.num_suppression_classes), dtype=np.float32)
+
+        # 构建类别名称到索引的映射
+        deception_name_to_idx = {name: i for i, name in enumerate(self.deception_classes)}
+        suppression_name_to_idx = {name: i for i, name in enumerate(self.suppression_classes)}
+
+        # "无XX干扰" 的索引
+        none_deception_idx = len(self.deception_classes)  # 最后一个位置
+        none_suppression_idx = len(self.suppression_classes)
+
+        for i, meta in enumerate(self._metadata):
+            if i >= self.num_samples:
+                break
+
+            jam_types = meta.get('jam_types', [])
+            if isinstance(jam_types, str):
+                jam_types = [jam_types] if jam_types else []
+            elif not isinstance(jam_types, list):
+                jam_types = []
+
+            # 分类干扰类型
+            has_deception = False
+            has_suppression = False
+
+            for jam_type in jam_types:
+                jam_type = jam_type.strip() if isinstance(jam_type, str) else str(jam_type)
+
+                if jam_type in deception_name_to_idx:
+                    labels_deception[i, deception_name_to_idx[jam_type]] = 1.0
+                    has_deception = True
+                elif jam_type in suppression_name_to_idx:
+                    labels_suppression[i, suppression_name_to_idx[jam_type]] = 1.0
+                    has_suppression = True
+
+            # 如果没有欺骗干扰，标记为 "无欺骗干扰"
+            if not has_deception:
+                labels_deception[i, none_deception_idx] = 1.0
+
+            # 如果没有压制干扰，标记为 "无压制干扰"
+            if not has_suppression:
+                labels_suppression[i, none_suppression_idx] = 1.0
+
+        return labels_deception, labels_suppression
+
+    def _lazy_load(self):
+        if self._h5_file is None:
+            self._h5_file = h5py.File(self.stft_file, 'r')
+        return self._h5_file
+
+    def __len__(self):
+        return self.num_samples
+
+    def _get_metadata(self, index: int) -> dict:
+        if self._metadata is None:
+            return None
+        if isinstance(self._metadata, list) and index < len(self._metadata):
+            meta = self._metadata[index].copy()
+            if 'jam_types' in meta and isinstance(meta['jam_types'], int):
+                meta['jam_types'] = [meta['jam_types']]
+            return meta
+        return None
+
+    def __getitem__(self, index: int):
+        h5_file = self._lazy_load()
+
+        # 读取 STFT 数据
+        raw_stft = h5_file[self.stft_var_name][:, :, index]
+        stft_complex = raw_stft['real'] + 1j * raw_stft['imag']
+
+        # 归一化
+        if self.normalize_mode == 'per_sample':
+            mag = np.abs(stft_complex)
+            if self.normalize_method == 'max':
+                ref = np.max(mag)
+            elif self.normalize_method == 'p95':
+                ref = np.percentile(mag, 95)
+            else:
+                ref = np.percentile(mag, 99)
+
+            if ref > 0:
+                stft_complex = stft_complex / ref
+            stft_mag = np.abs(stft_complex).T
+        else:
+            stft_mag = np.abs(stft_complex).T
+            stft_mag = np.clip(stft_mag, 0, self.norm_scale_mag) / self.norm_scale_mag
+
+        # 构建三通道张量
+        stft_tensor = torch.from_numpy(np.stack([stft_mag, stft_mag, stft_mag], axis=0)).float()
+
+        # Resize
+        if stft_tensor.shape[-2:] != (self.image_size, self.image_size):
+            stft_tensor = torch.nn.functional.interpolate(
+                stft_tensor.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
+
+        # CLIP 标准化
+        if self.clip_norm is not None:
+            stft_tensor = self.clip_norm(stft_tensor)
+
+        # 获取双分支标签
+        label_deception = torch.from_numpy(self._labels_deception[index])
+        label_suppression = torch.from_numpy(self._labels_suppression[index])
+
+        # 获取 metadata
+        metadata = self._get_metadata(index)
+
+        return stft_tensor, label_deception, label_suppression, metadata
+
+
+def collate_fn_dual_branch(batch):
+    """
+    双分支 Collate 函数
+
+    Args:
+        batch: list of (stft_image, label_deception, label_suppression, metadata)
+
+    Returns:
+        stft_images, text_tokens_deception, text_tokens_suppression,
+        labels_deception, labels_suppression, texts_deception, texts_suppression, metadata_list
+    """
+    from multi.text_templates import get_dual_branch_descriptions
+    import clip
+
+    stft_images, labels_deception, labels_suppression, metadata_list = zip(*batch)
+
+    # 堆叠
+    stft_images = torch.stack(stft_images, dim=0)
+    labels_deception = torch.stack(labels_deception, dim=0)
+    labels_suppression = torch.stack(labels_suppression, dim=0)
+
+    # 从配置获取干扰类型分组
+    deception_classes = ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"]
+    suppression_classes = ["AJ", "BJ", "SJ", "NCJ", "NPJ", "NFMJ", "NPMJ", "NAMJ", "PJ"]
+
+    # 生成双分支文本描述
+    texts_deception = []
+    texts_suppression = []
+
+    for meta in metadata_list:
+        jam_types = meta.get('jam_types', [])
+        if isinstance(jam_types, str):
+            jam_types = [jam_types] if jam_types else []
+        elif not isinstance(jam_types, list):
+            jam_types = []
+
+        desc_deception, desc_suppression = get_dual_branch_descriptions(
+            jam_types, deception_classes, suppression_classes
+        )
+        texts_deception.append(desc_deception)
+        texts_suppression.append(desc_suppression)
+
+    # Tokenize
+    text_tokens_deception = clip.tokenize(texts_deception, truncate=True)
+    text_tokens_suppression = clip.tokenize(texts_suppression, truncate=True)
+
+    return (stft_images, text_tokens_deception, text_tokens_suppression,
+            labels_deception, labels_suppression, texts_deception, texts_suppression, metadata_list)
+
+
+def create_dual_branch_dataloaders(
+    config: dict,
+    normalization_stats: dict = None,
+    batch_size: int = 16,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    load_test: bool = True,
+) -> tuple:
+    """
+    创建双分支 CZSL 数据加载器
+
+    Args:
+        config: 配置字典
+        normalization_stats: 归一化统计量
+        batch_size: 批次大小
+        num_workers: 数据加载 worker 数
+        pin_memory: 是否 pin memory
+        load_test: 是否加载测试集
+
+    Returns:
+        (train_loader, val_loader, test_loader, num_deception_classes, num_suppression_classes)
+    """
+    data_config = config.get('data', {})
+    base_path = data_config.get('base_path')
+    jnr_start = data_config.get('jnr_start', 10)
+    jnr_end = data_config.get('jnr_end', 10)
+    jnr_step = data_config.get('jnr_step', 1)
+
+    jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
+
+    # 从配置获取干扰类型分组
+    jamming_groups = config.get("jamming_groups", {})
+    deception_classes = jamming_groups.get("deception", {}).get("classes", ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"])
+    suppression_classes = jamming_groups.get("suppression", {}).get("classes", ["AJ", "BJ", "SJ", "NCJ", "NPJ", "NFMJ", "NPMJ", "NAMJ", "PJ"])
+
+    def load_split(split_name: str, required: bool = True):
+        datasets = []
+
+        for jnr in jnr_levels:
+            jnr_folder = f"JNR_{'+' if jnr >= 0 else ''}{jnr}"
+            data_folder = os.path.join(base_path, jnr_folder)
+
+            stft_file = os.path.join(data_folder, f'{split_name}_echo_stfts.mat')
+            metadata_file = os.path.join(data_folder, f'{split_name}_echo_metadata.json')
+
+            if not os.path.exists(stft_file):
+                print(f"Warning: STFT data not found for {jnr_folder}/{split_name}, skipping...")
+                continue
+
+            if not os.path.exists(metadata_file):
+                print(f"Warning: Metadata not found for {jnr_folder}/{split_name}, skipping...")
+                continue
+
+            dataset = DualBranchSTFTDataset(
+                stft_file=stft_file,
+                metadata_file=metadata_file,
+                normalization_stats=normalization_stats,
+                deception_classes=deception_classes,
+                suppression_classes=suppression_classes,
+            )
+            datasets.append(dataset)
+            print(f"Loaded {split_name} data from {jnr_folder}: {len(dataset)} samples")
+
+        if not datasets:
+            if required:
+                raise ValueError(f"No data found for {split_name} split!")
+            else:
+                print(f"Warning: No data found for {split_name} split, returning None")
+                return None
+
+        return ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+
+    # 创建数据集
+    train_dataset = load_split('train', required=True)
+    val_dataset = load_split('val', required=True)
+    test_dataset = load_split('test', required=False) if load_test else None
+
+    # 创建数据加载器
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn_dual_branch,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn_dual_branch,
+    )
+
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=collate_fn_dual_branch,
+        )
+
+    num_deception_classes = len(deception_classes) + 1
+    num_suppression_classes = len(suppression_classes) + 1
+
+    return train_loader, val_loader, test_loader, num_deception_classes, num_suppression_classes
+
+
 def create_czsl_dataloaders(
     config: dict,
     normalization_stats: dict = None,
     batch_size: int = 16,
     num_workers: int = 4,
     pin_memory: bool = True,
+    load_test: bool = True,
 ) -> tuple:
     """
     创建 CZSL 数据加载器 (train/val/test)
@@ -284,9 +651,11 @@ def create_czsl_dataloaders(
         batch_size: 批次大小
         num_workers: 数据加载 worker 数
         pin_memory: 是否 pin memory
+        load_test: 是否加载测试集
 
     Returns:
         (train_loader, val_loader, test_loader, num_classes)
+        如果 load_test=False 或 test 数据不存在，test_loader 为 None
     """
 
     data_config = config.get('data', {})
@@ -307,8 +676,13 @@ def create_czsl_dataloaders(
     class_names = [cls['name'] for cls in config.get('jamming_classes', [])]
 
     # 加载所有 JNR 级别的数据
-    def load_split(split_name: str):
-        """加载单个 split 的数据集"""
+    def load_split(split_name: str, required: bool = True):
+        """加载单个 split 的数据集
+
+        Args:
+            split_name: split 名称
+            required: 是否必需，如果为 False 则在找不到时返回 None
+        """
         datasets = []
 
         for jnr in jnr_levels:
@@ -340,14 +714,18 @@ def create_czsl_dataloaders(
             print(f"Loaded {split_name} data from {jnr_folder}: {len(stft_dataset)} samples")
 
         if not datasets:
-            raise ValueError(f"No data found for {split_name} split!")
+            if required:
+                raise ValueError(f"No data found for {split_name} split!")
+            else:
+                print(f"Warning: No data found for {split_name} split, returning None")
+                return None
 
         return ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
 
     # 创建数据集
-    train_dataset = load_split('train')
-    val_dataset = load_split('val')
-    test_dataset = load_split('test')
+    train_dataset = load_split('train', required=True)
+    val_dataset = load_split('val', required=True)
+    test_dataset = load_split('test', required=False) if load_test else None
 
     # 使用模块级别的 collate_fn
     # 创建数据加载器
@@ -369,14 +747,16 @@ def create_czsl_dataloaders(
         collate_fn=collate_fn,
     )
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=collate_fn,
-    )
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=collate_fn,
+        )
 
     return train_loader, val_loader, test_loader, len(class_names)
 

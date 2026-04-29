@@ -557,6 +557,550 @@ def create_czsl_model(config: dict, device: str = "cuda") -> CLIPForCZSL:
     return model
 
 
+class DualBranchCLIPForCZSL(nn.Module):
+    """
+    双分支 CLIP 模型 - 用于欺骗/压制干扰分类
+
+    架构:
+    - 共享 CLIP 视觉编码器
+    - 欺骗干扰分支: 独立文本特征空间 (5种欺骗 + 无欺骗)
+    - 压制干扰分支: 独立文本特征空间 (9种压制 + 无压制)
+    """
+
+    def __init__(
+        self,
+        clip_model: str = "ViT-B/32",
+        deception_classes: List[str] = None,
+        suppression_classes: List[str] = None,
+        freeze_vision: bool = False,
+        freeze_text: bool = True,
+        vision_layers_unfreeze: int = 2,
+        device: str = "cuda",
+        use_time_domain: bool = False,
+        time_seq_len: int = 8000,
+    ):
+        """
+        初始化双分支 CZSL-CLIP 模型
+
+        Args:
+            clip_model: CLIP 模型名称
+            deception_classes: 欺骗干扰类型列表
+            suppression_classes: 压制干扰类型列表
+            freeze_vision: 是否冻结视觉编码器
+            freeze_text: 是否冻结文本编码器
+            vision_layers_unfreeze: 解冻视觉编码器最后 N 层
+            device: 计算设备
+            use_time_domain: 是否使用时域信号
+            time_seq_len: 时域信号序列长度
+        """
+        super().__init__()
+        self.device = device
+        self.deception_classes = deception_classes or []
+        self.suppression_classes = suppression_classes or []
+
+        # 添加 "无XX干扰" 类
+        self.deception_classes_with_none = self.deception_classes + ["无欺骗干扰"]
+        self.suppression_classes_with_none = self.suppression_classes + ["无压制干扰"]
+
+        self.num_deception_classes = len(self.deception_classes_with_none)
+        self.num_suppression_classes = len(self.suppression_classes_with_none)
+
+        self.use_time_domain = use_time_domain
+        self.time_seq_len = time_seq_len
+
+        # 加载预训练 CLIP 模型
+        if clip_model == "resnet18":
+            self.model = HybridResNetCLIP(device=device, target_embed_dim=1024)
+            self.preprocess = clip.clip._transform(self.model.visual.input_resolution)
+        else:
+            self.model, self.preprocess = clip.load(clip_model, device=device)
+
+        self.model = self.model.float()
+
+        # 获取特征维度
+        self.embed_dim = self.model.text_projection.shape[1]
+
+        # 应用冻结策略
+        self._apply_freeze_strategy(
+            freeze_vision=freeze_vision,
+            freeze_text=freeze_text,
+            vision_layers_unfreeze=vision_layers_unfreeze
+        )
+
+        # 时域编码器 (如果启用)
+        if self.use_time_domain:
+            self.time_encoder = TimeDomainTransformerEncoder(
+                embed_dim=self.embed_dim,
+                num_heads=8,
+                num_layers=3,
+                seq_len=time_seq_len
+            ).to(device)
+            self.fusion_projection = nn.Linear(self.embed_dim * 2, self.embed_dim).to(device)
+
+        # 缓存文本特征
+        self._deception_text_features = None
+        self._suppression_text_features = None
+        self._deception_names = None
+        self._suppression_names = None
+
+    def _apply_freeze_strategy(self, freeze_vision, freeze_text, vision_layers_unfreeze):
+        """应用冻结策略"""
+        if freeze_text:
+            for param in self.model.transformer.parameters():
+                param.requires_grad = False
+            self.model.token_embedding.weight.requires_grad = False
+            self.model.positional_embedding.requires_grad = False
+            self.model.text_projection.requires_grad = False
+
+        if freeze_vision:
+            for param in self.model.visual.parameters():
+                param.requires_grad = False
+        elif vision_layers_unfreeze > 0:
+            self._freeze_vision_partially(vision_layers_unfreeze)
+
+    def _freeze_vision_partially(self, layers_unfreeze: int):
+        """部分冻结视觉编码器"""
+        for param in self.model.visual.parameters():
+            param.requires_grad = False
+
+        if hasattr(self.model.visual, 'transformer'):
+            num_layers = len(self.model.visual.transformer.resblocks)
+            for i in range(num_layers - layers_unfreeze, num_layers):
+                for param in self.model.visual.transformer.resblocks[i].parameters():
+                    param.requires_grad = True
+        elif hasattr(self.model.visual, 'layer4'):
+            for param in self.model.visual.layer4.parameters():
+                param.requires_grad = True
+            if layers_unfreeze > 1:
+                for param in self.model.visual.layer3.parameters():
+                    param.requires_grad = True
+
+    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
+        """编码图像"""
+        return self.model.encode_image(image)
+
+    def encode_text(self, text_tokens: torch.Tensor) -> torch.Tensor:
+        """编码文本"""
+        return self.model.encode_text(text_tokens)
+
+    def forward_dual(
+        self,
+        image: torch.Tensor,
+        text_tokens_deception: torch.Tensor,
+        text_tokens_suppression: torch.Tensor,
+        time_signal: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        双分支前向传播
+
+        Args:
+            image: STFT 图像
+            text_tokens_deception: 欺骗分支文本 tokens
+            text_tokens_suppression: 压制分支文本 tokens
+            time_signal: 时域信号 (可选)
+
+        Returns:
+            image_features: 图像特征
+            text_features_deception: 欺骗分支文本特征
+            text_features_suppression: 压制分支文本特征
+        """
+        # 提取图像特征
+        stft_features = self.encode_image(image)
+
+        if self.use_time_domain and time_signal is not None:
+            time_features = self.time_encoder(time_signal)
+            fused_features = torch.cat([stft_features, time_features], dim=-1)
+            image_features = self.fusion_projection(fused_features)
+        else:
+            image_features = stft_features
+
+        # 提取两个分支的文本特征
+        text_features_deception = self.encode_text(text_tokens_deception)
+        text_features_suppression = self.encode_text(text_tokens_suppression)
+
+        # 归一化
+        image_features = F.normalize(image_features, dim=-1)
+        text_features_deception = F.normalize(text_features_deception, dim=-1)
+        text_features_suppression = F.normalize(text_features_suppression, dim=-1)
+
+        return image_features, text_features_deception, text_features_suppression
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        text_tokens_deception: torch.Tensor = None,
+        text_tokens_suppression: torch.Tensor = None,
+        time_signal: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """前向传播"""
+        return self.forward_dual(image, text_tokens_deception, text_tokens_suppression, time_signal)
+
+    @torch.no_grad()
+    def cache_text_features_dual(self, use_translation: bool = False):
+        """
+        缓存双分支文本特征
+        """
+        self.eval()
+        from multi.text_templates import get_dual_branch_inference_descriptions
+
+        descriptions = get_dual_branch_inference_descriptions(
+            self.deception_classes,
+            self.suppression_classes,
+            use_translation=use_translation
+        )
+
+        # 欺骗分支
+        deception_texts = descriptions['deception']
+        self._deception_names = descriptions['deception_names']
+        deception_tokens = clip.tokenize(deception_texts, truncate=True).to(self.device)
+        self._deception_text_features = self.encode_text(deception_tokens)
+        self._deception_text_features = F.normalize(self._deception_text_features, dim=-1)
+
+        # 压制分支
+        suppression_texts = descriptions['suppression']
+        self._suppression_names = descriptions['suppression_names']
+        suppression_tokens = clip.tokenize(suppression_texts, truncate=True).to(self.device)
+        self._suppression_text_features = self.encode_text(suppression_tokens)
+        self._suppression_text_features = F.normalize(self._suppression_text_features, dim=-1)
+
+        print(f"Cached dual-branch text features:")
+        print(f"  - Deception: {len(self._deception_names)} classes")
+        print(f"  - Suppression: {len(self._suppression_names)} classes")
+
+    def get_deception_text_features(self) -> torch.Tensor:
+        """获取欺骗分支文本特征"""
+        if self._deception_text_features is None:
+            self.cache_text_features_dual()
+        return self._deception_text_features
+
+    def get_suppression_text_features(self) -> torch.Tensor:
+        """获取压制分支文本特征"""
+        if self._suppression_text_features is None:
+            self.cache_text_features_dual()
+        return self._suppression_text_features
+
+    @torch.no_grad()
+    def zero_shot_predict_dual(
+        self,
+        image: torch.Tensor,
+        time_signal: torch.Tensor = None,
+        top_k: int = 1
+    ) -> Tuple[dict, dict]:
+        """
+        双分支零样本预测
+
+        Args:
+            image: 图像张量
+            time_signal: 时域信号 (可选)
+            top_k: 返回 top-k 预测
+
+        Returns:
+            deception_result: {'similarities', 'indices', 'names'}
+            suppression_result: {'similarities', 'indices', 'names'}
+        """
+        self.eval()
+
+        # 编码图像
+        stft_features = self.encode_image(image)
+
+        if self.use_time_domain and time_signal is not None:
+            time_features = self.time_encoder(time_signal)
+            fused_features = torch.cat([stft_features, time_features], dim=-1)
+            image_features = self.fusion_projection(fused_features)
+        else:
+            image_features = stft_features
+
+        image_features = F.normalize(image_features, dim=-1)
+
+        logit_scale = self.model.logit_scale.exp()
+
+        # 欺骗分支预测
+        deception_features = self.get_deception_text_features()
+        deception_similarities = logit_scale * (image_features @ deception_features.T)
+        top_k_deception = min(top_k, deception_features.shape[0])
+        deception_values, deception_indices = torch.topk(deception_similarities, k=top_k_deception, dim=-1)
+        deception_names = [[self._deception_names[idx.item()] for idx in batch_indices]
+                          for batch_indices in deception_indices]
+
+        deception_result = {
+            'similarities': deception_similarities,
+            'indices': deception_indices,
+            'names': deception_names
+        }
+
+        # 压制分支预测
+        suppression_features = self.get_suppression_text_features()
+        suppression_similarities = logit_scale * (image_features @ suppression_features.T)
+        top_k_suppression = min(top_k, suppression_features.shape[0])
+        suppression_values, suppression_indices = torch.topk(suppression_similarities, k=top_k_suppression, dim=-1)
+        suppression_names = [[self._suppression_names[idx.item()] for idx in batch_indices]
+                            for batch_indices in suppression_indices]
+
+        suppression_result = {
+            'similarities': suppression_similarities,
+            'indices': suppression_indices,
+            'names': suppression_names
+        }
+
+        return deception_result, suppression_result
+
+
+def create_dual_branch_model(config: dict, device: str = "cuda") -> DualBranchCLIPForCZSL:
+    """
+    创建双分支 CZSL 模型
+
+    Args:
+        config: 配置字典
+        device: 计算设备
+
+    Returns:
+        DualBranchCLIPForCZSL 模型实例
+    """
+    model_config = config.get("model", {})
+    data_config = config.get("data", {})
+
+    # 从 jamming_groups 获取分类
+    jamming_groups = config.get("jamming_groups", {})
+    deception_classes = jamming_groups.get("deception", {}).get("classes", [])
+    suppression_classes = jamming_groups.get("suppression", {}).get("classes", [])
+
+    if not deception_classes or not suppression_classes:
+        # 回退到默认分组
+        all_classes = [cls_info["name"] for cls_info in config.get("jamming_classes", [])]
+        # 根据常见干扰类型分组
+        deception_classes = ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"]
+        suppression_classes = ["AJ", "BJ", "SJ", "NCJ", "NPJ", "NFMJ", "NPMJ", "NAMJ", "PJ"]
+        # 过滤出实际存在的类别
+        deception_classes = [c for c in deception_classes if c in all_classes]
+        suppression_classes = [c for c in suppression_classes if c in all_classes]
+
+    # 时域配置
+    use_time_domain = config.get("use_time_domain", False)
+    time_seq_len = data_config.get("time_seq_len", 8000)
+
+    model = DualBranchCLIPForCZSL(
+        clip_model=model_config.get("clip_model", "ViT-B/32"),
+        deception_classes=deception_classes,
+        suppression_classes=suppression_classes,
+        freeze_vision=model_config.get("freeze_vision", False),
+        freeze_text=model_config.get("freeze_text", True),
+        vision_layers_unfreeze=model_config.get("vision_layers_unfreeze", 2),
+        device=device,
+        use_time_domain=use_time_domain,
+        time_seq_len=time_seq_len
+    )
+
+    # LoRA 配置
+    lora_config = config.get("lora", {})
+    if lora_config.get("enabled", False):
+        print("\n" + "=" * 60)
+        print("Applying LoRA to dual-branch model...")
+        print("=" * 60)
+
+        target_modules = lora_config.get("target_modules", ["attn"])
+        if isinstance(target_modules, str):
+            target_modules = [target_modules]
+
+        replaced = apply_lora_to_model(
+            model.model,
+            target_modules=target_modules,
+            rank=lora_config.get("rank", 8),
+            alpha=lora_config.get("alpha", 16.0),
+            dropout=lora_config.get("dropout", 0.0)
+        )
+
+        freeze_non_lora_params(model.model)
+
+        stats = count_parameters(model.model)
+        print(f"\nLoRA applied to {replaced} layers")
+        print(f"Trainable parameters: {stats['trainable']:,} ({stats['trainable_ratio']:.2%})")
+        print("=" * 60)
+
+    return model
+
+
+# ============================================================================
+# ResNet18 双分支分类模型 - 用于消融实验对比
+# ============================================================================
+
+class DualBranchResNet18(nn.Module):
+    """
+    双分支 ResNet18 分类模型 - 用于消融实验
+
+    架构:
+    - 共享 ResNet18 视觉编码器
+    - 欺骗干扰分类头 (num_deception_classes)
+    - 压制干扰分类头 (num_suppression_classes)
+
+    使用标准交叉熵损失训练，不是 CLIP 对比学习。
+    """
+
+    def __init__(
+        self,
+        deception_classes: List[str] = None,
+        suppression_classes: List[str] = None,
+        pretrained: bool = True,
+        freeze_backbone: bool = False,
+        device: str = "cuda"
+    ):
+        """
+        初始化双分支 ResNet18 模型
+
+        Args:
+            deception_classes: 欺骗干扰类型列表
+            suppression_classes: 压制干扰类型列表
+            pretrained: 是否使用 ImageNet 预训练权重
+            freeze_backbone: 是否冻结骨干网络
+            device: 计算设备
+        """
+        super().__init__()
+        self.device = device
+        self.deception_classes = deception_classes or []
+        self.suppression_classes = suppression_classes or []
+
+        # 包含 "无XX干扰"
+        self.deception_classes_with_none = self.deception_classes + ["无欺骗干扰"]
+        self.suppression_classes_with_none = self.suppression_classes + ["无压制干扰"]
+
+        self.num_deception_classes = len(self.deception_classes_with_none)
+        self.num_suppression_classes = len(self.suppression_classes_with_none)
+
+        # 加载预训练 ResNet18
+        resnet = models.resnet18(pretrained=pretrained)
+
+        # 移除原始全连接层
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])  # 输出: [batch, 512, 1, 1]
+        self.feature_dim = 512
+
+        # 欺骗分支分类头
+        self.deception_classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(self.feature_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, self.num_deception_classes)
+        )
+
+        # 压制分支分类头
+        self.suppression_classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(self.feature_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, self.num_suppression_classes)
+        )
+
+        # 冻结骨干网络
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        self.to(device)
+
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """提取图像特征"""
+        features = self.backbone(x)
+        features = features.view(features.size(0), -1)  # [batch, 512]
+        return features
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        前向传播
+
+        Args:
+            x: 输入图像 [batch, 3, H, W]
+
+        Returns:
+            logits_deception: 欺骗分支 logits [batch, num_deception_classes]
+            logits_suppression: 压制分支 logits [batch, num_suppression_classes]
+        """
+        features = self.extract_features(x)
+
+        logits_deception = self.deception_classifier(features)
+        logits_suppression = self.suppression_classifier(features)
+
+        return logits_deception, logits_suppression
+
+    def predict(self, x: torch.Tensor) -> Tuple[dict, dict]:
+        """
+        预测
+
+        Args:
+            x: 输入图像
+
+        Returns:
+            deception_result: {'indices', 'names', 'probs'}
+            suppression_result: {'indices', 'names', 'probs'}
+        """
+        self.eval()
+        with torch.no_grad():
+            logits_deception, logits_suppression = self.forward(x)
+
+            probs_deception = F.softmax(logits_deception, dim=-1)
+            probs_suppression = F.softmax(logits_suppression, dim=-1)
+
+            pred_deception = torch.argmax(probs_deception, dim=-1)
+            pred_suppression = torch.argmax(probs_suppression, dim=-1)
+
+        batch_size = x.size(0)
+
+        deception_names = [[self.deception_classes_with_none[idx.item()]] for idx in pred_deception]
+        suppression_names = [[self.suppression_classes_with_none[idx.item()]] for idx in pred_suppression]
+
+        deception_result = {
+            'indices': pred_deception.unsqueeze(1),
+            'names': deception_names,
+            'probs': probs_deception
+        }
+
+        suppression_result = {
+            'indices': pred_suppression.unsqueeze(1),
+            'names': suppression_names,
+            'probs': probs_suppression
+        }
+
+        return deception_result, suppression_result
+
+
+def create_resnet18_dual_branch_model(config: dict, device: str = "cuda") -> DualBranchResNet18:
+    """
+    创建双分支 ResNet18 模型
+
+    Args:
+        config: 配置字典
+        device: 计算设备
+
+    Returns:
+        DualBranchResNet18 模型实例
+    """
+    model_config = config.get("model", {})
+
+    # 从 jamming_groups 获取分类
+    jamming_groups = config.get("jamming_groups", {})
+    deception_classes = jamming_groups.get("deception", {}).get("classes", ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"])
+    suppression_classes = jamming_groups.get("suppression", {}).get("classes", ["AJ", "BJ", "SJ", "NCJ", "NPJ", "NFMJ", "NPMJ", "NAMJ", "PJ"])
+
+    model = DualBranchResNet18(
+        deception_classes=deception_classes,
+        suppression_classes=suppression_classes,
+        pretrained=model_config.get("pretrained", True),
+        freeze_backbone=model_config.get("freeze_backbone", False),
+        device=device
+    )
+
+    # 统计参数
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print(f"\nDualBranchResNet18 created:")
+    print(f"  - Deception classes: {len(deception_classes)} + 1 (无欺骗干扰)")
+    print(f"  - Suppression classes: {len(suppression_classes)} + 1 (无压制干扰)")
+    print(f"  - Total parameters: {total_params:,}")
+    print(f"  - Trainable parameters: {trainable_params:,}")
+
+    return model
+
+
 if __name__ == "__main__":
     # 测试代码
     device = "cuda" if torch.cuda.is_available() else "cpu"

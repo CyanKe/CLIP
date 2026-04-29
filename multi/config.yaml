@@ -12,11 +12,11 @@ model:
 # 训练配置
 train:
   batch_size: 32
-  epochs: 5
+  epochs: 20
   lr: 0.00001                     # 1e-5
   weight_decay: 0.01
   warmup_epochs: 2
-  threshold: 0.5                  # 多标签预测阈值
+  threshold: 0.07                  # 多标签预测阈值
 
   # 学习率调度
   scheduler:
@@ -41,7 +41,7 @@ loss:
 data:
   base_path: "D:/VScode/Jamming_signal_simulation/output/260422"
   jnr_start: 0
-  jnr_end: 50
+  jnr_end: 20
   jnr_step: 5
   num_workers: 4
   pin_memory: true
@@ -114,6 +114,19 @@ jamming_classes:
   - name: "PJ"
 
 # ============================================================================
+# 干扰类型分组配置 - 用于双分支分类
+# ============================================================================
+jamming_groups:
+  deception:
+    name: "欺骗干扰"
+    classes: ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"]
+    none_class: "无欺骗干扰"
+  suppression:
+    name: "压制干扰"
+    classes: ["AJ", "BJ", "SJ", "NCJ", "NPJ", "NFMJ", "NPMJ", "NAMJ", "PJ"]
+    none_class: "无压制干扰"
+
+# ============================================================================
 # 类别名称翻译字典 (缩写 -> 全称)
 # 用于生成更具语义的文本描述，提升 CLIP 的理解能力
 # ============================================================================
@@ -165,6 +178,13 @@ czsl:
     - ["NAMJ"]
     - ["PJ"]
 
+  # 合作为seen（训练时可见）
+
+
+  unseen_combinations:
+  # 未见组合（用于零样本测试）
+  # 这些组合在训练时不出现，但测试时需要识别
+
     - ["DFTJ", "AJ"]
     - ["DFTJ", "BJ"]
     - ["DFTJ", "SJ"]
@@ -214,14 +234,6 @@ czsl:
     - ["CSJ", "NPMJ"]
     - ["CSJ", "NFMJ"]
     - ["CSJ", "PJ"]
-
-
-  # 合作为seen（训练时可见）
-
-  unseen_combinations:
-  # 未见组合（用于零样本测试）
-  # 这些组合在训练时不出现，但测试时需要识别
-
 
   # 数据划分参数
   unseen_ratio: 0          # 自动划分时unseen比例
