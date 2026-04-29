@@ -2,12 +2,26 @@
 # 组合零样本学习配置文件
 # ============================================================================
 
-# CLIP模型配置
+# CLIP/SigLIP 模型配置
 model:
-  clip_model: "ViT-B/32"       # CLIP模型类型: RN50, RN101, ViT-B/32, ViT-B/16, ViT-L/14, resnet18
+  # CLIP 模型选项 (OpenAI):
+  # - "ViT-B/32", "ViT-B/16", "ViT-L/14", "RN50", "RN101", "resnet18"
+  #
+  # SigLIP 模型选项 (HuggingFace):
+  # - "siglip-base-patch16-224"
+  # - "siglip-large-patch16-384"
+  # - "google/siglip-base-patch16-224" (完整名称)
+  clip_model: "siglip-base-patch16-224"
+
   freeze_vision: false         # 设为 false 以启用部分解冻
   vision_layers_unfreeze: 2    # 只解冻视觉编码器最后2层
   freeze_text: true            # 冻结文本编码器
+  use_multishape_vit: true
+  patch_sizes: [[8, 32], [32, 8], [16, 16]]
+  embed_dim: 512
+  depth: 6
+  num_heads: 8
+  fusion_mode: "early_fusion"
 
 # 训练配置
 train:
@@ -30,12 +44,17 @@ train:
   grad_clip: 1.0
 
 # 损失函数配置
+# 注意：SigLIP 模型会自动使用 Sigmoid Loss，无需手动设置
 loss:
   type: "multilabel_infonce"   # label_aware_infonce, infonce, multilabel_infonce, asymmetric, bce
-  temperature: 0.07             # 对比损失温度参数
+  temperature: 0.1             # 对比损失温度参数 (SigLIP 默认 0.1, CLIP 默认 0.07)
   label_smoothing: 0.0          # 标签平滑
   learnable_temperature: true   # 是否学习温度参数
   handle_zero_sum: "self_only"  # 处理无同类样本的策略: self_only, uniform, skip
+
+  # SigLIP Sigmoid Loss 专用参数
+  initial_bias: -10.0          # 初始 logit bias
+  similarity_metric: "iou"     # 多标签相似度度量: iou 或 binary
 
 # 数据配置
 data:

@@ -20,6 +20,45 @@ CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
+def tokenize_texts(
+    texts: list,
+    model_type: str = "clip",
+    processor=None,
+    max_length: int = None
+) -> torch.Tensor:
+    """
+    统一的文本分词函数，支持 CLIP 和 SigLIP
+
+    Args:
+        texts: 文本列表
+        model_type: 模型类型 ("clip" 或 "siglip-xxx")
+        processor: SigLIP processor（SigLIP 模型需要）
+        max_length: 最大序列长度（可选）
+
+    Returns:
+        tokens: token 张量 [batch_size, seq_len]
+    """
+    if model_type.startswith("siglip"):
+        # SigLIP tokenization
+        from multi.siglip_loader import get_siglip_text_length
+
+        if max_length is None:
+            max_length = get_siglip_text_length(model_type)
+
+        encoded = processor(
+            text=texts,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=max_length
+        )
+        return encoded["input_ids"]
+    else:
+        # CLIP tokenization
+        import clip
+        return clip.tokenize(texts, truncate=True)
+
+
 def collate_fn(batch):
     """
     Collate 函数（模块级别，支持多进程 pickle）
@@ -63,6 +102,50 @@ def collate_fn(batch):
     text_tokens = clip.tokenize(texts, truncate=True)
 
     return stft_images, time_signals, text_tokens, labels, texts, metadata_list
+
+
+def create_collate_fn(model_type: str = "clip", processor=None):
+    """
+    创建支持 CLIP 或 SigLIP 的 collate 函数
+
+    Args:
+        model_type: 模型类型 ("clip" 或 "siglip-xxx")
+        processor: SigLIP processor（SigLIP 模型需要）
+
+    Returns:
+        collate 函数
+    """
+    def _collate_fn(batch):
+        """Collate 函数，支持 CLIP 和 SigLIP tokenization"""
+        from multi.text_templates import generate_text_descriptions
+
+        # 检查第一个样本的长度以确定是否包含时域信号
+        sample = batch[0]
+        has_time_signal = len(sample) == 4
+
+        if has_time_signal:
+            stft_images, time_signals, labels, metadata_list = zip(*batch)
+            time_signals = torch.stack(time_signals, dim=0)
+        else:
+            stft_images, labels, metadata_list = zip(*batch)
+            time_signals = None
+
+        # 堆叠 STFT 图像和标签
+        stft_images = torch.stack(stft_images, dim=0)
+        labels = torch.stack(labels, dim=0)
+
+        # 生成文本描述
+        texts = []
+        for meta in metadata_list:
+            text = generate_text_descriptions(meta, style='class_only')
+            texts.append(text)
+
+        # 使用统一的 tokenize 函数
+        text_tokens = tokenize_texts(texts, model_type, processor)
+
+        return stft_images, time_signals, text_tokens, labels, texts, metadata_list
+
+    return _collate_fn
 
 
 class STFTDataset(Dataset):
@@ -641,6 +724,8 @@ def create_czsl_dataloaders(
     num_workers: int = 4,
     pin_memory: bool = True,
     load_test: bool = True,
+    model_type: str = "clip",
+    processor=None,
 ) -> tuple:
     """
     创建 CZSL 数据加载器 (train/val/test)
@@ -652,6 +737,8 @@ def create_czsl_dataloaders(
         num_workers: 数据加载 worker 数
         pin_memory: 是否 pin memory
         load_test: 是否加载测试集
+        model_type: 模型类型 ("clip" 或 "siglip-xxx")
+        processor: SigLIP processor（SigLIP 模型需要）
 
     Returns:
         (train_loader, val_loader, test_loader, num_classes)
@@ -727,7 +814,9 @@ def create_czsl_dataloaders(
     val_dataset = load_split('val', required=True)
     test_dataset = load_split('test', required=False) if load_test else None
 
-    # 使用模块级别的 collate_fn
+    # 创建 collate 函数（支持 CLIP 和 SigLIP）
+    _collate_fn = create_collate_fn(model_type, processor)
+
     # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
@@ -735,7 +824,7 @@ def create_czsl_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate_fn,
+        collate_fn=_collate_fn,
     )
 
     val_loader = DataLoader(
@@ -744,7 +833,7 @@ def create_czsl_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate_fn,
+        collate_fn=_collate_fn,
     )
 
     test_loader = None
@@ -755,7 +844,7 @@ def create_czsl_dataloaders(
             shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            collate_fn=collate_fn,
+            collate_fn=_collate_fn,
         )
 
     return train_loader, val_loader, test_loader, len(class_names)

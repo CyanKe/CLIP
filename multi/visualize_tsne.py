@@ -28,6 +28,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from multi.model import create_czsl_model
 from multi.data import STFTDataset, collate_fn, create_czsl_dataloaders
+from multi.rectangular_patch_vit import create_multi_shape_dual_branch_model
+from multi.data import create_dual_branch_dataloaders
 
 
 # 欺骗干扰类别 - 黑色 + 不同形状
@@ -63,7 +65,7 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def extract_features(model, data_loader, device):
+def extract_features(model, data_loader, device, is_dual_branch=False):
     """提取图像特征和标签"""
     model.eval()
     all_features = []
@@ -71,20 +73,52 @@ def extract_features(model, data_loader, device):
     all_metas = []
 
     with torch.no_grad():
-        for images, _, _, labels, _, metas in tqdm(data_loader, desc="Extracting features"):
-            images = images.to(device)
+        if is_dual_branch:
+            # 双分支模型数据格式
+            for batch_data in tqdm(data_loader, desc="Extracting features"):
+                (stft_images, _text_tokens_deception, _text_tokens_suppression,
+                 labels_deception, labels_suppression, _texts_deception, _texts_suppression,
+                 metadata_list) = batch_data
 
-            # 调整图像尺寸
-            if images.shape[-1] != 224:
-                images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+                images = stft_images.to(device)
 
-            # 提取特征
-            features = model.encode_image(images)
-            features = F.normalize(features, dim=-1)
+                # 调整图像尺寸
+                if images.shape[-1] != 224:
+                    images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
 
-            all_features.append(features.cpu().numpy())
-            all_labels.append(labels.numpy())
-            all_metas.extend(metas)
+                # 提取特征
+                features = model.encode_image(images)
+                features = F.normalize(features, dim=-1)
+
+                all_features.append(features.cpu().numpy())
+                # 合并欺骗和压制标签为多标签格式
+                batch_size = labels_deception.shape[0]
+                combined_labels = torch.zeros(batch_size, len(DECEPTION_CLASSES) + len(SUPPRESSION_CLASSES))
+                for i in range(batch_size):
+                    d_idx = labels_deception[i].argmax().item()
+                    s_idx = labels_suppression[i].argmax().item()
+                    if d_idx < len(DECEPTION_CLASSES):
+                        combined_labels[i, d_idx] = 1
+                    if s_idx < len(SUPPRESSION_CLASSES):
+                        combined_labels[i, len(DECEPTION_CLASSES) + s_idx] = 1
+                all_labels.append(combined_labels.numpy())
+                all_metas.extend(metadata_list)
+        else:
+            # 单分支模型数据格式
+            for images, _, _, labels, _, metas in tqdm(data_loader, desc="Extracting features"):
+                images = images.to(device)
+
+                # 调整图像尺寸
+                if images.shape[-1] != 224:
+                    images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+
+                # 提取特征
+                features = model.encode_image(images)
+                features = F.normalize(features, dim=-1)
+
+                all_features.append(features.cpu().numpy())
+                all_labels.append(labels.numpy())
+                all_metas.extend(metas)
 
     return np.concatenate(all_features, axis=0), np.concatenate(all_labels, axis=0), all_metas
 
@@ -294,23 +328,49 @@ def main():
 
     # 加载配置
     config = load_config(args.config)
+
+    # 默认使用单分支类别名
     class_names = [cls_info["name"] for cls_info in config.get("jamming_classes", [])]
     print(f"Class names: {class_names}")
 
+    # 加载检查点并检测模型类型
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    state_dict = checkpoint['model_state_dict']
+
+    # 检测是否为双分支模型
+    is_dual_branch = any(k.startswith("visual.patch_embeds") or
+                         "deception" in k or "suppression" in k or
+                         k.startswith("logit_scale") for k in state_dict.keys())
+
+    # 检测是否为多形状 ViT 模型
+    is_multishape = any(k.startswith("visual.patch_embeds") for k in state_dict.keys())
+
     # 创建模型
-    model = create_czsl_model(config, device)
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if is_multishape:
+        print("\nDetected Multi-Shape Patch ViT Dual-Branch model")
+        model = create_multi_shape_dual_branch_model(config, device=str(device))
+    elif is_dual_branch:
+        print("\nDetected Dual-Branch CLIP model")
+        from multi.model import create_dual_branch_model
+        model = create_dual_branch_model(config, device=str(device))
+    else:
+        print("\nDetected Single-Branch CLIP model")
+        model = create_czsl_model(config, device)
+
+    model.load_state_dict(state_dict)
     model.eval()
     print(f"Loaded checkpoint from {args.checkpoint}")
 
     # 创建数据加载器
-    train_loader, val_loader, test_loader, _ = create_czsl_dataloaders(
-        config,
-        batch_size=args.batch_size,
-        num_workers=4,
-        pin_memory=True
-    )
+    if is_dual_branch:
+        train_loader, val_loader, test_loader, _, _ = create_dual_branch_dataloaders(config, load_test=True)
+    else:
+        train_loader, val_loader, test_loader, _ = create_czsl_dataloaders(
+            config,
+            batch_size=args.batch_size,
+            num_workers=4,
+            pin_memory=True
+        )
 
     # 选择 split
     if args.split == 'train':
@@ -327,21 +387,28 @@ def main():
         indices = np.random.choice(len(dataset), min(args.max_samples, len(dataset)), replace=False)
         from torch.utils.data import Subset
         dataset = Subset(dataset, indices)
-        data_loader = DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=False,
-            num_workers=4, pin_memory=True, collate_fn=collate_fn
-        )
+        if is_dual_branch:
+            from multi.data import collate_fn_dual_branch
+            data_loader = DataLoader(
+                dataset, batch_size=args.batch_size, shuffle=False,
+                num_workers=4, pin_memory=True, collate_fn=collate_fn_dual_branch
+            )
+        else:
+            data_loader = DataLoader(
+                dataset, batch_size=args.batch_size, shuffle=False,
+                num_workers=4, pin_memory=True, collate_fn=collate_fn
+            )
 
     print(f"Dataset size: {len(dataset)}")
 
     # 提取特征
-    features, labels, metas = extract_features(model, data_loader, device)
+    features, labels, metas = extract_features(model, data_loader, device, is_dual_branch=is_dual_branch)
     print(f"Features shape: {features.shape}")
     print(f"Labels shape: {labels.shape}")
 
     # t-SNE 降维
     print(f"Running t-SNE with perplexity={args.perplexity}...")
-    tsne = TSNE(n_components=2, perplexity=args.perplexity, random_state=42, n_iter=1000)
+    tsne = TSNE(n_components=2, perplexity=args.perplexity, random_state=42, max_iter=1000)
     features_2d = tsne.fit_transform(features)
     print(f"t-SNE completed. Shape: {features_2d.shape}")
 
