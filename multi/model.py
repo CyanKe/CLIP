@@ -495,17 +495,322 @@ class CLIPForCZSL(nn.Module):
         return similarities, indices, pred_names
 
 
-def create_czsl_model(config: dict, device: str = "cuda") -> CLIPForCZSL:
+class SigLIPForCZSL(nn.Module):
     """
-    创建 CZSL 模型
+    SigLIP 模型用于组合零样本学习 (CZSL)
+
+    使用 HuggingFace transformers 加载 SigLIP 模型
+    提供 CLIP 兼容的接口
+    """
+
+    def __init__(
+        self,
+        model_name: str = "siglip-base-patch16-224",
+        num_classes: int = 16,
+        class_names: List[str] = None,
+        freeze_vision: bool = False,
+        freeze_text: bool = True,
+        vision_layers_unfreeze: int = 2,
+        device: str = "cuda",
+        use_time_domain: bool = False,
+        time_seq_len: int = 8000,
+    ):
+        """
+        初始化 CZSL-SigLIP 模型
+
+        Args:
+            model_name: SigLIP 模型名称
+            num_classes: 类别数
+            class_names: 类别名称列表
+            freeze_vision: 是否冻结视觉编码器
+            freeze_text: 是否冻结文本编码器
+            vision_layers_unfreeze: 解冻视觉编码器最后 N 层
+            device: 计算设备
+            use_time_domain: 是否使用时域信号
+            time_seq_len: 时域信号序列长度
+        """
+        super().__init__()
+        from multi.siglip_loader import load_siglip
+
+        self.device = device
+        self.num_classes = num_classes
+        self.class_names = class_names or [f"Class_{i}" for i in range(num_classes)]
+        self.use_time_domain = use_time_domain
+        self.time_seq_len = time_seq_len
+        self.model_name = model_name
+
+        # 加载 SigLIP 模型
+        self.model, self.processor = load_siglip(model_name, device)
+        self.embed_dim = self.model.config.hidden_size
+
+        # 应用冻结策略
+        self._apply_freeze_strategy(freeze_vision, freeze_text, vision_layers_unfreeze)
+
+        # 时域编码器（如果启用）
+        if self.use_time_domain:
+            self.time_encoder = TimeDomainTransformerEncoder(
+                embed_dim=self.embed_dim,
+                num_heads=8,
+                num_layers=3,
+                seq_len=time_seq_len
+            ).to(device)
+            self.fusion_projection = nn.Linear(self.embed_dim * 2, self.embed_dim).to(device)
+
+        # 文本特征缓存
+        self._text_features_cache = None
+        self._combination_features_cache = None
+        self._combination_names = None
+
+    def _apply_freeze_strategy(self, freeze_vision, freeze_text, vision_layers_unfreeze):
+        """应用冻结策略"""
+        if freeze_text:
+            for param in self.model.text_model.parameters():
+                param.requires_grad = False
+
+        if freeze_vision:
+            for param in self.model.vision_model.parameters():
+                param.requires_grad = False
+        elif vision_layers_unfreeze > 0:
+            self._freeze_vision_partially(vision_layers_unfreeze)
+
+    def _freeze_vision_partially(self, layers_unfreeze: int):
+        """部分冻结视觉编码器"""
+        for param in self.model.vision_model.parameters():
+            param.requires_grad = False
+
+        # 解冻最后 N 层
+        encoder = self.model.vision_model.encoder
+        num_layers = len(encoder.layers)
+        for i in range(num_layers - layers_unfreeze, num_layers):
+            for param in encoder.layers[i].parameters():
+                param.requires_grad = True
+
+    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
+        """编码图像"""
+        vision_output = self.model.vision_model(pixel_values=image)
+        return vision_output.pooler_output
+
+    def encode_text(self, text_tokens: torch.Tensor) -> torch.Tensor:
+        """编码文本"""
+        # SigLIP 使用 pad_token_id = 1 (不是 0)
+        attention_mask = (text_tokens != 1).long()
+        text_output = self.model.text_model(
+            input_ids=text_tokens,
+            attention_mask=attention_mask
+        )
+        return text_output.pooler_output
+
+    def get_logit_scale(self) -> torch.Tensor:
+        """获取温度缩放参数"""
+        return self.model.logit_scale.exp()
+
+    def get_logit_bias(self) -> torch.Tensor:
+        """获取 logit bias 参数（SigLIP 特有）"""
+        return self.model.logit_bias
+
+    def forward_contrastive(
+        self,
+        image: torch.Tensor,
+        text_tokens: torch.Tensor,
+        time_signal: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        对比学习前向传播
+
+        Args:
+            image: STFT 图像张量 [batch_size, 3, H, W]
+            text_tokens: 文本 tokens [batch_size, seq_len]
+            time_signal: 时域信号张量 [batch_size, seq_len] (可选)
+
+        Returns:
+            image_features: 图像特征 [batch_size, embed_dim]
+            text_features: 文本特征 [batch_size, embed_dim]
+        """
+        # 提取 STFT 特征
+        stft_features = self.encode_image(image)
+
+        # 如果启用时域信号且提供了时域数据，进行融合
+        if self.use_time_domain and time_signal is not None:
+            time_features = self.time_encoder(time_signal)
+            fused_features = torch.cat([stft_features, time_features], dim=-1)
+            image_features = self.fusion_projection(fused_features)
+        else:
+            image_features = stft_features
+
+        # 提取文本特征
+        text_features = self.encode_text(text_tokens)
+
+        # 归一化
+        image_features = F.normalize(image_features, dim=-1)
+        text_features = F.normalize(text_features, dim=-1)
+
+        return image_features, text_features
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        text_tokens: torch.Tensor = None,
+        time_signal: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """前向传播（对比学习模式）"""
+        return self.forward_contrastive(image, text_tokens, time_signal)
+
+    @torch.no_grad()
+    def cache_text_features(
+        self,
+        max_combination_size: int = 2,
+        include_single: bool = True,
+        seen_combinations: list = None,
+        use_translation: bool = False
+    ):
+        """缓存所有类别和组合的文本特征"""
+        self.eval()
+        from itertools import combinations
+
+        all_features = []
+        all_names = []
+
+        # 单干扰特征
+        if include_single:
+            from multi.text_templates import get_inference_description
+            from multi.siglip_loader import get_siglip_text_length
+
+            max_length = get_siglip_text_length(self.model_name)
+
+            for cls_name in self.class_names:
+                desc = get_inference_description([cls_name], use_translation=use_translation)
+                tokens = self.processor(
+                    text=desc,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=max_length
+                )["input_ids"].to(self.device)
+                features = self.encode_text(tokens)
+                features = F.normalize(features, dim=-1)
+                all_features.append(features)
+                all_names.append(cls_name)
+
+        # 组合特征
+        if max_combination_size >= 2:
+            from multi.text_templates import get_inference_description
+            from multi.siglip_loader import get_siglip_text_length
+
+            max_length = get_siglip_text_length(self.model_name)
+
+            if seen_combinations:
+                combo_only = [c for c in seen_combinations if len(c) > 1]
+                for combo in combo_only:
+                    combined_desc = get_inference_description(list(combo), use_translation=use_translation)
+                    tokens = self.processor(
+                        text=combined_desc,
+                        return_tensors="pt",
+                        padding="max_length",
+                        truncation=True,
+                        max_length=max_length
+                    )["input_ids"].to(self.device)
+                    features = self.encode_text(tokens)
+                    features = F.normalize(features, dim=-1)
+                    all_features.append(features)
+                    all_names.append('+'.join(combo))
+            else:
+                for i, j in combinations(range(len(self.class_names)), 2):
+                    cls1, cls2 = self.class_names[i], self.class_names[j]
+                    combined_desc = get_inference_description([cls1, cls2], use_translation=use_translation)
+                    tokens = self.processor(
+                        text=combined_desc,
+                        return_tensors="pt",
+                        padding="max_length",
+                        truncation=True,
+                        max_length=max_length
+                    )["input_ids"].to(self.device)
+                    features = self.encode_text(tokens)
+                    features = F.normalize(features, dim=-1)
+                    all_features.append(features)
+                    all_names.append(f"{cls1}+{cls2}")
+
+        self._combination_features_cache = torch.cat(all_features, dim=0)
+        self._combination_names = all_names
+        self._text_features_cache = self._combination_features_cache[:len(self.class_names)]
+
+        print(f"Cached {len(all_names)} text features for SigLIP:")
+        print(f"  - Single classes: {len(self.class_names)}")
+        if seen_combinations:
+            print(f"  - Seen combinations: {len(all_names) - len(self.class_names)}")
+        else:
+            print(f"  - Combinations (all pairs): {len(all_names) - len(self.class_names)}")
+
+    def get_cached_text_features(self) -> torch.Tensor:
+        """获取缓存的文本特征"""
+        if self._text_features_cache is None:
+            self.cache_text_features()
+        return self._text_features_cache
+
+    def get_cached_combination_features(self) -> torch.Tensor:
+        """获取缓存的组合特征"""
+        if self._combination_features_cache is None:
+            self.cache_text_features()
+        return self._combination_features_cache
+
+    @torch.no_grad()
+    def zero_shot_predict(
+        self,
+        image: torch.Tensor,
+        time_signal: torch.Tensor = None,
+        use_combinations: bool = True,
+        top_k: int = 1
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+        """零样本预测"""
+        self.eval()
+
+        # 编码图像
+        stft_features = self.encode_image(image)
+
+        if self.use_time_domain and time_signal is not None:
+            time_features = self.time_encoder(time_signal)
+            fused_features = torch.cat([stft_features, time_features], dim=-1)
+            image_features = self.fusion_projection(fused_features)
+        else:
+            image_features = stft_features
+
+        image_features = F.normalize(image_features, dim=-1)
+
+        # 选择文本特征
+        if use_combinations:
+            text_features = self.get_cached_combination_features()
+            names = self._combination_names
+        else:
+            text_features = self.get_cached_text_features()
+            names = self.class_names
+
+        # 计算相似度 (SigLIP 使用 logit_scale 和 logit_bias)
+        logit_scale = self.get_logit_scale()
+        logit_bias = self.get_logit_bias()
+        similarities = logit_scale * (image_features @ text_features.T) + logit_bias
+
+        # 获取 top-k 预测
+        top_k = min(top_k, text_features.shape[0])
+        values, indices = torch.topk(similarities, k=top_k, dim=-1)
+
+        # 获取预测名称
+        pred_names = [[names[idx.item()] for idx in batch_indices] for batch_indices in indices]
+
+        return similarities, indices, pred_names
+
+
+def create_czsl_model(config: dict, device: str = "cuda"):
+    """
+    创建 CZSL 模型（支持 CLIP 和 SigLIP）
 
     Args:
         config: 配置字典
         device: 计算设备
 
     Returns:
-        CLIPForCZSL 模型实例
+        CLIPForCZSL 或 SigLIPForCZSL 模型实例
     """
+    from multi.siglip_loader import is_siglip_model
+
     model_config = config.get("model", {})
     data_config = config.get("data", {})
     class_names = [cls_info["name"] for cls_info in config.get("jamming_classes", [])]
@@ -514,17 +819,36 @@ def create_czsl_model(config: dict, device: str = "cuda") -> CLIPForCZSL:
     use_time_domain = config.get("use_time_domain", False)
     time_seq_len = data_config.get("time_seq_len", 8000)
 
-    model = CLIPForCZSL(
-        clip_model=model_config.get("clip_model", "ViT-B/32"),
-        num_classes=len(class_names),
-        class_names=class_names,
-        freeze_vision=model_config.get("freeze_vision", False),
-        freeze_text=model_config.get("freeze_text", True),
-        vision_layers_unfreeze=model_config.get("vision_layers_unfreeze", 2),
-        device=device,
-        use_time_domain=use_time_domain,
-        time_seq_len=time_seq_len
-    )
+    clip_model = model_config.get("clip_model", "ViT-B/32")
+
+    # 检测是否为 SigLIP 模型
+    if is_siglip_model(clip_model):
+        print(f"\nCreating SigLIPForCZSL with model: {clip_model}")
+        model = SigLIPForCZSL(
+            model_name=clip_model,
+            num_classes=len(class_names),
+            class_names=class_names,
+            freeze_vision=model_config.get("freeze_vision", False),
+            freeze_text=model_config.get("freeze_text", True),
+            vision_layers_unfreeze=model_config.get("vision_layers_unfreeze", 2),
+            device=device,
+            use_time_domain=use_time_domain,
+            time_seq_len=time_seq_len
+        )
+    else:
+        # 使用 CLIP 模型
+        print(f"\nCreating CLIPForCZSL with model: {clip_model}")
+        model = CLIPForCZSL(
+            clip_model=clip_model,
+            num_classes=len(class_names),
+            class_names=class_names,
+            freeze_vision=model_config.get("freeze_vision", False),
+            freeze_text=model_config.get("freeze_text", True),
+            vision_layers_unfreeze=model_config.get("vision_layers_unfreeze", 2),
+            device=device,
+            use_time_domain=use_time_domain,
+            time_seq_len=time_seq_len
+        )
 
     # LoRA 配置
     lora_config = config.get("lora", {})

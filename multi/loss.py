@@ -703,18 +703,207 @@ class DualBranchContrastiveLoss(nn.Module):
         return total_loss, info_dict
 
 
-def create_loss_function(config: dict) -> nn.Module:
+class SigmoidLoss(nn.Module):
+    """
+    SigLIP 风格的 Sigmoid Loss
+
+    与 InfoNCE 不同，Sigmoid Loss:
+    - 使用二元交叉熵处理每个 (image, text) pair
+    - 不需要对整个 batch 做 softmax
+    - 训练更稳定，对 batch size 不敏感
+
+    参考: "Sigmoid Loss for Language Image Pre-Training"
+    """
+
+    def __init__(
+        self,
+        temperature: float = 0.1,
+        learnable_temperature: bool = True,
+        initial_bias: float = -10.0,
+    ):
+        """
+        初始化
+
+        Args:
+            temperature: 温度参数
+            learnable_temperature: 是否学习温度参数
+            initial_bias: 初始 logit bias（SigLIP 使用负值）
+        """
+        super().__init__()
+
+        if learnable_temperature:
+            self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
+            self.logit_bias = nn.Parameter(torch.tensor(initial_bias))
+        else:
+            self.register_buffer('logit_scale', torch.log(torch.tensor(1.0 / temperature)))
+            self.register_buffer('logit_bias', torch.tensor(initial_bias))
+
+    def forward(
+        self,
+        image_features: torch.Tensor,
+        text_features: torch.Tensor,
+        labels: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """
+        计算 Sigmoid Loss
+
+        Args:
+            image_features: 图像特征 [batch_size, embed_dim]
+            text_features: 文本特征 [batch_size, embed_dim]
+            labels: 标签 [batch_size, num_classes] 或 [batch_size] (可选)
+
+        Returns:
+            loss: 损失值
+            logits: 相似度矩阵 [batch_size, batch_size]
+            info_dict: 监控信息
+        """
+        batch_size = image_features.shape[0]
+
+        # 归一化
+        image_features = F.normalize(image_features, dim=-1)
+        text_features = F.normalize(text_features, dim=-1)
+
+        # 计算 logits
+        logit_scale = self.logit_scale.exp().clamp(max=100)
+        logit_bias = self.logit_bias
+        logits = logit_scale * (image_features @ text_features.T) + logit_bias
+
+        # 构建目标矩阵
+        if labels is not None:
+            if labels.dim() == 2:
+                # 多热标签：有共同标签的样本对为正样本
+                target = (labels @ labels.T > 0).float()
+            else:
+                # 单标签：相同标签的样本对为正样本
+                target = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
+        else:
+            # 默认：对角线为正样本
+            target = torch.eye(batch_size, device=image_features.device)
+
+        # Sigmoid BCE loss
+        loss = F.binary_cross_entropy_with_logits(logits, target)
+
+        info_dict = {
+            "logit_scale": logit_scale.item(),
+            "logit_bias": logit_bias.item(),
+            "num_positive_pairs": target.sum().item(),
+        }
+
+        return loss, logits, info_dict
+
+
+class MultiLabelSigmoidLoss(nn.Module):
+    """
+    多标签 Sigmoid Loss
+
+    使用 IoU (Intersection over Union) 构建软目标矩阵
+    适用于多标签分类场景
+    """
+
+    def __init__(
+        self,
+        temperature: float = 0.1,
+        learnable_temperature: bool = True,
+        initial_bias: float = -10.0,
+        similarity_metric: str = "iou"
+    ):
+        """
+        初始化
+
+        Args:
+            temperature: 温度参数
+            learnable_temperature: 是否学习温度参数
+            initial_bias: 初始 logit bias
+            similarity_metric: 相似度度量 ('iou' 或 'binary')
+        """
+        super().__init__()
+
+        assert similarity_metric in ["iou", "binary"], "similarity_metric must be 'iou' or 'binary'"
+        self.similarity_metric = similarity_metric
+
+        if learnable_temperature:
+            self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
+            self.logit_bias = nn.Parameter(torch.tensor(initial_bias))
+        else:
+            self.register_buffer('logit_scale', torch.log(torch.tensor(1.0 / temperature)))
+            self.register_buffer('logit_bias', torch.tensor(initial_bias))
+
+    def forward(
+        self,
+        image_features: torch.Tensor,
+        text_features: torch.Tensor,
+        labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """
+        计算多标签 Sigmoid Loss
+
+        Args:
+            image_features: 图像特征 [batch_size, embed_dim]
+            text_features: 文本特征 [batch_size, embed_dim]
+            labels: 多热标签 [batch_size, num_classes]
+
+        Returns:
+            loss: 损失值
+            logits: 相似度矩阵 [batch_size, batch_size]
+            info_dict: 监控信息
+        """
+        labels = labels.float()
+
+        # 归一化
+        image_features = F.normalize(image_features, dim=-1)
+        text_features = F.normalize(text_features, dim=-1)
+
+        # 计算 logits
+        logit_scale = self.logit_scale.exp().clamp(max=100)
+        logit_bias = self.logit_bias
+        logits = logit_scale * (image_features @ text_features.T) + logit_bias
+
+        # 构建软目标矩阵
+        intersection = torch.matmul(labels, labels.T)
+
+        if self.similarity_metric == "iou":
+            label_sums = labels.sum(dim=-1)
+            union = label_sums.unsqueeze(1) + label_sums.unsqueeze(0) - intersection
+            union = union.clamp(min=1e-8)
+            target = intersection / union
+        else:
+            target = (intersection > 0).float()
+
+        # Sigmoid BCE loss
+        loss = F.binary_cross_entropy_with_logits(logits, target)
+
+        info_dict = {
+            "logit_scale": logit_scale.item(),
+            "logit_bias": logit_bias.item(),
+            "avg_similarity": target.mean().item(),
+        }
+
+        return loss, logits, info_dict
+
+
+def create_loss_function(config: dict, model_type: str = "clip") -> nn.Module:
     """
     根据配置创建损失函数
 
     Args:
         config: 配置字典
+        model_type: 模型类型 ("clip" 或 "siglip-xxx")
 
     Returns:
         损失函数实例
     """
     loss_config = config.get("loss", {})
     loss_type = loss_config.get("type", "bce")
+
+    # SigLIP 模型自动使用 Sigmoid Loss
+    if model_type.startswith("siglip"):
+        print(f"Using MultiLabelSigmoidLoss for SigLIP model")
+        return MultiLabelSigmoidLoss(
+            temperature=loss_config.get("temperature", 0.1),
+            learnable_temperature=loss_config.get("learnable_temperature", True),
+            initial_bias=loss_config.get("initial_bias", -10.0),
+            similarity_metric=loss_config.get("similarity_metric", "iou")
+        )
 
     if loss_type == "infonce":
         return InfoNCELoss(
