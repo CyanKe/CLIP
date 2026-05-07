@@ -321,7 +321,7 @@ class Trainer:
         if is_best:
             best_path = self.save_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
-            print(f"  Saved best model with F1: {metrics['f1_macro']:.4f}")
+            print(f"  ★ Saved best model with F1: {metrics['f1_macro']:.4f}")
 
     def fit(self, num_epochs: int) -> dict:
         """

@@ -24,8 +24,9 @@ plt.rcParams['axes.unicode_minus'] = False
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from multi.model import create_dual_branch_model, DualBranchCLIPForCZSL
+from multi.model import create_dual_branch_model
 from multi.data import create_dual_branch_dataloaders, DualBranchSTFTDataset, collate_fn_dual_branch
+from multi.rectangular_patch_vit import create_multi_shape_dual_branch_model
 
 
 class DualBranchEvaluator:
@@ -33,7 +34,7 @@ class DualBranchEvaluator:
 
     def __init__(
         self,
-        model: DualBranchCLIPForCZSL,
+        model,  # 支持 DualBranchCLIPForCZSL 或 MultiShapePatchViTForDualBranch
         device: torch.device,
         deception_classes: list,
         suppression_classes: list
@@ -772,7 +773,7 @@ def main():
     parser.add_argument("--config", type=str, default="multi/config.yaml")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
-    parser.add_argument("--output_dir", type=str, default="results/dual_branch")
+    parser.add_argument("--output_dir", type=str, default="results/dual_branch_few/")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--save_stft", action="store_true", help="Save STFT images with predictions")
     parser.add_argument("--max_stft_samples", type=int, default=100, help="Maximum number of STFT images to save")
@@ -803,12 +804,22 @@ def main():
     seen_combinations = czsl_config.get("seen_combinations", [])
     unseen_combinations = czsl_config.get("unseen_combinations", [])
 
-    # 创建模型
-    model = create_dual_branch_model(config, device=str(device))
-
     # 加载检查点
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # 检测模型类型
+    state_dict = checkpoint["model_state_dict"]
+    is_multishape = any(k.startswith("visual.patch_embeds") for k in state_dict.keys())
+
+    # 创建模型
+    if is_multishape:
+        print("\nDetected Multi-Shape Patch ViT model from checkpoint")
+        model = create_multi_shape_dual_branch_model(config, device=str(device))
+    else:
+        print("\nDetected CLIP Dual-Branch model from checkpoint")
+        model = create_dual_branch_model(config, device=str(device))
+
+    model.load_state_dict(state_dict)
     print(f"Loaded checkpoint from {args.checkpoint}")
 
     # 缓存文本特征

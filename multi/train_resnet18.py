@@ -201,7 +201,7 @@ class ResNet18Trainer:
         if is_best:
             best_path = self.save_dir / "resnet18_dual_branch_best.pt"
             torch.save(checkpoint, best_path)
-            print(f"  Saved best model with loss: {metrics['loss']:.4f}")
+            print(f"  ★ Saved best model with loss: {metrics['loss']:.4f}")
 
     def fit(self, num_epochs: int, debug: bool = False) -> dict:
         print(f"\n{'='*60}")

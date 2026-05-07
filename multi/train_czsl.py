@@ -273,7 +273,7 @@ class CZSLTrainer:
         if is_best:
             best_path = self.save_dir / "czsl_best_model.pt"
             torch.save(checkpoint, best_path)
-            print(f"  Saved best model with loss: {metrics['loss']:.4f}")
+            print(f"  ★ Saved best model with loss: {metrics['loss']:.4f}")
 
     def fit(self, num_epochs: int, debug: bool = False) -> dict:
         print(f"\n{'='*60}")

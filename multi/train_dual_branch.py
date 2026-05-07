@@ -155,7 +155,11 @@ class DualBranchTrainer:
 
             # 计算准确率 (对角线准确率作为参考)
             with torch.no_grad():
-                logit_scale = self.model.model.logit_scale.exp()
+                # 兼容两种模型结构
+                if hasattr(self.model, 'model'):
+                    logit_scale = self.model.model.logit_scale.exp()
+                else:
+                    logit_scale = self.model.logit_scale.exp()
 
                 # 欺骗分支准确率
                 logits_deception = logit_scale * (image_features @ text_features_deception.t())
@@ -233,7 +237,11 @@ class DualBranchTrainer:
             total_loss += loss.item() * batch_size
 
             # 计算准确率
-            logit_scale = self.model.model.logit_scale.exp()
+            # 兼容两种模型结构
+            if hasattr(self.model, 'model'):
+                logit_scale = self.model.model.logit_scale.exp()
+            else:
+                logit_scale = self.model.logit_scale.exp()
             targets = torch.arange(batch_size, device=self.device)
 
             logits_deception = logit_scale * (image_features @ text_features_deception.t())
