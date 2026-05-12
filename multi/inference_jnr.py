@@ -58,7 +58,8 @@ def inference_specific_jnr_jamtype(
     jnr_folder = f"JNR_{'+' if jnr >= 0 else ''}{jnr}"
     data_folder = os.path.join(base_path, jnr_folder)
 
-    stft_file = os.path.join(data_folder, f'{split}_echo_stfts.mat')
+    stft_suffix = data_config.get('stft_suffix', 'echo_stfts')
+    stft_file = os.path.join(data_folder, f'{split}_{stft_suffix}.mat')
     metadata_file = os.path.join(data_folder, f'{split}_echo_metadata.json')
 
     if not os.path.exists(stft_file):

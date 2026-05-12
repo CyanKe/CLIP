@@ -98,7 +98,8 @@ def process_all_jnr(
     output_base: str,
     method: str = 'p99',
     splits: list = None,
-    stft_var_name: str = 'all_stfts'
+    stft_var_name: str = 'all_stfts',
+    stft_suffix: str = 'echo_stfts'
 ):
     """
     处理所有 JNR 级别的数据
@@ -121,13 +122,13 @@ def process_all_jnr(
         print(f"{'='*50}")
 
         for split in splits:
-            input_file = os.path.join(base_path, jnr_folder, f'{split}_echo_stfts.mat')
+            input_file = os.path.join(base_path, jnr_folder, f'{split}_{stft_suffix}.mat')
 
             if not os.path.exists(input_file):
                 print(f"  [Skip] {input_file} not found")
                 continue
 
-            output_file = os.path.join(output_base, jnr_folder, f'{split}_echo_stfts.mat')
+            output_file = os.path.join(output_base, jnr_folder, f'{split}_{stft_suffix}.mat')
 
             process_stft_file(
                 input_path=input_file,
@@ -192,6 +193,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Verify normalization results after processing"
     )
+    parser.add_argument(
+        "--stft_suffix",
+        type=str,
+        default="echo_stfts",
+        help="STFT filename suffix"
+    )
 
     args = parser.parse_args()
 
@@ -200,7 +207,8 @@ if __name__ == "__main__":
         jnr_levels=args.jnr_levels,
         output_base=args.output_base,
         method=args.method,
-        splits=args.splits
+        splits=args.splits,
+        stft_suffix=args.stft_suffix
     )
 
     if args.verify:
@@ -209,7 +217,7 @@ if __name__ == "__main__":
         verify_path = os.path.join(
             args.output_base,
             f"JNR_{first_jnr}",
-            'train_echo_stfts.mat'
+            f'train_{args.stft_suffix}.mat'
         )
         if os.path.exists(verify_path):
             verify_normalization(verify_path)

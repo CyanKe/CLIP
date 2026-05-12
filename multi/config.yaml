@@ -71,6 +71,7 @@ data:
   # 时域数据配置
   time_seq_len: 8000             # 时域信号序列长度
   time_var_name: "all_times"     # 时域数据在HDF5中的变量名
+  stft_suffix: "echo_stfts"     # STFT 文件名后缀 (改为 echo_dechirp_stfts 切换数据)
 
 # 模型开关配置
 use_time_domain: false          # 是否使用时域信号进行消融实验

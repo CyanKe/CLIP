@@ -429,7 +429,7 @@ def load_config(config_path: str) -> dict:
     return config
 
 
-def load_datasets_by_jnr(base_path, jnr_start, jnr_end, jnr_step, split="val"):
+def load_datasets_by_jnr(base_path, jnr_start, jnr_end, jnr_step, split="val", stft_suffix="echo_stfts"):
     """
     按JNR级别分别加载数据集
 
@@ -441,9 +441,9 @@ def load_datasets_by_jnr(base_path, jnr_start, jnr_end, jnr_step, split="val"):
 
     datasets = {}
     split_files = {
-        "train": ("train_echo_stfts.mat", "train_echo_label.mat"),
-        "test": ("test_echo_stfts.mat", "test_echo_label.mat"),
-        "val": ("val_echo_stfts.mat", "val_echo_label.mat")
+        "train": (f"train_{stft_suffix}.mat", "train_echo_label.mat"),
+        "test": (f"test_{stft_suffix}.mat", "test_echo_label.mat"),
+        "val": (f"val_{stft_suffix}.mat", "val_echo_label.mat")
     }
 
     from czsl.data import STFTDataset3
@@ -544,7 +544,8 @@ def main():
             jnr_start=data_config.get("jnr_start", -5),
             jnr_end=data_config.get("jnr_end", 40),
             jnr_step=data_config.get("jnr_step", 5),
-            split=args.split
+            split=args.split,
+            stft_suffix=data_config.get('stft_suffix', 'echo_stfts')
         )
 
         all_results = {}

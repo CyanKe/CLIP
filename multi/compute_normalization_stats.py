@@ -13,7 +13,8 @@ def compute_normalization_stats(
     base_path: str,
     jnr_levels: list,
     stft_var_name: str = 'all_stfts',
-    max_samples: int = 5000
+    max_samples: int = 5000,
+    stft_suffix: str = 'echo_stfts'
 ):
     """
     计算训练集的全局统计量（用于归一化）
@@ -26,7 +27,7 @@ def compute_normalization_stats(
 
     for jnr in jnr_levels:
         jnr_folder = f"JNR_{jnr}"
-        stft_file = os.path.join(base_path, jnr_folder, 'test_echo_stfts.mat')
+        stft_file = os.path.join(base_path, jnr_folder, f'test_{stft_suffix}.mat')
 
         if not os.path.exists(stft_file):
             print(f"Warning: {stft_file} not found, skipping...")
@@ -154,13 +155,20 @@ if __name__ == "__main__":
         type=int,
         default=5000
     )
+    parser.add_argument(
+        "--stft_suffix",
+        type=str,
+        default="echo_stfts",
+        help="STFT filename suffix (e.g. echo_stfts, echo_dechirp_stfts)"
+    )
 
     args = parser.parse_args()
 
     stats = compute_normalization_stats(
         base_path=args.base_path,
         jnr_levels=args.jnr_levels,
-        max_samples=args.max_samples
+        max_samples=args.max_samples,
+        stft_suffix=args.stft_suffix
     )
 
     save_stats(stats, args.output)

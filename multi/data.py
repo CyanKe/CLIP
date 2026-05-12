@@ -631,6 +631,7 @@ def create_dual_branch_dataloaders(
     jnr_start = data_config.get('jnr_start', 10)
     jnr_end = data_config.get('jnr_end', 10)
     jnr_step = data_config.get('jnr_step', 1)
+    stft_suffix = data_config.get('stft_suffix', 'echo_stfts')
 
     jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
 
@@ -646,7 +647,7 @@ def create_dual_branch_dataloaders(
             jnr_folder = f"JNR_{'+' if jnr >= 0 else ''}{jnr}"
             data_folder = os.path.join(base_path, jnr_folder)
 
-            stft_file = os.path.join(data_folder, f'{split_name}_echo_stfts.mat')
+            stft_file = os.path.join(data_folder, f'{split_name}_{stft_suffix}.mat')
             metadata_file = os.path.join(data_folder, f'{split_name}_echo_metadata.json')
 
             if not os.path.exists(stft_file):
@@ -750,6 +751,7 @@ def create_czsl_dataloaders(
     jnr_start = data_config.get('jnr_start', 10)
     jnr_end = data_config.get('jnr_end', 10)
     jnr_step = data_config.get('jnr_step', 1)
+    stft_suffix = data_config.get('stft_suffix', 'echo_stfts')
 
     # 时域数据配置
     use_time_domain = config.get('use_time_domain', False)
@@ -776,7 +778,7 @@ def create_czsl_dataloaders(
             jnr_folder = f"JNR_{'+' if jnr >= 0 else ''}{jnr}"
             data_folder = os.path.join(base_path, jnr_folder)
 
-            stft_file = os.path.join(data_folder, f'{split_name}_echo_stfts.mat')
+            stft_file = os.path.join(data_folder, f'{split_name}_{stft_suffix}.mat')
             metadata_file = os.path.join(data_folder, f'{split_name}_echo_metadata.json')
 
             # 时域数据文件路径 (假设命名规则)
