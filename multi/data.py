@@ -104,6 +104,37 @@ def collate_fn(batch):
     return stft_images, time_signals, text_tokens, labels, texts, metadata_list
 
 
+def _collate_fn(batch, model_type="clip", processor=None):
+    """Collate 函数，支持 CLIP 和 SigLIP tokenization（模块级别以便 pickle）"""
+    from multi.text_templates import generate_text_descriptions
+
+    # 检查第一个样本的长度以确定是否包含时域信号
+    sample = batch[0]
+    has_time_signal = len(sample) == 4
+
+    if has_time_signal:
+        stft_images, time_signals, labels, metadata_list = zip(*batch)
+        time_signals = torch.stack(time_signals, dim=0)
+    else:
+        stft_images, labels, metadata_list = zip(*batch)
+        time_signals = None
+
+    # 堆叠 STFT 图像和标签
+    stft_images = torch.stack(stft_images, dim=0)
+    labels = torch.stack(labels, dim=0)
+
+    # 生成文本描述
+    texts = []
+    for meta in metadata_list:
+        text = generate_text_descriptions(meta, style='class_only')
+        texts.append(text)
+
+    # 使用统一的 tokenize 函数
+    text_tokens = tokenize_texts(texts, model_type, processor)
+
+    return stft_images, time_signals, text_tokens, labels, texts, metadata_list
+
+
 def create_collate_fn(model_type: str = "clip", processor=None):
     """
     创建支持 CLIP 或 SigLIP 的 collate 函数
@@ -115,37 +146,8 @@ def create_collate_fn(model_type: str = "clip", processor=None):
     Returns:
         collate 函数
     """
-    def _collate_fn(batch):
-        """Collate 函数，支持 CLIP 和 SigLIP tokenization"""
-        from multi.text_templates import generate_text_descriptions
-
-        # 检查第一个样本的长度以确定是否包含时域信号
-        sample = batch[0]
-        has_time_signal = len(sample) == 4
-
-        if has_time_signal:
-            stft_images, time_signals, labels, metadata_list = zip(*batch)
-            time_signals = torch.stack(time_signals, dim=0)
-        else:
-            stft_images, labels, metadata_list = zip(*batch)
-            time_signals = None
-
-        # 堆叠 STFT 图像和标签
-        stft_images = torch.stack(stft_images, dim=0)
-        labels = torch.stack(labels, dim=0)
-
-        # 生成文本描述
-        texts = []
-        for meta in metadata_list:
-            text = generate_text_descriptions(meta, style='class_only')
-            texts.append(text)
-
-        # 使用统一的 tokenize 函数
-        text_tokens = tokenize_texts(texts, model_type, processor)
-
-        return stft_images, time_signals, text_tokens, labels, texts, metadata_list
-
-    return _collate_fn
+    from functools import partial
+    return partial(_collate_fn, model_type=model_type, processor=processor)
 
 
 class STFTDataset(Dataset):

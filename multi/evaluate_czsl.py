@@ -23,7 +23,7 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score, roc_curve, auc
 from sklearn.manifold import TSNE
 
 # 添加路径
@@ -99,6 +99,116 @@ def create_jnr_dataloaders(
         print(f"Loaded {split} data from {jnr_folder}: {len(dataset)} samples")
 
     return jnr_loaders
+
+
+def plot_roc_curves(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    class_names: list,
+    save_dir: str = None,
+    prefix: str = "roc",
+    mode_title: str = ""
+):
+    """
+    绘制 ROC 曲线（独立函数，解耦于评估器）
+
+    生成两张图:
+      1. {prefix}_roc_per_class.png — 每个类别不同颜色的 ROC 曲线
+      2. {prefix}_roc_average.png  — Micro/Macro 平均 ROC 曲线
+
+    Args:
+        labels: one-hot 标签 [n_samples, n_classes]
+        probabilities: softmax 概率 [n_samples, n_classes]
+        class_names: 类别名称列表
+        save_dir: 保存目录（None 则显示）
+        prefix: 文件名前缀
+        mode_title: 标题后缀（如 "by_combination" 或 "JNR=+10"）
+    """
+    n_classes = labels.shape[1]
+
+    # 计算每个类别的 ROC 和 AUC
+    fpr_dict, tpr_dict, auc_dict = {}, {}, {}
+    for i in range(n_classes):
+        if np.sum(labels[:, i]) == 0:
+            continue
+        fpr_dict[i], tpr_dict[i], _ = roc_curve(labels[:, i], probabilities[:, i])
+        auc_dict[i] = auc(fpr_dict[i], tpr_dict[i])
+
+    # Micro-average
+    fpr_micro, tpr_micro, _ = roc_curve(labels.ravel(), probabilities.ravel())
+    auc_micro = auc(fpr_micro, tpr_micro)
+
+    # Macro-average
+    all_fpr = np.unique(np.concatenate([fpr_dict[i] for i in fpr_dict]))
+    mean_tpr = np.zeros_like(all_fpr)
+    for i in fpr_dict:
+        mean_tpr += np.interp(all_fpr, fpr_dict[i], tpr_dict[i])
+    mean_tpr /= len(fpr_dict)
+    auc_macro = auc(all_fpr, mean_tpr)
+
+    title_suffix = f" ({mode_title})" if mode_title else ""
+
+    # === 图1: 每个类别的 ROC 曲线（不同颜色） ===
+    colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    for idx, i in enumerate(fpr_dict):
+        color = colors[idx % 10]
+        ax.plot(
+            fpr_dict[i], tpr_dict[i],
+            color=color, linewidth=1.2,
+            label=f'{class_names[i]} (AUC={auc_dict[i]:.3f})'
+        )
+
+    ax.plot([0, 1], [0, 1], color='navy', linewidth=1.0, linestyle=':', alpha=0.7)
+    ax.set_xlim([-0.02, 1.02])
+    ax.set_ylim([-0.02, 1.02])
+    ax.set_xlabel('False Positive Rate', fontsize=12)
+    ax.set_ylabel('True Positive Rate', fontsize=12)
+    ax.set_title(f'Per-class ROC Curves{title_suffix}', fontsize=14)
+    ax.legend(loc='lower right', fontsize=7, ncol=1)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if save_dir:
+        path = os.path.join(save_dir, f"{prefix}_roc_per_class.png")
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        print(f"Per-class ROC saved to {path}")
+    else:
+        plt.show()
+    plt.close()
+
+    # === 图2: Micro / Macro 平均 ROC 曲线 ===
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    ax.plot(
+        fpr_micro, tpr_micro,
+        color='darkorange', linewidth=2.5,
+        label=f'Micro-average (AUC={auc_micro:.3f})'
+    )
+    ax.plot(
+        all_fpr, mean_tpr,
+        color='darkgreen', linewidth=2.5, linestyle='--',
+        label=f'Macro-average (AUC={auc_macro:.3f})'
+    )
+    ax.plot([0, 1], [0, 1], color='navy', linewidth=1.0, linestyle=':', alpha=0.7)
+
+    ax.set_xlim([-0.02, 1.02])
+    ax.set_ylim([-0.02, 1.02])
+    ax.set_xlabel('False Positive Rate', fontsize=12)
+    ax.set_ylabel('True Positive Rate', fontsize=12)
+    ax.set_title(f'Average ROC Curves{title_suffix}', fontsize=14)
+    ax.legend(loc='lower right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if save_dir:
+        path = os.path.join(save_dir, f"{prefix}_roc_average.png")
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        print(f"Average ROC saved to {path}")
+    else:
+        plt.show()
+    plt.close()
 
 
 class CZSLEvaluator:
@@ -335,6 +445,7 @@ class CZSLEvaluator:
         all_labels = []
         all_preds = []
         all_features = []
+        all_probs = []
 
         eval_bar = tqdm(data_loader, desc="Evaluating by Combination Type")
 
@@ -385,6 +496,7 @@ class CZSLEvaluator:
             # 收集预测结果
             all_labels.append(labels.cpu())
             all_preds.append(preds.cpu())
+            all_probs.append(probs.cpu())
             all_features.append(image_features.cpu().numpy())
 
             # Debug: 显示第一个批次的详细信息
@@ -450,12 +562,14 @@ class CZSLEvaluator:
         # 合并所有结果
         all_labels = torch.cat(all_labels).numpy()
         all_preds = torch.cat(all_preds).numpy()
+        all_probs = torch.cat(all_probs).numpy()
         all_features = np.concatenate(all_features, axis=0)
 
         return {
             "metrics": metrics,
             "labels": all_labels,
             "predictions": all_preds,
+            "probabilities": all_probs,
             "features": all_features
         }
 
@@ -849,6 +963,7 @@ class CZSLEvaluator:
 
             all_labels = []
             all_preds = []
+            all_probs = []
             seen_correct, seen_total = 0, 0
             unseen_correct, unseen_total = 0, 0
 
@@ -888,6 +1003,7 @@ class CZSLEvaluator:
 
                 all_labels.append(labels.cpu())
                 all_preds.append(preds.cpu())
+                all_probs.append(probs.cpu())
 
                 # 统计每个类别的 TP, FP, FN
                 for c in range(num_classes):
@@ -918,8 +1034,9 @@ class CZSLEvaluator:
                             unseen_correct += 1
 
             # 计算指标
-            all_labels = torch.cat(all_labels).numpy()
-            all_preds = torch.cat(all_preds).numpy()
+            all_labels_np = torch.cat(all_labels).numpy()
+            all_preds_np = torch.cat(all_preds).numpy()
+            all_probs_np = torch.cat(all_probs).numpy()
 
             # 计算每个类别的准确率 (recall)
             per_class_recall = np.zeros(num_classes)
@@ -941,14 +1058,16 @@ class CZSLEvaluator:
                 "seen_samples": seen_total,
                 "unseen_accuracy": unseen_correct / unseen_total if unseen_total > 0 else 0,
                 "unseen_samples": unseen_total,
-                "f1_macro": f1_score(all_labels, all_preds, average='macro', zero_division=0),
-                "f1_micro": f1_score(all_labels, all_preds, average='micro', zero_division=0),
+                "f1_macro": f1_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
+                "f1_micro": f1_score(all_labels_np, all_preds_np, average='micro', zero_division=0),
                 "precision_macro": precision_score(
-                    all_labels, all_preds, average='macro', zero_division=0
+                    all_labels_np, all_preds_np, average='macro', zero_division=0
                 ),
                 "recall_macro": recall_score(
-                    all_labels, all_preds, average='macro', zero_division=0
+                    all_labels_np, all_preds_np, average='macro', zero_division=0
                 ),
+                "labels": all_labels_np,
+                "probabilities": all_probs_np,
                 "per_class_recall": per_class_recall,
                 "per_class_precision": per_class_precision,
                 "per_class_f1": per_class_f1,
@@ -1495,6 +1614,16 @@ def main():
             unseen_combinations=unseen_combinations
         )
 
+        # ROC曲线
+        plot_roc_curves(
+            results["labels"],
+            results["probabilities"],
+            class_names,
+            save_dir=str(output_dir),
+            prefix="czsl",
+            mode_title="by_combination"
+        )
+
         # 保存文本结果
         with open(output_dir / "combination_results.txt", 'w') as f:
             f.write("Evaluation by Combination Type\n")
@@ -1549,6 +1678,19 @@ def main():
             results,
             save_path=str(output_dir / f"jnr_metrics_{args.split}.png")
         )
+
+        # 每个JNR等级的ROC曲线
+        for jnr_val, jnr_results in sorted(results.items()):
+            if "probabilities" in jnr_results and jnr_results["probabilities"].size > 0:
+                prefix = f"jnr_{jnr_val:+.0f}"
+                plot_roc_curves(
+                    jnr_results["labels"],
+                    jnr_results["probabilities"],
+                    class_names,
+                    save_dir=str(output_dir),
+                    prefix=prefix,
+                    mode_title=f"JNR={jnr_val:+d}"
+                )
 
 
 if __name__ == "__main__":

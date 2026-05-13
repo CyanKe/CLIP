@@ -16,6 +16,7 @@ model:
   freeze_vision: false         # 设为 false 以启用部分解冻
   vision_layers_unfreeze: 2    # 只解冻视觉编码器最后2层
   freeze_text: true            # 冻结文本编码器
+  use_resnet18: false            # dual_branch 模式下使用 ResNet18 (消融实验)
   use_multishape_vit: true
   patch_sizes: [[8, 32], [32, 8], [16, 16]]
   embed_dim: 512
@@ -25,6 +26,7 @@ model:
 
 # 训练配置
 train:
+  mode: "czsl"                    # 训练模式: "czsl" (对比学习) 或 "dual_branch" (双分支)
   batch_size: 32
   epochs: 20
   lr: 0.00001                     # 1e-5
