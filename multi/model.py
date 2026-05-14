@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import clip
 import torchvision.models as models
 from multi.lora import apply_lora_to_model, freeze_non_lora_params, count_parameters
+from multi.prompt_learner import FeatureConditionedPromptLearner
 
 
 class ResNet18Visual(nn.Module):
@@ -180,6 +181,8 @@ class CLIPForCZSL(nn.Module):
         device: str = "cuda",
         use_time_domain: bool = False,
         time_seq_len: int = 8000,
+        use_feature_context: bool = False,
+        n_ctx_per_domain: dict = None,
     ):
         """
         初始化 CZSL-CLIP 模型
@@ -194,6 +197,8 @@ class CLIPForCZSL(nn.Module):
             device: 计算设备
             use_time_domain: 是否使用时域信号
             time_seq_len: 时域信号序列长度
+            use_feature_context: 是否使用特征条件上下文 (CoOp-style)
+            n_ctx_per_domain: 各域上下文 token 数
         """
         super().__init__()
         self.device = device
@@ -201,6 +206,7 @@ class CLIPForCZSL(nn.Module):
         self.class_names = class_names or [f"Class_{i}" for i in range(num_classes)]
         self.use_time_domain = use_time_domain
         self.time_seq_len = time_seq_len
+        self.use_feature_context = use_feature_context
 
         # 加载预训练 CLIP 模型
         if clip_model == "resnet18":
@@ -234,6 +240,16 @@ class CLIPForCZSL(nn.Module):
 
             # 融合投影层：拼接后投影回 embed_dim
             self.fusion_projection = nn.Linear(self.embed_dim * 2, self.embed_dim).to(device)
+
+        # 特征条件上下文 (CoOp-style)
+        if self.use_feature_context:
+            transformer_width = self.model.transformer.width
+            self.prompt_learner = FeatureConditionedPromptLearner(
+                transformer_width=transformer_width,
+                n_ctx_per_domain=n_ctx_per_domain,
+            ).to(device)
+        else:
+            self.prompt_learner = None
 
         # 文本特征缓存（用于零样本推理）
         self._text_features_cache = None
@@ -280,11 +296,71 @@ class CLIPForCZSL(nn.Module):
         """编码文本"""
         return self.model.encode_text(text_tokens)
 
+    def encode_text_with_context(
+        self,
+        text: torch.Tensor,
+        context_vectors: torch.Tensor,
+    ) -> torch.Tensor:
+        """带特征条件上下文的文本编码
+
+        将 context_vectors 插入到 [SOT_emb | context_vectors | word_embs | EOT_emb | padding] 中，
+        通过冻结的文本 Transformer 编码。
+
+        Args:
+            text: token IDs [B, 77]
+            context_vectors: 上下文向量 [B, M, transformer_width]
+
+        Returns:
+            text_features: [B, embed_dim]
+        """
+        B = text.shape[0]
+        M = context_vectors.shape[1]
+        dtype = self.model.visual.conv1.weight.dtype
+
+        # 1. Token embeddings
+        token_embs = self.model.token_embedding(text).type(dtype)  # [B, 77, D]
+
+        # 2. 定位 EOT
+        eot_pos = text.argmax(dim=-1)  # [B]
+
+        # 3. 拼接: [SOT_emb | context_vectors | word_embs(1:eot+1) | padding]
+        sot_emb = token_embs[:, 0:1, :]                          # [B, 1, D]
+        max_eot = eot_pos.max().item()
+        word_embs = token_embs[:, 1:max_eot + 1, :]              # [B, max_eot, D]
+
+        x = torch.cat([sot_emb, context_vectors.type(dtype), word_embs], dim=1)  # [B, 1+M+max_eot, D]
+
+        # 补零到 77
+        seq_len = x.shape[1]
+        if seq_len > 77:
+            x = x[:, :77, :]
+        elif seq_len < 77:
+            pad = torch.zeros(B, 77 - seq_len, x.shape[-1], device=x.device, dtype=x.dtype)
+            x = torch.cat([x, pad], dim=1)
+
+        # 4. 加位置编码
+        x = x + self.model.positional_embedding.type(dtype)
+
+        # 5. 冻结 Transformer
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.model.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        # 6. LayerNorm
+        x = self.model.ln_final(x).type(dtype)
+
+        # 7. 提取偏移后的 EOT 位置特征
+        new_eot_pos = (eot_pos + M).clamp(max=76)
+        text_features = x[torch.arange(B, device=x.device), new_eot_pos] @ self.model.text_projection
+
+        return text_features
+
     def forward_contrastive(
         self,
         image: torch.Tensor,
         text_tokens: torch.Tensor,
-        time_signal: torch.Tensor = None
+        time_signal: torch.Tensor = None,
+        features_dict: dict = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         对比学习前向传播
@@ -293,6 +369,7 @@ class CLIPForCZSL(nn.Module):
             image: STFT 图像张量 [batch_size, 3, H, W]
             text_tokens: 文本 tokens [batch_size, seq_len]
             time_signal: 时域信号张量 [batch_size, seq_len] (可选)
+            features_dict: 各域特征 {'time': [B,5], ...} (可选，用于 CoOp)
 
         Returns:
             image_features: 图像特征 [batch_size, embed_dim]
@@ -316,7 +393,11 @@ class CLIPForCZSL(nn.Module):
             image_features = stft_features
 
         # 提取文本特征
-        text_features = self.encode_text(text_tokens)
+        if features_dict is not None and self.prompt_learner is not None:
+            context_vectors = self.prompt_learner(features_dict)  # [B, M, D]
+            text_features = self.encode_text_with_context(text_tokens, context_vectors)
+        else:
+            text_features = self.encode_text(text_tokens)
 
         # 归一化
         image_features = F.normalize(image_features, dim=-1)
@@ -328,7 +409,8 @@ class CLIPForCZSL(nn.Module):
         self,
         image: torch.Tensor,
         text_tokens: torch.Tensor = None,
-        time_signal: torch.Tensor = None
+        time_signal: torch.Tensor = None,
+        features_dict: dict = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播（对比学习模式）
@@ -337,11 +419,12 @@ class CLIPForCZSL(nn.Module):
             image: STFT 图像张量
             text_tokens: 文本 tokens (对比学习模式需要)
             time_signal: 时域信号张量 (可选)
+            features_dict: 各域特征 (可选，用于 CoOp)
 
         Returns:
             image_features, text_features
         """
-        return self.forward_contrastive(image, text_tokens, time_signal)
+        return self.forward_contrastive(image, text_tokens, time_signal, features_dict)
 
     @torch.no_grad()
     def cache_text_features(
@@ -362,6 +445,12 @@ class CLIPForCZSL(nn.Module):
             use_translation: 是否使用翻译后的类别名称（如 "Dense False Target Jamming"）
         """
         self.eval()
+
+        # 特征条件上下文模式下，文本特征依赖逐样本特征，无法预缓存
+        if self.prompt_learner is not None:
+            print("Feature-conditioned context active: skipping text feature caching (computed per-sample)")
+            return
+
         from itertools import combinations
 
         all_features = []
@@ -431,20 +520,93 @@ class CLIPForCZSL(nn.Module):
         return self._combination_features_cache
 
     @torch.no_grad()
+    def compute_text_features_for_sample(
+        self,
+        features_dict: dict,
+        class_names: list = None,
+        use_combinations: bool = True,
+        seen_combinations: list = None,
+        use_translation: bool = False,
+    ) -> Tuple[torch.Tensor, List[str]]:
+        """基于单样本特征，计算所有候选类别的文本特征
+
+        Args:
+            features_dict: 各域特征 {'time': [1,5], ...}
+            class_names: 候选类别名列表
+            use_combinations: 是否包含组合
+            seen_combinations: 已见组合列表
+            use_translation: 是否使用翻译
+
+        Returns:
+            text_features: [K, embed_dim]
+            names: 类别名列表
+        """
+        from itertools import combinations
+        from multi.text_templates import get_inference_description
+
+        class_names = class_names or self.class_names
+        context_vectors = self.prompt_learner(features_dict)  # [1, M, D]
+
+        all_features = []
+        all_names = []
+
+        # 单类别
+        for cls_name in class_names:
+            desc = get_inference_description([cls_name], use_translation=use_translation)
+            tokens = clip.tokenize(desc, truncate=True).to(self.device)  # [1, 77]
+            ctx = context_vectors.expand(1, -1, -1)  # [1, M, D]
+            feat = self.encode_text_with_context(tokens, ctx)
+            feat = F.normalize(feat, dim=-1)
+            all_features.append(feat)
+            all_names.append(cls_name)
+
+        # 组合
+        if use_combinations and seen_combinations:
+            for combo in seen_combinations:
+                if len(combo) <= 1:
+                    continue
+                combined_desc = get_inference_description(list(combo), use_translation=use_translation)
+                tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
+                ctx = context_vectors.expand(1, -1, -1)
+                feat = self.encode_text_with_context(tokens, ctx)
+                feat = F.normalize(feat, dim=-1)
+                all_features.append(feat)
+                all_names.append('+'.join(combo))
+        elif use_combinations:
+            for i, j in combinations(range(len(class_names)), 2):
+                cls1, cls2 = class_names[i], class_names[j]
+                combined_desc = get_inference_description([cls1, cls2], use_translation=use_translation)
+                tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
+                ctx = context_vectors.expand(1, -1, -1)
+                feat = self.encode_text_with_context(tokens, ctx)
+                feat = F.normalize(feat, dim=-1)
+                all_features.append(feat)
+                all_names.append(f"{cls1}+{cls2}")
+
+        return torch.cat(all_features, dim=0), all_names
+
+    @torch.no_grad()
     def zero_shot_predict(
         self,
         image: torch.Tensor,
         time_signal: torch.Tensor = None,
+        features_dict: dict = None,
         use_combinations: bool = True,
-        top_k: int = 1
+        top_k: int = 1,
+        seen_combinations: list = None,
+        use_translation: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
         """
         零样本预测
 
         Args:
             image: 图像张量 [batch_size, 3, H, W]
+            time_signal: 时域信号张量 (可选)
+            features_dict: 各域特征 (可选，用于 CoOp)
             use_combinations: 是否使用组合特征
             top_k: 返回 top-k 个预测
+            seen_combinations: 已见组合列表
+            use_translation: 是否使用翻译
 
         Returns:
             similarities: 相似度分数 [batch_size, num_candidates]
@@ -473,20 +635,38 @@ class CLIPForCZSL(nn.Module):
         # 归一化
         image_features = F.normalize(image_features, dim=-1)
 
-        # 选择文本特征
-        if use_combinations:
-            text_features = self.get_cached_combination_features()
-            names = self._combination_names
-        else:
-            text_features = self.get_cached_text_features()
-            names = self.class_names
+        # 特征条件上下文路径: 逐样本计算文本特征
+        if features_dict is not None and self.prompt_learner is not None:
+            B = image.shape[0]
+            all_similarities = []
 
-        # 计算相似度
-        logit_scale = self.model.logit_scale.exp()
-        similarities = logit_scale * (image_features @ text_features.T)
+            for i in range(B):
+                sample_features = {d: f[i:i+1] for d, f in features_dict.items()}
+                text_features, names = self.compute_text_features_for_sample(
+                    sample_features,
+                    use_combinations=use_combinations,
+                    seen_combinations=seen_combinations,
+                    use_translation=use_translation,
+                )
+                logit_scale = self.model.logit_scale.exp()
+                sim = logit_scale * (image_features[i:i+1] @ text_features.T)
+                all_similarities.append(sim)
+
+            similarities = torch.cat(all_similarities, dim=0)
+        else:
+            # 原始缓存路径
+            if use_combinations:
+                text_features = self.get_cached_combination_features()
+                names = self._combination_names
+            else:
+                text_features = self.get_cached_text_features()
+                names = self.class_names
+
+            logit_scale = self.model.logit_scale.exp()
+            similarities = logit_scale * (image_features @ text_features.T)
 
         # 获取 top-k 预测
-        top_k = min(top_k, text_features.shape[0])
+        top_k = min(top_k, similarities.shape[-1])
         values, indices = torch.topk(similarities, k=top_k, dim=-1)
 
         # 获取预测名称
@@ -514,6 +694,8 @@ class SigLIPForCZSL(nn.Module):
         device: str = "cuda",
         use_time_domain: bool = False,
         time_seq_len: int = 8000,
+        use_feature_context: bool = False,
+        n_ctx_per_domain: dict = None,
     ):
         """
         初始化 CZSL-SigLIP 模型
@@ -528,6 +710,8 @@ class SigLIPForCZSL(nn.Module):
             device: 计算设备
             use_time_domain: 是否使用时域信号
             time_seq_len: 时域信号序列长度
+            use_feature_context: 是否使用特征条件上下文 (CoOp-style)
+            n_ctx_per_domain: 各域上下文 token 数
         """
         super().__init__()
         from multi.siglip_loader import load_siglip
@@ -538,6 +722,7 @@ class SigLIPForCZSL(nn.Module):
         self.use_time_domain = use_time_domain
         self.time_seq_len = time_seq_len
         self.model_name = model_name
+        self.use_feature_context = use_feature_context
 
         # 加载 SigLIP 模型
         self.model, self.processor = load_siglip(model_name, device)
@@ -560,6 +745,16 @@ class SigLIPForCZSL(nn.Module):
         self._text_features_cache = None
         self._combination_features_cache = None
         self._combination_names = None
+
+        # 特征条件上下文 (CoOp-style)
+        if self.use_feature_context:
+            transformer_width = self.model.text_model.config.hidden_size
+            self.prompt_learner = FeatureConditionedPromptLearner(
+                transformer_width=transformer_width,
+                n_ctx_per_domain=n_ctx_per_domain,
+            ).to(device)
+        else:
+            self.prompt_learner = None
 
     def _apply_freeze_strategy(self, freeze_vision, freeze_text, vision_layers_unfreeze):
         """应用冻结策略"""
@@ -600,6 +795,78 @@ class SigLIPForCZSL(nn.Module):
         )
         return text_output.pooler_output
 
+    def encode_text_with_context(
+        self,
+        text: torch.Tensor,
+        context_vectors: torch.Tensor,
+    ) -> torch.Tensor:
+        """带特征条件上下文的文本编码 (SigLIP 版本)
+
+        通过 embed_tokens 获取词嵌入，拼接 context_vectors，
+        手动调用 encoder 和 final_layer_norm，取 pooler 输出。
+
+        Args:
+            text: token IDs [B, seq_len]
+            context_vectors: 上下文向量 [B, M, hidden_size]
+
+        Returns:
+            text_features: [B, embed_dim]
+        """
+        B = text.shape[0]
+        M = context_vectors.shape[1]
+        text_model = self.model.text_model
+        hidden_size = text_model.config.hidden_size
+
+        # 1. 词嵌入
+        inputs_embeds = text_model.embed_tokens(text)  # [B, seq_len, hidden_size]
+
+        # 2. 拼接 context_vectors 到 SOT 之后
+        # 找到第一个 padding 位置 (pad_token_id=1 for SigLIP)
+        pad_token_id = 1
+        non_pad_mask = (text != pad_token_id)  # [B, seq_len]
+        # 对每个样本，找到非 padding 的最后一个位置
+        seq_lengths = non_pad_mask.sum(dim=1)  # [B]
+
+        # 构造新序列: [词嵌入(0:seq_len) | context_vectors | padding]
+        # 为了简化，将 context 插入到有效 token 之后
+        max_len = text.shape[1]
+        new_seq_len = max_len + M
+
+        # 创建新的 embeddings tensor
+        new_embeds = torch.zeros(B, new_seq_len, hidden_size,
+                                 device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        new_attention_mask = torch.zeros(B, new_seq_len,
+                                         device=text.device, dtype=torch.long)
+
+        for i in range(B):
+            sl = seq_lengths[i].item()
+            # 复制原始有效 token embeddings
+            new_embeds[i, :sl] = inputs_embeds[i, :sl]
+            # 插入 context vectors
+            new_embeds[i, sl:sl + M] = context_vectors[i]
+            # attention mask
+            new_attention_mask[i, :sl + M] = 1
+
+        # 3. 调用 encoder（跳过 embed_tokens 重复计算）
+        encoder_outputs = text_model.encoder(
+            inputs_embeds=new_embeds,
+            attention_mask=new_attention_mask,
+        )
+        last_hidden_state = encoder_outputs.last_hidden_state  # [B, new_seq_len, hidden_size]
+
+        # 4. final_layer_norm
+        last_hidden_state = text_model.final_layer_norm(last_hidden_state)
+
+        # 5. Pooler: 取 EOS token (最后非 padding 位置)
+        # context 插入后，pooler 取 context 后第一个位置（即原来 EOS 的位置偏移了）
+        # SigLIP pooler 一般取 last_hidden_state[:, 0]（CLS）或 EOS
+        # 这里使用与原始 encode_text 一致的方式: pooler_output
+        # SigLIP 的 pooler 实际上是取 EOS token，我们取 seq_lengths + M - 1 位置
+        eos_positions = (seq_lengths + M - 1).clamp(max=new_seq_len - 1)
+        pooler_output = last_hidden_state[torch.arange(B, device=last_hidden_state.device), eos_positions]
+
+        return pooler_output
+
     def get_logit_scale(self) -> torch.Tensor:
         """获取温度缩放参数"""
         return self.model.logit_scale.exp()
@@ -612,7 +879,8 @@ class SigLIPForCZSL(nn.Module):
         self,
         image: torch.Tensor,
         text_tokens: torch.Tensor,
-        time_signal: torch.Tensor = None
+        time_signal: torch.Tensor = None,
+        features_dict: dict = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         对比学习前向传播
@@ -621,6 +889,7 @@ class SigLIPForCZSL(nn.Module):
             image: STFT 图像张量 [batch_size, 3, H, W]
             text_tokens: 文本 tokens [batch_size, seq_len]
             time_signal: 时域信号张量 [batch_size, seq_len] (可选)
+            features_dict: 各域特征 {'time': [B,5], ...} (可选，用于 CoOp)
 
         Returns:
             image_features: 图像特征 [batch_size, embed_dim]
@@ -638,7 +907,11 @@ class SigLIPForCZSL(nn.Module):
             image_features = stft_features
 
         # 提取文本特征
-        text_features = self.encode_text(text_tokens)
+        if features_dict is not None and self.prompt_learner is not None:
+            context_vectors = self.prompt_learner(features_dict)  # [B, M, D]
+            text_features = self.encode_text_with_context(text_tokens, context_vectors)
+        else:
+            text_features = self.encode_text(text_tokens)
 
         # 归一化
         image_features = F.normalize(image_features, dim=-1)
@@ -650,10 +923,11 @@ class SigLIPForCZSL(nn.Module):
         self,
         image: torch.Tensor,
         text_tokens: torch.Tensor = None,
-        time_signal: torch.Tensor = None
+        time_signal: torch.Tensor = None,
+        features_dict: dict = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """前向传播（对比学习模式）"""
-        return self.forward_contrastive(image, text_tokens, time_signal)
+        return self.forward_contrastive(image, text_tokens, time_signal, features_dict)
 
     @torch.no_grad()
     def cache_text_features(
@@ -665,6 +939,12 @@ class SigLIPForCZSL(nn.Module):
     ):
         """缓存所有类别和组合的文本特征"""
         self.eval()
+
+        # 特征条件上下文模式下，文本特征依赖逐样本特征，无法预缓存
+        if self.prompt_learner is not None:
+            print("Feature-conditioned context active: skipping text feature caching (computed per-sample)")
+            return
+
         from itertools import combinations
 
         all_features = []
@@ -753,12 +1033,80 @@ class SigLIPForCZSL(nn.Module):
         return self._combination_features_cache
 
     @torch.no_grad()
+    def compute_text_features_for_sample(
+        self,
+        features_dict: dict,
+        class_names: list = None,
+        use_combinations: bool = True,
+        seen_combinations: list = None,
+        use_translation: bool = False,
+    ) -> Tuple[torch.Tensor, List[str]]:
+        """基于单样本特征，计算所有候选类别的文本特征 (SigLIP 版本)"""
+        from itertools import combinations
+        from multi.text_templates import get_inference_description
+        from multi.siglip_loader import get_siglip_text_length
+
+        class_names = class_names or self.class_names
+        context_vectors = self.prompt_learner(features_dict)  # [1, M, D]
+        max_length = get_siglip_text_length(self.model_name)
+
+        all_features = []
+        all_names = []
+
+        # 单类别
+        for cls_name in class_names:
+            desc = get_inference_description([cls_name], use_translation=use_translation)
+            tokens = self.processor(
+                text=desc, return_tensors="pt", padding="max_length",
+                truncation=True, max_length=max_length
+            )["input_ids"].to(self.device)
+            ctx = context_vectors.expand(tokens.shape[0], -1, -1)
+            feat = self.encode_text_with_context(tokens, ctx)
+            feat = F.normalize(feat, dim=-1)
+            all_features.append(feat)
+            all_names.append(cls_name)
+
+        # 组合
+        if use_combinations and seen_combinations:
+            for combo in seen_combinations:
+                if len(combo) <= 1:
+                    continue
+                combined_desc = get_inference_description(list(combo), use_translation=use_translation)
+                tokens = self.processor(
+                    text=combined_desc, return_tensors="pt", padding="max_length",
+                    truncation=True, max_length=max_length
+                )["input_ids"].to(self.device)
+                ctx = context_vectors.expand(tokens.shape[0], -1, -1)
+                feat = self.encode_text_with_context(tokens, ctx)
+                feat = F.normalize(feat, dim=-1)
+                all_features.append(feat)
+                all_names.append('+'.join(combo))
+        elif use_combinations:
+            for i, j in combinations(range(len(class_names)), 2):
+                cls1, cls2 = class_names[i], class_names[j]
+                combined_desc = get_inference_description([cls1, cls2], use_translation=use_translation)
+                tokens = self.processor(
+                    text=combined_desc, return_tensors="pt", padding="max_length",
+                    truncation=True, max_length=max_length
+                )["input_ids"].to(self.device)
+                ctx = context_vectors.expand(tokens.shape[0], -1, -1)
+                feat = self.encode_text_with_context(tokens, ctx)
+                feat = F.normalize(feat, dim=-1)
+                all_features.append(feat)
+                all_names.append(f"{cls1}+{cls2}")
+
+        return torch.cat(all_features, dim=0), all_names
+
+    @torch.no_grad()
     def zero_shot_predict(
         self,
         image: torch.Tensor,
         time_signal: torch.Tensor = None,
+        features_dict: dict = None,
         use_combinations: bool = True,
-        top_k: int = 1
+        top_k: int = 1,
+        seen_combinations: list = None,
+        use_translation: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
         """零样本预测"""
         self.eval()
@@ -775,21 +1123,40 @@ class SigLIPForCZSL(nn.Module):
 
         image_features = F.normalize(image_features, dim=-1)
 
-        # 选择文本特征
-        if use_combinations:
-            text_features = self.get_cached_combination_features()
-            names = self._combination_names
-        else:
-            text_features = self.get_cached_text_features()
-            names = self.class_names
+        # 特征条件上下文路径: 逐样本计算文本特征
+        if features_dict is not None and self.prompt_learner is not None:
+            B = image.shape[0]
+            all_similarities = []
 
-        # 计算相似度 (SigLIP 使用 logit_scale 和 logit_bias)
-        logit_scale = self.get_logit_scale()
-        logit_bias = self.get_logit_bias()
-        similarities = logit_scale * (image_features @ text_features.T) + logit_bias
+            for i in range(B):
+                sample_features = {d: f[i:i+1] for d, f in features_dict.items()}
+                text_features, names = self.compute_text_features_for_sample(
+                    sample_features,
+                    use_combinations=use_combinations,
+                    seen_combinations=seen_combinations,
+                    use_translation=use_translation,
+                )
+                logit_scale = self.get_logit_scale()
+                logit_bias = self.get_logit_bias()
+                sim = logit_scale * (image_features[i:i+1] @ text_features.T) + logit_bias
+                all_similarities.append(sim)
+
+            similarities = torch.cat(all_similarities, dim=0)
+        else:
+            # 原始缓存路径
+            if use_combinations:
+                text_features = self.get_cached_combination_features()
+                names = self._combination_names
+            else:
+                text_features = self.get_cached_text_features()
+                names = self.class_names
+
+            logit_scale = self.get_logit_scale()
+            logit_bias = self.get_logit_bias()
+            similarities = logit_scale * (image_features @ text_features.T) + logit_bias
 
         # 获取 top-k 预测
-        top_k = min(top_k, text_features.shape[0])
+        top_k = min(top_k, similarities.shape[-1])
         values, indices = torch.topk(similarities, k=top_k, dim=-1)
 
         # 获取预测名称
@@ -819,6 +1186,10 @@ def create_czsl_model(config: dict, device: str = "cuda"):
     use_time_domain = config.get("use_time_domain", False)
     time_seq_len = data_config.get("time_seq_len", 8000)
 
+    # 特征条件上下文配置
+    use_feature_context = config.get("use_feature_context", False)
+    n_ctx_per_domain = config.get("n_ctx_per_domain", None)
+
     clip_model = model_config.get("clip_model", "ViT-B/32")
 
     # 检测是否为 SigLIP 模型
@@ -833,7 +1204,9 @@ def create_czsl_model(config: dict, device: str = "cuda"):
             vision_layers_unfreeze=model_config.get("vision_layers_unfreeze", 2),
             device=device,
             use_time_domain=use_time_domain,
-            time_seq_len=time_seq_len
+            time_seq_len=time_seq_len,
+            use_feature_context=use_feature_context,
+            n_ctx_per_domain=n_ctx_per_domain,
         )
     else:
         # 使用 CLIP 模型
@@ -847,7 +1220,9 @@ def create_czsl_model(config: dict, device: str = "cuda"):
             vision_layers_unfreeze=model_config.get("vision_layers_unfreeze", 2),
             device=device,
             use_time_domain=use_time_domain,
-            time_seq_len=time_seq_len
+            time_seq_len=time_seq_len,
+            use_feature_context=use_feature_context,
+            n_ctx_per_domain=n_ctx_per_domain,
         )
 
     # LoRA 配置
@@ -902,6 +1277,8 @@ class DualBranchCLIPForCZSL(nn.Module):
         device: str = "cuda",
         use_time_domain: bool = False,
         time_seq_len: int = 8000,
+        use_feature_context: bool = False,
+        n_ctx_per_domain: dict = None,
     ):
         """
         初始化双分支 CZSL-CLIP 模型
@@ -916,6 +1293,8 @@ class DualBranchCLIPForCZSL(nn.Module):
             device: 计算设备
             use_time_domain: 是否使用时域信号
             time_seq_len: 时域信号序列长度
+            use_feature_context: 是否使用特征条件上下文 (CoOp-style)
+            n_ctx_per_domain: 各域上下文 token 数
         """
         super().__init__()
         self.device = device
@@ -931,6 +1310,7 @@ class DualBranchCLIPForCZSL(nn.Module):
 
         self.use_time_domain = use_time_domain
         self.time_seq_len = time_seq_len
+        self.use_feature_context = use_feature_context
 
         # 加载预训练 CLIP 模型
         if clip_model == "resnet18":
@@ -966,6 +1346,16 @@ class DualBranchCLIPForCZSL(nn.Module):
         self._suppression_text_features = None
         self._deception_names = None
         self._suppression_names = None
+
+        # 特征条件上下文 (CoOp-style)
+        if self.use_feature_context:
+            transformer_width = self.model.transformer.width
+            self.prompt_learner = FeatureConditionedPromptLearner(
+                transformer_width=transformer_width,
+                n_ctx_per_domain=n_ctx_per_domain,
+            ).to(device)
+        else:
+            self.prompt_learner = None
 
     def _apply_freeze_strategy(self, freeze_vision, freeze_text, vision_layers_unfreeze):
         """应用冻结策略"""
@@ -1007,12 +1397,50 @@ class DualBranchCLIPForCZSL(nn.Module):
         """编码文本"""
         return self.model.encode_text(text_tokens)
 
+    def encode_text_with_context(
+        self,
+        text: torch.Tensor,
+        context_vectors: torch.Tensor,
+    ) -> torch.Tensor:
+        """带特征条件上下文的文本编码（双分支共享）"""
+        B = text.shape[0]
+        M = context_vectors.shape[1]
+        dtype = self.model.visual.conv1.weight.dtype
+
+        token_embs = self.model.token_embedding(text).type(dtype)
+        eot_pos = text.argmax(dim=-1)
+
+        sot_emb = token_embs[:, 0:1, :]
+        max_eot = eot_pos.max().item()
+        word_embs = token_embs[:, 1:max_eot + 1, :]
+
+        x = torch.cat([sot_emb, context_vectors.type(dtype), word_embs], dim=1)
+
+        seq_len = x.shape[1]
+        if seq_len > 77:
+            x = x[:, :77, :]
+        elif seq_len < 77:
+            pad = torch.zeros(B, 77 - seq_len, x.shape[-1], device=x.device, dtype=x.dtype)
+            x = torch.cat([x, pad], dim=1)
+
+        x = x + self.model.positional_embedding.type(dtype)
+        x = x.permute(1, 0, 2)
+        x = self.model.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.model.ln_final(x).type(dtype)
+
+        new_eot_pos = (eot_pos + M).clamp(max=76)
+        text_features = x[torch.arange(B, device=x.device), new_eot_pos] @ self.model.text_projection
+
+        return text_features
+
     def forward_dual(
         self,
         image: torch.Tensor,
         text_tokens_deception: torch.Tensor,
         text_tokens_suppression: torch.Tensor,
-        time_signal: torch.Tensor = None
+        time_signal: torch.Tensor = None,
+        features_dict: dict = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         双分支前向传播
@@ -1022,6 +1450,7 @@ class DualBranchCLIPForCZSL(nn.Module):
             text_tokens_deception: 欺骗分支文本 tokens
             text_tokens_suppression: 压制分支文本 tokens
             time_signal: 时域信号 (可选)
+            features_dict: 各域特征 (可选，用于 CoOp)
 
         Returns:
             image_features: 图像特征
@@ -1039,8 +1468,13 @@ class DualBranchCLIPForCZSL(nn.Module):
             image_features = stft_features
 
         # 提取两个分支的文本特征
-        text_features_deception = self.encode_text(text_tokens_deception)
-        text_features_suppression = self.encode_text(text_tokens_suppression)
+        if features_dict is not None and self.prompt_learner is not None:
+            context_vectors = self.prompt_learner(features_dict)
+            text_features_deception = self.encode_text_with_context(text_tokens_deception, context_vectors)
+            text_features_suppression = self.encode_text_with_context(text_tokens_suppression, context_vectors)
+        else:
+            text_features_deception = self.encode_text(text_tokens_deception)
+            text_features_suppression = self.encode_text(text_tokens_suppression)
 
         # 归一化
         image_features = F.normalize(image_features, dim=-1)
@@ -1054,10 +1488,11 @@ class DualBranchCLIPForCZSL(nn.Module):
         image: torch.Tensor,
         text_tokens_deception: torch.Tensor = None,
         text_tokens_suppression: torch.Tensor = None,
-        time_signal: torch.Tensor = None
+        time_signal: torch.Tensor = None,
+        features_dict: dict = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """前向传播"""
-        return self.forward_dual(image, text_tokens_deception, text_tokens_suppression, time_signal)
+        return self.forward_dual(image, text_tokens_deception, text_tokens_suppression, time_signal, features_dict)
 
     @torch.no_grad()
     def cache_text_features_dual(self, use_translation: bool = False):
@@ -1065,6 +1500,12 @@ class DualBranchCLIPForCZSL(nn.Module):
         缓存双分支文本特征
         """
         self.eval()
+
+        # 特征条件上下文模式下，文本特征依赖逐样本特征，无法预缓存
+        if self.prompt_learner is not None:
+            print("Feature-conditioned context active: skipping dual-branch text feature caching")
+            return
+
         from multi.text_templates import get_dual_branch_inference_descriptions
 
         descriptions = get_dual_branch_inference_descriptions(
@@ -1202,6 +1643,10 @@ def create_dual_branch_model(config: dict, device: str = "cuda") -> DualBranchCL
     use_time_domain = config.get("use_time_domain", False)
     time_seq_len = data_config.get("time_seq_len", 8000)
 
+    # 特征条件上下文配置
+    use_feature_context = config.get("use_feature_context", False)
+    n_ctx_per_domain = config.get("n_ctx_per_domain", None)
+
     model = DualBranchCLIPForCZSL(
         clip_model=model_config.get("clip_model", "ViT-B/32"),
         deception_classes=deception_classes,
@@ -1211,7 +1656,9 @@ def create_dual_branch_model(config: dict, device: str = "cuda") -> DualBranchCL
         vision_layers_unfreeze=model_config.get("vision_layers_unfreeze", 2),
         device=device,
         use_time_domain=use_time_domain,
-        time_seq_len=time_seq_len
+        time_seq_len=time_seq_len,
+        use_feature_context=use_feature_context,
+        n_ctx_per_domain=n_ctx_per_domain,
     )
 
     # LoRA 配置

@@ -66,58 +66,59 @@ def collate_fn(batch):
     将 batch 转换为 tensor，并生成文本 tokens
 
     Args:
-        batch: list of (stft_image, label, metadata) 或 (stft_image, time_signal, label, metadata)
+        batch: list of (stft_image, label, metadata) 或 (stft_image, label, metadata, features)
 
     Returns:
-        stft_images, time_signals, text_tokens, labels, texts, metadata_list
+        stft_images, time_signals, text_tokens, labels, texts, metadata_list [, features_batched]
     """
     from multi.text_templates import generate_text_descriptions
     import clip
 
-    # 检查第一个样本的长度以确定是否包含时域信号
+    # 检测样本格式
     sample = batch[0]
-    has_time_signal = len(sample) == 4  # (stft_image, time_signal, label, metadata)
+    has_features = isinstance(sample[-1], dict) and len(sample) == 4
 
-    if has_time_signal:
-        stft_images, time_signals, labels, metadata_list = zip(*batch)
-        # 堆叠时域信号
-        time_signals = torch.stack(time_signals, dim=0)
+    if has_features:
+        stft_images, labels, metadata_list, features_list = zip(*batch)
+        # 拼接各域特征
+        features_batched = {}
+        for domain in features_list[0].keys():
+            features_batched[domain] = torch.stack([f[domain] for f in features_list], dim=0)
     else:
         stft_images, labels, metadata_list = zip(*batch)
-        time_signals = None
+        features_batched = None
 
     # 堆叠 STFT 图像和标签
     stft_images = torch.stack(stft_images, dim=0)
     labels = torch.stack(labels, dim=0)
 
     # 使用 metadata_template 生成文本描述并 tokenize
-    # 使用 'class_only' 风格：只包含干扰类型，不包含 JNR
-    # 这样同一干扰类型的所有样本共享相同的文本描述，避免特征空间分裂
     texts = []
     for meta in metadata_list:
-        # 使用 class_only 风格，与推理时的缓存文本格式一致
         text = generate_text_descriptions(meta, style='class_only')
         texts.append(text)
 
     text_tokens = clip.tokenize(texts, truncate=True)
 
-    return stft_images, time_signals, text_tokens, labels, texts, metadata_list
+    return stft_images, None, text_tokens, labels, texts, metadata_list, features_batched
 
 
 def _collate_fn(batch, model_type="clip", processor=None):
     """Collate 函数，支持 CLIP 和 SigLIP tokenization（模块级别以便 pickle）"""
     from multi.text_templates import generate_text_descriptions
 
-    # 检查第一个样本的长度以确定是否包含时域信号
+    # 检测样本格式
     sample = batch[0]
-    has_time_signal = len(sample) == 4
+    has_features = isinstance(sample[-1], dict) and len(sample) == 4
 
-    if has_time_signal:
-        stft_images, time_signals, labels, metadata_list = zip(*batch)
-        time_signals = torch.stack(time_signals, dim=0)
+    if has_features:
+        stft_images, labels, metadata_list, features_list = zip(*batch)
+        features_batched = {}
+        for domain in features_list[0].keys():
+            features_batched[domain] = torch.stack([f[domain] for f in features_list], dim=0)
     else:
         stft_images, labels, metadata_list = zip(*batch)
-        time_signals = None
+        features_batched = None
 
     # 堆叠 STFT 图像和标签
     stft_images = torch.stack(stft_images, dim=0)
@@ -132,7 +133,7 @@ def _collate_fn(batch, model_type="clip", processor=None):
     # 使用统一的 tokenize 函数
     text_tokens = tokenize_texts(texts, model_type, processor)
 
-    return stft_images, time_signals, text_tokens, labels, texts, metadata_list
+    return stft_images, None, text_tokens, labels, texts, metadata_list, features_batched
 
 
 def create_collate_fn(model_type: str = "clip", processor=None):
@@ -175,6 +176,9 @@ class STFTDataset(Dataset):
         class_names: list = None,
         normalize_mode: str = 'per_sample', # 'global'  'per_sample'
         normalize_method: str = 'p99', #'p99' 'p95' 或 'max'
+        features_file: str = None,
+        feature_norm_stats: dict = None,
+        use_feature_context: bool = False,
     ):
         """
         Args:
@@ -185,12 +189,16 @@ class STFTDataset(Dataset):
             image_size: 输出图像尺寸
             apply_clip_norm: 是否应用 CLIP 标准化
             class_names: 类别名称列表 (用于将 jam_types 转换为多热编码)
+            features_file: 多域特征 .json 文件路径 (可选)
+            feature_norm_stats: 特征归一化统计量 (可选)
+            use_feature_context: 是否启用特征条件上下文
         """
         super().__init__()
 
         self.stft_file = stft_file
         self.metadata_file = metadata_file
         self.stft_var_name = stft_var_name
+        self.use_feature_context = use_feature_context
 
         # 延迟加载 STFT 样本数
         with h5py.File(stft_file, 'r') as f:
@@ -232,6 +240,75 @@ class STFTDataset(Dataset):
 
         # 延迟加载的文件句柄
         self._h5_file = None
+
+        # 特征条件上下文
+        self._raw_features = None
+        self._feature_norm_stats = feature_norm_stats or {}
+        if self.use_feature_context and features_file and os.path.exists(features_file):
+            with open(features_file, 'r', encoding='utf-8') as f:
+                self._raw_features = json.load(f)
+            print(f"  Loaded features from {features_file}: {len(self._raw_features)} samples")
+        elif self.use_feature_context:
+            print(f"  Warning: use_feature_context=True but features file not found: {features_file}")
+
+    # 特征域定义
+    FEATURE_DOMAINS = {
+        'time': {
+            'prefix': 'time_domain',
+            'keys': ['skewness', 'kurtosis', 'envelope_variation', 'modulation_bandwidth', 'modulation_rate'],
+        },
+        'freq': {
+            'prefix': 'freq_domain',
+            'keys': ['spectral_skewness', 'spectral_kurtosis', 'carrier_factor', 'awgn_factor'],
+        },
+        'bispectrum': {
+            'prefix': 'bispectrum',
+            'keys': ['bispectrum_variance', 'bispectrum_mean'],
+        },
+        'wavelet': {
+            'prefix': 'wavelet',
+            'keys': ['variance', 'mean', 'max', 'scale_centroid', 'max_singular_value',
+                     'central_moment_2', 'central_moment_3', 'central_moment_4'],
+        },
+        'statistical': {
+            'prefix': 'statistical',
+            'keys': ['shannon_entropy', 'exponential_entropy', 'norm_entropy'],
+        },
+    }
+
+    def _get_features(self, index: int) -> dict:
+        """获取样本的多域特征（已标准化）
+
+        Returns:
+            features_dict: {'time': tensor([5]), 'freq': tensor([4]), ...}
+        """
+        if self._raw_features is None or index >= len(self._raw_features):
+            # 回退: 返回零特征
+            return {d: torch.zeros(len(info['keys'])) for d, info in self.FEATURE_DOMAINS.items()}
+
+        raw = self._raw_features[index]
+        features_dict = {}
+
+        for domain, info in self.FEATURE_DOMAINS.items():
+            prefix = info['prefix']
+            values = []
+            for key in info['keys']:
+                flat_key = f"{prefix}.{key}"
+                # 嵌套取值
+                val = raw
+                for part in [prefix, key]:
+                    val = val.get(part, 0.0) if isinstance(val, dict) else 0.0
+                # 处理 NaN/Inf
+                if not isinstance(val, (int, float)) or np.isnan(val) or np.isinf(val):
+                    val = 0.0
+                # 标准化
+                if flat_key in self._feature_norm_stats:
+                    stats = self._feature_norm_stats[flat_key]
+                    val = (val - stats.get('mean', 0.0)) / (stats.get('std', 1.0) + 1e-8)
+                values.append(val)
+            features_dict[domain] = torch.tensor(values, dtype=torch.float32)
+
+        return features_dict
 
     def _build_labels_from_metadata(self) -> np.ndarray:
         """
@@ -351,7 +428,12 @@ class STFTDataset(Dataset):
         # 9. 获取 metadata (用于生成文本描述)
         metadata = self._get_metadata(index)
 
-        return stft_tensor, label_tensor, metadata
+        # 10. 获取多域特征 (如果启用)
+        if self.use_feature_context:
+            features = self._get_features(index)
+            return stft_tensor, label_tensor, metadata, features
+        else:
+            return stft_tensor, label_tensor, metadata
 
 
 # ============================================================================
@@ -760,6 +842,15 @@ def create_czsl_dataloaders(
     time_seq_len = data_config.get('time_seq_len', 2048)
     time_var_name = data_config.get('time_var_name', 'raw_time')
 
+    # 特征条件上下文配置
+    use_feature_context = config.get('use_feature_context', False)
+    feature_norm_stats_path = config.get('feature_norm_stats_path', None)
+    feature_norm_stats = None
+    if use_feature_context and feature_norm_stats_path and os.path.exists(feature_norm_stats_path):
+        with open(feature_norm_stats_path, 'r', encoding='utf-8') as f:
+            feature_norm_stats = json.load(f)
+        print(f"Loaded feature normalization stats from {feature_norm_stats_path}")
+
     # JNR 级别
     jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
 
@@ -782,6 +873,7 @@ def create_czsl_dataloaders(
 
             stft_file = os.path.join(data_folder, f'{split_name}_{stft_suffix}.mat')
             metadata_file = os.path.join(data_folder, f'{split_name}_echo_metadata.json')
+            features_file = os.path.join(data_folder, f'{split_name}_echo_features.json')
 
             # 时域数据文件路径 (假设命名规则)
             time_file = os.path.join(data_folder, f'{split_name}_echo_times.mat')
@@ -800,6 +892,9 @@ def create_czsl_dataloaders(
                 metadata_file=metadata_file,
                 normalization_stats=normalization_stats,
                 class_names=class_names,
+                features_file=features_file if use_feature_context else None,
+                feature_norm_stats=feature_norm_stats,
+                use_feature_context=use_feature_context,
             )
             datasets.append(stft_dataset)
             print(f"Loaded {split_name} data from {jnr_folder}: {len(stft_dataset)} samples")

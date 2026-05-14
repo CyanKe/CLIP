@@ -658,7 +658,11 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
         debug_done = False
 
         for batch_idx, batch_data in enumerate(eval_bar):
-            if len(batch_data) == 6:
+            # 解析 batch，支持 6 元素 (无 features) 和 7 元素 (有 features)
+            features_dict = None
+            if len(batch_data) == 7:
+                images, time_signals, text_tokens, labels, texts, metas, features_dict = batch_data
+            elif len(batch_data) == 6:
                 images, time_signals, text_tokens, labels, texts, metas = batch_data
             else:
                 images, text_tokens, labels, texts, metas = batch_data
@@ -684,13 +688,19 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
 
             # Zero-shot predict
             if use_combinations:
+                # 准备 features_dict (如果可用)
+                feat_kwargs = {}
+                if features_dict is not None and hasattr(model, 'prompt_learner') and model.prompt_learner is not None:
+                    feat_kwargs['features_dict'] = {d: f.to(self.device) for d, f in features_dict.items()}
+                    feat_kwargs['seen_combinations'] = self.config.get("czsl", {}).get("seen_combinations", None)
+
                 if self.use_original_clip or self.use_multishape:
                     similarities, indices, pred_names = model.zero_shot_predict(
-                        images, use_combinations=True, top_k=1
+                        images, use_combinations=True, top_k=1, **feat_kwargs
                     ) if not self.use_original_clip else self._original_clip_predict(model, images, use_combinations=True)
                 else:
                     similarities, indices, pred_names = model.zero_shot_predict(
-                        images, use_combinations=True, top_k=1
+                        images, use_combinations=True, top_k=1, **feat_kwargs
                     )
 
                 preds = torch.zeros(batch_size, self.num_classes, device=self.device)
@@ -805,7 +815,10 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
         all_labels, all_preds, all_probs, all_features = [], [], [], []
 
         for batch_data in tqdm(data_loader, desc="By combination"):
-            if len(batch_data) == 6:
+            features_dict = None
+            if len(batch_data) == 7:
+                images, _, _, labels, texts, metas, features_dict = batch_data
+            elif len(batch_data) == 6:
                 images, _, _, labels, texts, metas = batch_data
             else:
                 images, labels, texts, metas = batch_data[:4]
@@ -816,15 +829,28 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
             batch_size = images.shape[0]
 
             # Predict using single-class features
-            text_features = model.get_cached_text_features() if not self.use_original_clip else model._text_features
-            image_features = model.encode_image(images)
-            image_features = F.normalize(image_features, dim=-1)
-            if self.use_original_clip:
-                logit_scale = model.logit_scale.exp()
+            if features_dict is not None and hasattr(model, 'prompt_learner') and model.prompt_learner is not None:
+                # 特征条件上下文: 逐样本计算
+                feat_kwargs = {'features_dict': {d: f.to(self.device) for d, f in features_dict.items()},
+                               'use_combinations': False}
+                similarities, indices, pred_names = model.zero_shot_predict(images, **feat_kwargs)
+                if self.use_original_clip:
+                    logit_scale = model.logit_scale.exp()
+                else:
+                    logit_scale = model.model.logit_scale.exp() if hasattr(model, 'model') else model.logit_scale.exp()
+                probs = torch.softmax(similarities, dim=-1)
+                image_features = model.encode_image(images)
+                image_features = F.normalize(image_features, dim=-1)
             else:
-                logit_scale = model.model.logit_scale.exp() if hasattr(model, 'model') else model.logit_scale.exp()
-            logits = logit_scale * (image_features @ text_features.T)
-            probs = torch.softmax(logits, dim=-1)
+                text_features = model.get_cached_text_features() if not self.use_original_clip else model._text_features
+                image_features = model.encode_image(images)
+                image_features = F.normalize(image_features, dim=-1)
+                if self.use_original_clip:
+                    logit_scale = model.logit_scale.exp()
+                else:
+                    logit_scale = model.model.logit_scale.exp() if hasattr(model, 'model') else model.logit_scale.exp()
+                logits = logit_scale * (image_features @ text_features.T)
+                probs = torch.softmax(logits, dim=-1)
 
             threshold = 1.0 / self.num_classes
             top_k = 3

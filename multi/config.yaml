@@ -60,7 +60,7 @@ loss:
 
 # 数据配置
 data:
-  base_path: "D:/VScode/Jamming_signal_simulation/output/260422"
+  base_path: "D:/VScode/Jamming_signal_simulation/output/20us_few"
   jnr_start: 0
   jnr_end: 20
   jnr_step: 5
@@ -77,6 +77,23 @@ data:
 
 # 模型开关配置
 use_time_domain: false          # 是否使用时域信号进行消融实验
+
+# ============================================================================
+# Feature-Conditioned Context (CoOp-style) 配置
+# 用域感知 Meta-Net 将22维信号特征映射为可学习上下文向量，
+# 注入冻结文本 Transformer，使文本表征随输入信号物理特性动态调整
+# ============================================================================
+use_feature_context: false          # 总开关 (true 启用 CoOp-style 特征条件上下文)
+
+n_ctx_per_domain:                   # 各域生成的上下文 token 数 (总=10)
+  time: 2                           # 时域 5维 → 2 tokens
+  freq: 2                           # 频域 4维 → 2 tokens
+  bispectrum: 1                     # 双谱 2维 → 1 token
+  wavelet: 3                        # 小波 8维 → 3 tokens
+  statistical: 2                    # 统计 3维 → 2 tokens
+
+feature_norm_stats_path: "multi/feature_normalization_stats.json"  # 特征归一化统计量
+prompt_lr: 0.002                    # Meta-Net 学习率 (比 base lr 高 ~200x)
 
 # LoRA 微调配置（禁用，改用解冻最后N层策略）
 lora:

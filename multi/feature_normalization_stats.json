@@ -1,0 +1,90 @@
+{
+  "time_domain.skewness": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "time_domain.kurtosis": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "time_domain.envelope_variation": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "time_domain.modulation_bandwidth": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "time_domain.modulation_rate": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "freq_domain.spectral_skewness": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "freq_domain.spectral_kurtosis": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "freq_domain.carrier_factor": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "freq_domain.awgn_factor": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "bispectrum.bispectrum_variance": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "bispectrum.bispectrum_mean": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "wavelet.variance": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "wavelet.mean": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "wavelet.max": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "wavelet.scale_centroid": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "wavelet.max_singular_value": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "wavelet.central_moment_2": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "wavelet.central_moment_3": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "wavelet.central_moment_4": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "statistical.shannon_entropy": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "statistical.exponential_entropy": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "statistical.norm_entropy": {
+    "mean": 0.0,
+    "std": 1.0
+  }
+}

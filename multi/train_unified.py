@@ -70,12 +70,32 @@ def create_optimizer_and_scheduler(
     num_training_steps: int
 ) -> tuple:
     train_config = config.get("train", {})
+    use_feature_context = config.get("use_feature_context", False)
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=float(train_config.get("lr", 1e-5)),
-        weight_decay=float(train_config.get("weight_decay", 0.01))
-    )
+    # 特征条件上下文: prompt_learner 参数使用更高学习率
+    if use_feature_context and hasattr(model, 'prompt_learner') and model.prompt_learner is not None:
+        prompt_params = list(model.prompt_learner.parameters())
+        prompt_param_ids = {id(p) for p in prompt_params}
+        other_params = [p for p in model.parameters()
+                       if p.requires_grad and id(p) not in prompt_param_ids]
+
+        prompt_lr = float(train_config.get("prompt_lr", 2e-3))
+        base_lr = float(train_config.get("lr", 1e-5))
+
+        print(f"  Prompt learner LR: {prompt_lr}, Base LR: {base_lr}")
+        print(f"  Prompt learner params: {sum(p.numel() for p in prompt_params):,}")
+        print(f"  Other trainable params: {sum(p.numel() for p in other_params):,}")
+
+        optimizer = AdamW([
+            {"params": other_params, "lr": base_lr, "weight_decay": float(train_config.get("weight_decay", 0.01))},
+            {"params": prompt_params, "lr": prompt_lr, "weight_decay": 0.0},
+        ])
+    else:
+        optimizer = AdamW(
+            model.parameters(),
+            lr=float(train_config.get("lr", 1e-5)),
+            weight_decay=float(train_config.get("weight_decay", 0.01))
+        )
 
     scheduler_config = train_config.get("scheduler", {})
     scheduler_type = scheduler_config.get("type", "cosine")
@@ -214,11 +234,16 @@ class CZSLStrategy(TrainingStrategy):
         )
 
     def prepare_batch(self, batch_data: tuple) -> dict:
-        if len(batch_data) == 6:
+        # batch_data: (images, time_signals, text_tokens, labels, texts, metas, features_batched)
+        if len(batch_data) == 7:
+            images, time_signals, text_tokens, labels, texts, metas, features = batch_data
+        elif len(batch_data) == 6:
             images, time_signals, text_tokens, labels, texts, metas = batch_data
+            features = None
         else:
             images, text_tokens, labels, texts, metas = batch_data
             time_signals = None
+            features = None
 
         images = images.to(self.device)
         text_tokens = text_tokens.to(self.device)
@@ -229,18 +254,26 @@ class CZSLStrategy(TrainingStrategy):
         if images.shape[-1] != 224:
             images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
 
-        return {
+        result = {
             "images": images,
             "text_tokens": text_tokens,
             "labels": labels,
             "time_signals": time_signals,
         }
 
+        if features is not None:
+            result["features"] = {d: f.to(self.device) for d, f in features.items()}
+        else:
+            result["features"] = None
+
+        return result
+
     def forward_pass(self, model: nn.Module, batch: dict, loss_fn: nn.Module) -> StepResult:
         from multi.loss import LabelAwareInfoNCELoss, MultiLabelSigmoidLoss
 
         image_features, text_features = model(
-            batch["images"], batch["text_tokens"], batch["time_signals"]
+            batch["images"], batch["text_tokens"], batch["time_signals"],
+            features_dict=batch.get("features"),
         )
         labels = batch["labels"]
         batch_size = batch["images"].size(0)
@@ -400,6 +433,7 @@ class DualBranchStrategy(TrainingStrategy):
                 batch["images"],
                 batch["text_tokens_deception"],
                 batch["text_tokens_suppression"],
+                features_dict=batch.get("features"),
             )
             loss, loss_info = loss_fn(
                 img_feat, txt_d_feat, txt_s_feat,
