@@ -2,7 +2,7 @@
 统一评估脚本 - 通过 config.yaml 控制评估模式
 python -m multi.evaluate_unified --checkpoint checkpoints/czsl_best_model.pt --mode zero_shot
 
-支持模式 (train.mode in config.yaml):
+支持模式 (model.dual_branch in config.yaml):
   - "czsl": 对比学习评估 (CLIP/MultiShapeViT/OriginalCLIP)
   - "dual_branch": 双分支评估 (CLIP双分支/MultiShapeViT双分支/ResNet18双分支)
 
@@ -547,7 +547,7 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
         super().__init__(config, device)
         model_config = config.get("model", {})
         self.model_type = model_config.get("clip_model", "ViT-B/32")
-        self.use_multishape = model_config.get("use_multishape_vit", False)
+        self.backbone = model_config.get("backbone", "vit")
         self.use_original_clip = use_original_clip
 
         # Class info
@@ -563,7 +563,7 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
     def _model_label(self):
         if self.use_original_clip:
             return "Original CLIP"
-        if self.use_multishape:
+        if self.backbone == "multishape_vit":
             return "MultiShapeViT"
         return "CZSL"
 
@@ -574,7 +574,7 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
             model = model.float().eval()
             print(f"Loading original CLIP model: {self.model_type}")
             return model
-        elif self.use_multishape:
+        elif self.backbone == "multishape_vit":
             from multi.rectangular_patch_vit import create_multi_shape_patch_model
             print("Creating Multi-Shape Patch ViT model...")
             return create_multi_shape_patch_model(self.config, device=str(self.device))
@@ -599,7 +599,7 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         # Try checkpoint config first
-        if "config" in checkpoint and not self.use_multishape:
+        if "config" in checkpoint and not self.backbone == "multishape_vit":
             # Use mismatch filtering for CZSL (classifier might differ)
             state_dict = checkpoint["model_state_dict"]
             model_state = model.state_dict()
@@ -678,7 +678,7 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
             if self.use_original_clip:
                 image_features = model.encode_image(images)
                 image_features = F.normalize(image_features, dim=-1)
-            elif self.use_multishape:
+            elif self.backbone == "multishape_vit":
                 image_features = model.encode_image(images)
                 image_features = F.normalize(image_features, dim=-1)
             else:
@@ -694,7 +694,7 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
                     feat_kwargs['features_dict'] = {d: f.to(self.device) for d, f in features_dict.items()}
                     feat_kwargs['seen_combinations'] = self.config.get("czsl", {}).get("seen_combinations", None)
 
-                if self.use_original_clip or self.use_multishape:
+                if self.use_original_clip or self.backbone == "multishape_vit":
                     similarities, indices, pred_names = model.zero_shot_predict(
                         images, use_combinations=True, top_k=1, **feat_kwargs
                     ) if not self.use_original_clip else self._original_clip_predict(model, images, use_combinations=True)
@@ -1030,13 +1030,12 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
 # DualBranchEvaluationStrategy
 # ============================================================================
 
-class DualBranchEvaluationStrategy(EvaluationStrategy, DualBranchPlotMixin):
+class DualBranchEvaluationStrategy(DualBranchPlotMixin, EvaluationStrategy):
     def __init__(self, config: dict, device: torch.device):
         self.config = config
         self.device = device
         model_config = config.get("model", {})
-        self.use_multishape = model_config.get("use_multishape_vit", False)
-        self.use_resnet18 = model_config.get("use_resnet18", False)
+        self.backbone = model_config.get("backbone", "vit")
 
         # Class info
         jamming_groups = config.get("jamming_groups", {})
@@ -1049,18 +1048,18 @@ class DualBranchEvaluationStrategy(EvaluationStrategy, DualBranchPlotMixin):
 
     @property
     def _model_label(self):
-        if self.use_resnet18:
+        if self.backbone == "resnet18":
             return "ResNet18 Dual-Branch"
-        elif self.use_multishape:
+        elif self.backbone == "multishape_vit":
             return "MultiShapeViT Dual-Branch"
         return "CLIP Dual-Branch"
 
     def create_model(self) -> nn.Module:
-        if self.use_resnet18:
+        if self.backbone == "resnet18":
             from multi.model import create_resnet18_dual_branch_model
             print("Creating ResNet18 dual-branch model...")
             return create_resnet18_dual_branch_model(self.config, device=str(self.device))
-        elif self.use_multishape:
+        elif self.backbone == "multishape_vit":
             from multi.rectangular_patch_vit import create_multi_shape_dual_branch_model
             print("Creating Multi-Shape Patch ViT dual-branch model...")
             return create_multi_shape_dual_branch_model(self.config, device=str(self.device))
@@ -1086,7 +1085,7 @@ class DualBranchEvaluationStrategy(EvaluationStrategy, DualBranchPlotMixin):
         return model
 
     def cache_text_features(self, model: nn.Module) -> None:
-        if not self.use_resnet18:
+        if not self.backbone == "resnet18":
             model.cache_text_features_dual()
 
     @torch.no_grad()
@@ -1110,7 +1109,7 @@ class DualBranchEvaluationStrategy(EvaluationStrategy, DualBranchPlotMixin):
             batch_size = stft_images.size(0)
 
             # Predict
-            if self.use_resnet18:
+            if self.backbone == "resnet18":
                 deception_result, suppression_result = model.predict(stft_images)
             else:
                 deception_result, suppression_result = model.zero_shot_predict_dual(stft_images)
@@ -1168,7 +1167,7 @@ class DualBranchEvaluationStrategy(EvaluationStrategy, DualBranchPlotMixin):
 
     def _predict_sample(self, image: torch.Tensor) -> tuple:
         """Predict a single image (for STFT saving). Returns (pred_d_idx, pred_s_idx)."""
-        if self.use_resnet18:
+        if self.backbone == "resnet18":
             d_result, s_result = self.model.predict(image)
         else:
             d_result, s_result = self.model.zero_shot_predict_dual(image)
@@ -1205,13 +1204,11 @@ class DualBranchEvaluationStrategy(EvaluationStrategy, DualBranchPlotMixin):
 
 def create_evaluation_strategy(config: dict, device: torch.device,
                                 use_original_clip: bool = False) -> EvaluationStrategy:
-    mode = config.get("train", {}).get("mode", "czsl")
-    if mode == "czsl":
-        return CZSLEvaluationStrategy(config, device, use_original_clip=use_original_clip)
-    elif mode == "dual_branch":
+    dual_branch = config.get("model", {}).get("dual_branch", False)
+    if dual_branch:
         return DualBranchEvaluationStrategy(config, device)
     else:
-        raise ValueError(f"Unknown train.mode: '{mode}'. Expected 'czsl' or 'dual_branch'.")
+        return CZSLEvaluationStrategy(config, device, use_original_clip=use_original_clip)
 
 
 # ============================================================================
@@ -1283,11 +1280,10 @@ def main():
         print(f"Other Accuracy:   {m['other_accuracy']:.4f} ({m['other_samples']} samples)")
     else:
         print(f"\nEvaluating on {args.split} set ({args.mode} mode)...")
-        results = strategy.evaluate(
-            model, data_loader,
-            use_combinations=args.use_combinations,
-            debug=args.debug
-        )
+        eval_kwargs = {"debug": args.debug}
+        if isinstance(strategy, CZSLEvaluationStrategy):
+            eval_kwargs["use_combinations"] = args.use_combinations
+        results = strategy.evaluate(model, data_loader, **eval_kwargs)
         strategy.print_metrics(results)
 
     # Save results
@@ -1305,7 +1301,7 @@ def main():
             metrics_to_save[key] = {k: v for k, v in results[key].items() if not isinstance(v, np.ndarray)}
         metrics_to_save["combined_accuracy"] = results["combined_accuracy"]
         metrics_to_save["total_samples"] = results["total_samples"]
-        label = "resnet18" if strategy.use_resnet18 else ("multishape" if strategy.use_multishape else "dual_branch")
+        label = strategy.backbone if hasattr(strategy, 'backbone') else "vit"
         with open(output_dir / f"{label}_results_{args.split}.json", 'w', encoding='utf-8') as f:
             json.dump(metrics_to_save, f, indent=2, ensure_ascii=False)
 

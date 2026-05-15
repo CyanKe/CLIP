@@ -1383,9 +1383,10 @@ class MultiShapePatchViTForDualBranch(nn.Module):
         image: torch.Tensor,
         text_tokens_deception: torch.Tensor,
         text_tokens_suppression: torch.Tensor,
-        time_signal: torch.Tensor = None
+        time_signal: torch.Tensor = None,
+        features_dict: dict = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """双分支前向传播"""
+        """双分支前向传播 (features_dict 用于与 DualBranchCLIPForCZSL 接口兼容)"""
         image_features = self.encode_image(image)
         text_features_deception = self.encode_text(text_tokens_deception)
         text_features_suppression = self.encode_text(text_tokens_suppression)
@@ -1396,8 +1397,8 @@ class MultiShapePatchViTForDualBranch(nn.Module):
 
         return image_features, text_features_deception, text_features_suppression
 
-    def forward(self, image, text_tokens_deception=None, text_tokens_suppression=None, time_signal=None):
-        return self.forward_dual(image, text_tokens_deception, text_tokens_suppression, time_signal)
+    def forward(self, image, text_tokens_deception=None, text_tokens_suppression=None, time_signal=None, features_dict=None):
+        return self.forward_dual(image, text_tokens_deception, text_tokens_suppression, time_signal, features_dict)
 
     @torch.no_grad()
     def cache_text_features_dual(self, use_translation: bool = False):

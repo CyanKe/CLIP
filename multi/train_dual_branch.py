@@ -9,7 +9,7 @@ python -m multi.train_dual_branch --config multi/config.yaml
 配置示例 (使用多形状 Patch ViT):
 ```yaml
 model:
-  use_multishape_vit: true
+  backbone: "multishape_vit"
   patch_sizes: [[8, 32], [32, 8], [16, 16]]
   embed_dim: 512
   depth: 6
@@ -87,13 +87,27 @@ class DualBranchTrainer:
         )
         print(f"Using DualBranchContrastiveLoss")
 
+        # 类别名称 (用于 per-class accuracy 输出)
+        jamming_groups = config.get("jamming_groups", {})
+        self.deception_class_names = jamming_groups.get("deception", {}).get(
+            "classes", ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"]
+        ) + ["无欺骗干扰"]
+        self.suppression_class_names = jamming_groups.get("suppression", {}).get(
+            "classes", ["AJ", "BJ", "SJ", "NCJ", "NPJ", "NFMJ", "NPMJ", "NAMJ", "PJ"]
+        ) + ["无压制干扰"]
+
     def train_epoch(self, debug: bool = False) -> dict:
         """训练一个 epoch"""
         self.model.train()
         total_loss = 0.0
-        total_correct_deception = 0
-        total_correct_suppression = 0
+        total_subset_correct_d = 0   # Subset Accuracy (标签集合完全匹配)
+        total_subset_correct_s = 0
+        total_jaccard_d = 0.0        # Jaccard Similarity 累加
+        total_jaccard_s = 0.0
         total_samples = 0
+        # per-class 统计
+        per_class_correct_d = None
+        per_class_correct_s = None
 
         train_bar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1} [Train]")
 
@@ -153,7 +167,7 @@ class DualBranchTrainer:
 
             total_loss += loss.item() * batch_size
 
-            # 计算准确率 (对角线准确率作为参考)
+            # 计算准确率 (Subset + Jaccard, 基于标签匹配)
             with torch.no_grad():
                 # 兼容两种模型结构
                 if hasattr(self.model, 'model'):
@@ -161,16 +175,48 @@ class DualBranchTrainer:
                 else:
                     logit_scale = self.model.logit_scale.exp()
 
-                # 欺骗分支准确率
-                logits_deception = logit_scale * (image_features @ text_features_deception.t())
-                targets = torch.arange(batch_size, device=self.device)
-                pred_deception = logits_deception.argmax(dim=1)
-                total_correct_deception += (pred_deception == targets).sum().item()
+                batch_indices = torch.arange(batch_size, device=self.device)
 
-                # 压制分支准确率
+                # --- 欺骗分支 ---
+                logits_deception = logit_scale * (image_features @ text_features_deception.t())
+                pred_deception = logits_deception.argmax(dim=1)
+                pred_labels_d = labels_deception[pred_deception]
+                true_labels_d = labels_deception[batch_indices]
+
+                # Subset Accuracy: 标签集合完全匹配
+                match_d = (pred_labels_d == true_labels_d).all(dim=1)
+                total_subset_correct_d += match_d.sum().item()
+
+                # Jaccard Similarity: |pred ∩ truth| / |pred ∪ truth|
+                intersection_d = (pred_labels_d * true_labels_d).sum(dim=1)
+                union_d = (pred_labels_d + true_labels_d).clamp(0, 1).sum(dim=1)
+                jaccard_d = intersection_d / union_d.clamp(min=1e-8)
+                total_jaccard_d += jaccard_d.sum().item()
+
+                # Per-class correct
+                per_class_match_d = (pred_labels_d == true_labels_d).float().sum(dim=0)
+                if per_class_correct_d is None:
+                    per_class_correct_d = torch.zeros_like(per_class_match_d)
+                per_class_correct_d += per_class_match_d
+
+                # --- 压制分支 ---
                 logits_suppression = logit_scale * (image_features @ text_features_suppression.t())
                 pred_suppression = logits_suppression.argmax(dim=1)
-                total_correct_suppression += (pred_suppression == targets).sum().item()
+                pred_labels_s = labels_suppression[pred_suppression]
+                true_labels_s = labels_suppression[batch_indices]
+
+                match_s = (pred_labels_s == true_labels_s).all(dim=1)
+                total_subset_correct_s += match_s.sum().item()
+
+                intersection_s = (pred_labels_s * true_labels_s).sum(dim=1)
+                union_s = (pred_labels_s + true_labels_s).clamp(0, 1).sum(dim=1)
+                jaccard_s = intersection_s / union_s.clamp(min=1e-8)
+                total_jaccard_s += jaccard_s.sum().item()
+
+                per_class_match_s = (pred_labels_s == true_labels_s).float().sum(dim=0)
+                if per_class_correct_s is None:
+                    per_class_correct_s = torch.zeros_like(per_class_match_s)
+                per_class_correct_s += per_class_match_s
 
                 total_samples += batch_size
 
@@ -178,8 +224,12 @@ class DualBranchTrainer:
 
         return {
             "loss": total_loss / len(self.train_loader.dataset),
-            "accuracy_deception": total_correct_deception / total_samples,
-            "accuracy_suppression": total_correct_suppression / total_samples
+            "subset_acc_deception": total_subset_correct_d / total_samples,
+            "subset_acc_suppression": total_subset_correct_s / total_samples,
+            "jaccard_deception": total_jaccard_d / total_samples,
+            "jaccard_suppression": total_jaccard_s / total_samples,
+            "per_class_acc_deception": (per_class_correct_d / total_samples).cpu().tolist(),
+            "per_class_acc_suppression": (per_class_correct_s / total_samples).cpu().tolist(),
         }
 
     @torch.no_grad()
@@ -187,9 +237,13 @@ class DualBranchTrainer:
         """验证"""
         self.model.eval()
         total_loss = 0.0
-        total_correct_deception = 0
-        total_correct_suppression = 0
+        total_subset_correct_d = 0
+        total_subset_correct_s = 0
+        total_jaccard_d = 0.0
+        total_jaccard_s = 0.0
         total_samples = 0
+        per_class_correct_d = None
+        per_class_correct_s = None
 
         val_bar = tqdm(self.val_loader, desc=f"Epoch {self.current_epoch + 1} [Val]")
 
@@ -236,21 +290,52 @@ class DualBranchTrainer:
 
             total_loss += loss.item() * batch_size
 
-            # 计算准确率
+            # 计算准确率 (Subset + Jaccard, 基于标签匹配)
             # 兼容两种模型结构
             if hasattr(self.model, 'model'):
                 logit_scale = self.model.model.logit_scale.exp()
             else:
                 logit_scale = self.model.logit_scale.exp()
-            targets = torch.arange(batch_size, device=self.device)
 
+            batch_indices = torch.arange(batch_size, device=self.device)
+
+            # --- 欺骗分支 ---
             logits_deception = logit_scale * (image_features @ text_features_deception.t())
             pred_deception = logits_deception.argmax(dim=1)
-            total_correct_deception += (pred_deception == targets).sum().item()
+            pred_labels_d = labels_deception[pred_deception]
+            true_labels_d = labels_deception[batch_indices]
 
+            match_d = (pred_labels_d == true_labels_d).all(dim=1)
+            total_subset_correct_d += match_d.sum().item()
+
+            intersection_d = (pred_labels_d * true_labels_d).sum(dim=1)
+            union_d = (pred_labels_d + true_labels_d).clamp(0, 1).sum(dim=1)
+            jaccard_d = intersection_d / union_d.clamp(min=1e-8)
+            total_jaccard_d += jaccard_d.sum().item()
+
+            per_class_match_d = (pred_labels_d == true_labels_d).float().sum(dim=0)
+            if per_class_correct_d is None:
+                per_class_correct_d = torch.zeros_like(per_class_match_d)
+            per_class_correct_d += per_class_match_d
+
+            # --- 压制分支 ---
             logits_suppression = logit_scale * (image_features @ text_features_suppression.t())
             pred_suppression = logits_suppression.argmax(dim=1)
-            total_correct_suppression += (pred_suppression == targets).sum().item()
+            pred_labels_s = labels_suppression[pred_suppression]
+            true_labels_s = labels_suppression[batch_indices]
+
+            match_s = (pred_labels_s == true_labels_s).all(dim=1)
+            total_subset_correct_s += match_s.sum().item()
+
+            intersection_s = (pred_labels_s * true_labels_s).sum(dim=1)
+            union_s = (pred_labels_s + true_labels_s).clamp(0, 1).sum(dim=1)
+            jaccard_s = intersection_s / union_s.clamp(min=1e-8)
+            total_jaccard_s += jaccard_s.sum().item()
+
+            per_class_match_s = (pred_labels_s == true_labels_s).float().sum(dim=0)
+            if per_class_correct_s is None:
+                per_class_correct_s = torch.zeros_like(per_class_match_s)
+            per_class_correct_s += per_class_match_s
 
             total_samples += batch_size
 
@@ -258,8 +343,12 @@ class DualBranchTrainer:
 
         return {
             "loss": total_loss / len(self.val_loader.dataset),
-            "accuracy_deception": total_correct_deception / total_samples,
-            "accuracy_suppression": total_correct_suppression / total_samples
+            "subset_acc_deception": total_subset_correct_d / total_samples,
+            "subset_acc_suppression": total_subset_correct_s / total_samples,
+            "jaccard_deception": total_jaccard_d / total_samples,
+            "jaccard_suppression": total_jaccard_s / total_samples,
+            "per_class_acc_deception": (per_class_correct_d / total_samples).cpu().tolist(),
+            "per_class_acc_suppression": (per_class_correct_s / total_samples).cpu().tolist(),
         }
 
     def save_checkpoint(self, metrics: dict, is_best: bool = False):
@@ -308,23 +397,47 @@ class DualBranchTrainer:
 
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
             print(f"  Train - Loss: {train_metrics['loss']:.4f}, "
-                  f"Deception Acc: {train_metrics['accuracy_deception']:.4f}, "
-                  f"Suppression Acc: {train_metrics['accuracy_suppression']:.4f}")
+                  f"Subset(D): {train_metrics['subset_acc_deception']:.4f}, "
+                  f"Subset(S): {train_metrics['subset_acc_suppression']:.4f}, "
+                  f"Jaccard(D): {train_metrics['jaccard_deception']:.4f}, "
+                  f"Jaccard(S): {train_metrics['jaccard_suppression']:.4f}")
             print(f"  Val   - Loss: {val_metrics['loss']:.4f}, "
-                  f"Deception Acc: {val_metrics['accuracy_deception']:.4f}, "
-                  f"Suppression Acc: {val_metrics['accuracy_suppression']:.4f}")
+                  f"Subset(D): {val_metrics['subset_acc_deception']:.4f}, "
+                  f"Subset(S): {val_metrics['subset_acc_suppression']:.4f}, "
+                  f"Jaccard(D): {val_metrics['jaccard_deception']:.4f}, "
+                  f"Jaccard(S): {val_metrics['jaccard_suppression']:.4f}")
+
+            # 打印 per-class accuracy (仅第一个 epoch 和最后一个)
+            if epoch == 0 or epoch == num_epochs - 1:
+                for branch_name, class_names, per_class_acc in [
+                    ("Deception", self.deception_class_names, val_metrics["per_class_acc_deception"]),
+                    ("Suppression", self.suppression_class_names, val_metrics["per_class_acc_suppression"]),
+                ]:
+                    print(f"  Val Per-Class ({branch_name}):")
+                    for name, acc in zip(class_names, per_class_acc):
+                        print(f"    {name:12s}: {acc:.4f}")
 
             if self.use_wandb:
-                wandb.log({
+                wandb_log = {
                     "epoch": epoch + 1,
                     "lr": self.scheduler.get_last_lr()[0],
                     "train_loss": train_metrics["loss"],
-                    "train_acc_deception": train_metrics["accuracy_deception"],
-                    "train_acc_suppression": train_metrics["accuracy_suppression"],
+                    "train_subset_acc_deception": train_metrics["subset_acc_deception"],
+                    "train_subset_acc_suppression": train_metrics["subset_acc_suppression"],
+                    "train_jaccard_deception": train_metrics["jaccard_deception"],
+                    "train_jaccard_suppression": train_metrics["jaccard_suppression"],
                     "val_loss": val_metrics["loss"],
-                    "val_acc_deception": val_metrics["accuracy_deception"],
-                    "val_acc_suppression": val_metrics["accuracy_suppression"]
-                })
+                    "val_subset_acc_deception": val_metrics["subset_acc_deception"],
+                    "val_subset_acc_suppression": val_metrics["subset_acc_suppression"],
+                    "val_jaccard_deception": val_metrics["jaccard_deception"],
+                    "val_jaccard_suppression": val_metrics["jaccard_suppression"],
+                }
+                # 添加 per-class accuracy 到 wandb
+                for i, name in enumerate(self.deception_class_names):
+                    wandb_log[f"val_per_class_d_{name}"] = val_metrics["per_class_acc_deception"][i]
+                for i, name in enumerate(self.suppression_class_names):
+                    wandb_log[f"val_per_class_s_{name}"] = val_metrics["per_class_acc_suppression"][i]
+                wandb.log(wandb_log)
 
             is_best = val_metrics["loss"] < self.best_val_loss
             if is_best:
@@ -406,7 +519,7 @@ def main():
 
     # 选择模型类型
     model_config = config.get("model", {})
-    use_multishape = args.use_multishape or model_config.get("use_multishape_vit", False)
+    use_multishape = args.use_multishape or model_config.get("backbone", "vit") == "multishape_vit"
 
     if use_multishape:
         print("\nCreating Multi-Shape Patch ViT Dual-Branch model...")

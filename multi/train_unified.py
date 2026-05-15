@@ -2,18 +2,18 @@
 统一训练脚本 - 通过 config.yaml 控制训练模式
 python -m multi.train_unified --config multi/config.yaml
 
-支持模式 (train.mode):
-  - "czsl": 对比学习模式 (CLIP/MultiShapeViT)
-  - "dual_branch": 双分支模式 (CLIP双分支/MultiShapeViT双分支/ResNet18双分支)
+配置方式:
+  model.backbone: "vit" | "multishape_vit" | "resnet18"
+  model.dual_branch: true (双分支) / false (单分支对比学习)
 
-模型选择 (无需改 mode，通过现有 config key 自动分发):
-  CZSL 模式:
-    - model.use_multishape_vit=false → CLIP
-    - model.use_multishape_vit=true  → MultiShapeViT
-  Dual-Branch 模式:
-    - model.use_resnet18=true        → ResNet18 双分支分类
-    - model.use_multishape_vit=true  → MultiShapeViT 双分支
-    - 其他                           → CLIP 双分支
+模型分发:
+  dual_branch=false:
+    - backbone="vit"            → CLIP 对比学习
+    - backbone="multishape_vit" → MultiShapeViT 对比学习
+  dual_branch=true:
+    - backbone="vit"            → CLIP 双分支
+    - backbone="multishape_vit" → MultiShapeViT 双分支
+    - backbone="resnet18"       → ResNet18 双分支分类
 """
 import os
 import sys
@@ -198,10 +198,10 @@ class CZSLStrategy(TrainingStrategy):
         super().__init__(config, device)
         model_config = config.get("model", {})
         self.model_type = model_config.get("clip_model", "ViT-B/32")
-        self.use_multishape = model_config.get("use_multishape_vit", False)
+        self.backbone = model_config.get("backbone", "vit")
 
     def create_model(self) -> nn.Module:
-        if self.use_multishape:
+        if self.backbone == "multishape_vit":
             from multi.rectangular_patch_vit import create_multi_shape_patch_model
             print("Creating Multi-Shape Patch ViT CZSL model...")
             return create_multi_shape_patch_model(self.config, device=str(self.device))
@@ -321,14 +321,14 @@ class CZSLStrategy(TrainingStrategy):
         }
 
     def checkpoint_prefix(self) -> str:
-        return "multishape_vit_" if self.use_multishape else "czsl_"
+        return "multishape_vit_" if self.backbone == "multishape_vit" else "czsl_"
 
     def wandb_run_name(self) -> str:
-        prefix = "MultiShapeViT" if self.use_multishape else "CZSL"
+        prefix = "MultiShapeViT" if self.backbone == "multishape_vit" else "CZSL"
         return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     def wandb_tags(self) -> List[str]:
-        if self.use_multishape:
+        if self.backbone == "multishape_vit":
             return ["MultiShapeViT", "early_fusion"]
         return ["CZSL", "InfoNCE"]
 
@@ -350,15 +350,14 @@ class DualBranchStrategy(TrainingStrategy):
     def __init__(self, config: dict, device: torch.device):
         super().__init__(config, device)
         model_config = config.get("model", {})
-        self.use_multishape = model_config.get("use_multishape_vit", False)
-        self.use_resnet18 = model_config.get("use_resnet18", False)
+        self.backbone = model_config.get("backbone", "vit")
 
     def create_model(self) -> nn.Module:
-        if self.use_resnet18:
+        if self.backbone == "resnet18":
             from multi.model import create_resnet18_dual_branch_model
             print("Creating ResNet18 dual-branch model...")
             return create_resnet18_dual_branch_model(self.config, device=str(self.device))
-        elif self.use_multishape:
+        elif self.backbone == "multishape_vit":
             from multi.rectangular_patch_vit import create_multi_shape_dual_branch_model
             print("Creating Multi-Shape Patch ViT dual-branch model...")
             return create_multi_shape_dual_branch_model(self.config, device=str(self.device))
@@ -378,7 +377,7 @@ class DualBranchStrategy(TrainingStrategy):
         )
 
     def create_loss(self, model: nn.Module) -> nn.Module:
-        if self.use_resnet18:
+        if self.backbone == "resnet18":
             print("Using CrossEntropyLoss for both branches")
             return DualBranchClassificationLoss()
         else:
@@ -393,7 +392,7 @@ class DualBranchStrategy(TrainingStrategy):
             return loss_fn
 
     def cache_text_features(self, model: nn.Module) -> None:
-        if not self.use_resnet18:
+        if not self.backbone == "resnet18":
             model.cache_text_features_dual()
 
     def prepare_batch(self, batch_data: tuple) -> dict:
@@ -408,7 +407,7 @@ class DualBranchStrategy(TrainingStrategy):
 
         result = {"images": images, "labels_deception": lab_d, "labels_suppression": lab_s}
 
-        if not self.use_resnet18:
+        if not self.backbone == "resnet18":
             result["text_tokens_deception"] = tok_d.to(self.device)
             result["text_tokens_suppression"] = tok_s.to(self.device)
         else:
@@ -420,7 +419,7 @@ class DualBranchStrategy(TrainingStrategy):
     def forward_pass(self, model: nn.Module, batch: dict, loss_fn: nn.Module) -> StepResult:
         batch_size = batch["images"].size(0)
 
-        if self.use_resnet18:
+        if self.backbone == "resnet18":
             logits_d, logits_s = model(batch["images"])
             loss, _ = loss_fn(logits_d, logits_s, batch["labels_deception_idx"], batch["labels_suppression_idx"])
             return StepResult(
@@ -465,7 +464,7 @@ class DualBranchStrategy(TrainingStrategy):
         with torch.no_grad():
             logits = result.logits_for_metrics
             bs = result.batch_size
-            if self.use_resnet18:
+            if self.backbone == "resnet18":
                 acc["total_correct_deception"] += (logits["logits_d"].argmax(1) == batch["labels_deception_idx"]).sum().item()
                 acc["total_correct_suppression"] += (logits["logits_s"].argmax(1) == batch["labels_suppression_idx"]).sum().item()
             else:
@@ -482,16 +481,16 @@ class DualBranchStrategy(TrainingStrategy):
         }
 
     def checkpoint_prefix(self) -> str:
-        if self.use_resnet18:
+        if self.backbone == "resnet18":
             return "resnet18_dual_branch_"
-        elif self.use_multishape:
+        elif self.backbone == "multishape_vit":
             return "multishape_dual_branch_"
         return "dual_branch_"
 
     def wandb_run_name(self) -> str:
-        if self.use_resnet18:
+        if self.backbone == "resnet18":
             prefix = "ResNet18DualBranch"
-        elif self.use_multishape:
+        elif self.backbone == "multishape_vit":
             prefix = "MultiShapeDualBranch"
         else:
             prefix = "DualBranch"
@@ -515,13 +514,11 @@ class DualBranchStrategy(TrainingStrategy):
 # ============================================================================
 
 def create_strategy(config: dict, device: torch.device) -> TrainingStrategy:
-    mode = config.get("train", {}).get("mode", "czsl")
-    if mode == "czsl":
-        return CZSLStrategy(config, device)
-    elif mode == "dual_branch":
+    dual_branch = config.get("model", {}).get("dual_branch", False)
+    if dual_branch:
         return DualBranchStrategy(config, device)
     else:
-        raise ValueError(f"Unknown train.mode: '{mode}'. Expected 'czsl' or 'dual_branch'.")
+        return CZSLStrategy(config, device)
 
 
 # ============================================================================
