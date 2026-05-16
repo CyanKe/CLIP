@@ -4,7 +4,8 @@
 
 用法:
   python -m multi.train_feature_only --config multi/config.yaml
-  python -m multi.train_feature_only --config multi/config.yaml --eval_only --checkpoint path/to/model.pt
+  python -m multi.train_feature_only --config multi/config.yaml --eval_only --checkpoint path/to/model.pt --split test
+  python -m multi.train_feature_only --config multi/config.yaml --eval_only --checkpoint path/to/model.pt --split val
 
 架构:
   22-dim features → FeatureConditionedPromptLearner → context vectors [B, M, D]
@@ -28,6 +29,14 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -71,10 +80,13 @@ class FeatureOnlyModel(nn.Module):
             nn.Linear(classifier_hidden, num_classes),
         )
 
-    def forward(self, features_dict: dict) -> torch.Tensor:
+    def forward(self, features_dict: dict, return_features: bool = False):
         context = self.prompt_learner(features_dict)  # [B, M, D]
         pooled = context.mean(dim=1)                   # [B, D]
-        return self.classifier(pooled)                 # [B, num_classes]
+        logits = self.classifier(pooled)               # [B, num_classes]
+        if return_features:
+            return logits, pooled
+        return logits
 
 
 # ============================================================================
@@ -300,16 +312,21 @@ def train_epoch(model, dataloader, loss_fn, optimizer, device):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, loss_fn, device):
+def evaluate(model, dataloader, loss_fn, device, return_details: bool = False):
     model.eval()
     total_loss, total_correct, total_samples = 0.0, 0, 0
     all_preds, all_labels = [], []
+    all_features = [] if return_details else None
 
     for features_dict, labels in tqdm(dataloader, desc="Eval"):
         features_dict = {k: v.to(device) for k, v in features_dict.items()}
         labels = labels.to(device)
 
-        logits = model(features_dict)
+        if return_details:
+            logits, feats = model(features_dict, return_features=True)
+            all_features.append(feats.cpu().numpy())
+        else:
+            logits = model(features_dict)
         loss = loss_fn(logits, labels)
 
         total_loss += loss.item() * labels.size(0)
@@ -330,9 +347,12 @@ def evaluate(model, dataloader, loss_fn, device):
         tp = ((all_preds[:, c] == 1) & (all_labels[:, c] == 1)).sum()
         fp = ((all_preds[:, c] == 1) & (all_labels[:, c] == 0)).sum()
         fn = ((all_preds[:, c] == 0) & (all_labels[:, c] == 1)).sum()
+        tn = ((all_preds[:, c] == 0) & (all_labels[:, c] == 0)).sum()
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
-        per_class[c] = {"precision": precision, "recall": recall, "f1": 2 * precision * recall / (precision + recall + 1e-8)}
+        per_class[c] = {"tp": tp, "fp": fp, "fn": fn, "tn": tn,
+                        "precision": precision, "recall": recall,
+                        "f1": 2 * precision * recall / (precision + recall + 1e-8)}
 
     # Micro/macro F1
     tp_all = ((all_preds == 1) & (all_labels == 1)).sum()
@@ -344,12 +364,262 @@ def evaluate(model, dataloader, loss_fn, device):
 
     macro_f1 = np.mean([per_class[c]["f1"] for c in range(all_labels.shape[1])])
 
-    return {
+    result = {
         "loss": total_loss / total_samples,
         "exact_match": total_correct / total_samples,
         "micro_f1": micro_f1,
         "macro_f1": macro_f1,
     }
+    if return_details:
+        result["all_preds"] = all_preds
+        result["all_labels"] = all_labels
+        result["all_features"] = np.concatenate(all_features)
+        result["per_class"] = per_class
+    return result
+
+
+# ============================================================================
+# Confusion Matrix
+# ============================================================================
+
+def plot_confusion_matrices(
+    all_preds: np.ndarray,
+    all_labels: np.ndarray,
+    class_names: List[str],
+    save_path: str,
+    title_prefix: str = "",
+):
+    """为每个类别绘制 2×2 混淆矩阵，并汇总为多标签概览图
+
+    Args:
+        all_preds:  [N, C] 二值预测
+        all_labels: [N, C] 真实标签
+        class_names: 类别名称列表
+        save_path: 图片保存路径
+        title_prefix: 标题前缀 (e.g. "Test" / "Val")
+    """
+    if not HAS_MPL:
+        print("Warning: matplotlib not available, skipping confusion matrix plot.")
+        return
+
+    n_classes = len(class_names)
+    ncols = 4
+    nrows = (n_classes + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+    axes = axes.flatten() if n_classes > 1 else [axes]
+
+    for c in range(n_classes):
+        ax = axes[c]
+        tp = ((all_preds[:, c] == 1) & (all_labels[:, c] == 1)).sum()
+        fp = ((all_preds[:, c] == 1) & (all_labels[:, c] == 0)).sum()
+        fn = ((all_preds[:, c] == 0) & (all_labels[:, c] == 1)).sum()
+        tn = ((all_preds[:, c] == 0) & (all_labels[:, c] == 0)).sum()
+
+        cm = np.array([[tn, fp], [fn, tp]])
+        im = ax.imshow(cm, cmap='Blues', vmin=0)
+
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, f"{cm[i, j]}", ha='center', va='center',
+                        fontsize=11, fontweight='bold',
+                        color='white' if cm[i, j] > cm.max() * 0.5 else 'black')
+
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(['Neg', 'Pos'], fontsize=9)
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(['Neg', 'Pos'], fontsize=9)
+        ax.set_xlabel('Predicted', fontsize=9)
+        ax.set_ylabel('Actual', fontsize=9)
+
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+        ax.set_title(f"{class_names[c]}\nF1={f1:.3f} P={precision:.3f} R={recall:.3f}", fontsize=10)
+
+    # 隐藏多余子图
+    for c in range(n_classes, len(axes)):
+        axes[c].set_visible(False)
+
+    fig.suptitle(f"{title_prefix} Per-Class Confusion Matrices", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Confusion matrices saved to {save_path}")
+
+
+def plot_combined_confusion_matrix(
+    all_preds: np.ndarray,
+    all_labels: np.ndarray,
+    class_names: List[str],
+    save_path: str,
+    title_prefix: str = "",
+):
+    """汇总混淆矩阵: C×C 矩阵，行=真实类别，列=预测类别
+
+    对于多标签，每个样本可能有多个正类。这里统计：
+    行 i，列 j = 真实类别 i 被预测为类别 j 的次数（共现/混淆统计）
+    """
+    if not HAS_MPL:
+        return
+
+    n_classes = len(class_names)
+    co_occur = np.zeros((n_classes, n_classes), dtype=np.float64)
+
+    for c_true in range(n_classes):
+        mask_true = all_labels[:, c_true] == 1
+        if mask_true.sum() == 0:
+            continue
+        preds_for_true = all_preds[mask_true]
+        co_occur[c_true] = preds_for_true.sum(axis=0) / mask_true.sum()
+
+    fig, ax = plt.subplots(figsize=(max(10, n_classes * 0.8), max(8, n_classes * 0.7)))
+    im = ax.imshow(co_occur, cmap='YlOrRd', vmin=0, vmax=1)
+
+    for i in range(n_classes):
+        for j in range(n_classes):
+            ax.text(j, i, f"{co_occur[i, j]:.2f}", ha='center', va='center',
+                    fontsize=8, color='white' if co_occur[i, j] > 0.5 else 'black')
+
+    ax.set_xticks(range(n_classes))
+    ax.set_xticklabels(class_names, rotation=45, ha='right', fontsize=9)
+    ax.set_yticks(range(n_classes))
+    ax.set_yticklabels(class_names, fontsize=9)
+    ax.set_xlabel('Predicted', fontsize=11)
+    ax.set_ylabel('Actual', fontsize=11)
+    ax.set_title(f"{title_prefix} Label Co-occurrence / Confusion\n(row=actual, col=predicted, values=ratio)", fontsize=13, fontweight='bold')
+    plt.colorbar(im, ax=ax, shrink=0.8)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Combined confusion matrix saved to {save_path}")
+
+
+# ============================================================================
+# t-SNE Visualization
+# ============================================================================
+
+def plot_tsne(
+    features: np.ndarray,
+    labels: np.ndarray,
+    class_names: List[str],
+    save_path: str,
+    title_prefix: str = "",
+    max_samples: int = 3000,
+    perplexity: float = 30.0,
+):
+    """t-SNE 可视化学习到的特征表示
+
+    生成两种图:
+    1. 按主要类别着色 (primary class = 第一个正标签)
+    2. 每类高亮图 (positive vs negative)
+
+    Args:
+        features: [N, D] 特征向量
+        labels:  [N, C] 多热标签
+        class_names: 类别名称列表
+        save_path: 保存路径 (会衍生 _perclass 图)
+        title_prefix: 标题前缀
+        max_samples: t-SNE 最大样本数 (超过则随机采样)
+        perplexity: t-SNE perplexity 参数
+    """
+    if not HAS_MPL:
+        print("Warning: matplotlib not available, skipping t-SNE.")
+        return
+
+    try:
+        from sklearn.manifold import TSNE
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        print("Warning: sklearn not available, skipping t-SNE.")
+        return
+
+    N = features.shape[0]
+    if N > max_samples:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(N, max_samples, replace=False)
+        features = features[idx]
+        labels = labels[idx]
+        N = max_samples
+
+    print(f"  Running t-SNE on {N} samples (perplexity={perplexity})...")
+
+    # Standardize
+    feats_scaled = StandardScaler().fit_transform(features)
+
+    # t-SNE
+    tsne = TSNE(n_components=2, perplexity=min(perplexity, N - 1),
+                random_state=42, verbose=0)
+    feats_2d = tsne.fit_transform(feats_scaled)
+
+    n_classes = len(class_names)
+    cmap = plt.cm.tab10
+
+    # Determine primary class per sample
+    primary = np.full(N, -1, dtype=int)
+    for i in range(N):
+        pos = np.where(labels[i] == 1)[0]
+        primary[i] = pos[0] if len(pos) > 0 else -1
+    has_label = primary >= 0
+
+    # ---- Plot 1: colored by primary class ----
+    fig, ax = plt.subplots(figsize=(11, 9))
+    unique_classes = sorted(set(primary[has_label]))
+
+    for c in unique_classes:
+        mask = primary == c
+        ax.scatter(feats_2d[mask, 0], feats_2d[mask, 1],
+                   c=[cmap(c % 10)], label=class_names[c],
+                   s=8, alpha=0.6, edgecolors='none')
+
+    # Unlabeled
+    if (~has_label).sum() > 0:
+        ax.scatter(feats_2d[~has_label, 0], feats_2d[~has_label, 1],
+                   c='gray', label='No label', s=8, alpha=0.3, edgecolors='none')
+
+    ax.legend(loc='lower left', fontsize=7, markerscale=2, ncol=2)
+    ax.set_title(f"{title_prefix} t-SNE by Primary Class (perplexity={perplexity})", fontsize=13, fontweight='bold')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"  t-SNE (primary class) saved to {save_path}")
+
+    # ---- Plot 2: per-class highlight grid ----
+    ncols = 4
+    nrows = (n_classes + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows))
+    axes = axes.flatten()
+
+    for c in range(n_classes):
+        ax = axes[c]
+        pos_mask = labels[:, c] == 1
+        neg_mask = ~pos_mask
+
+        # Negative samples (background)
+        ax.scatter(feats_2d[neg_mask, 0], feats_2d[neg_mask, 1],
+                   c='lightgray', s=3, alpha=0.3, edgecolors='none')
+        # Positive samples (highlighted)
+        ax.scatter(feats_2d[pos_mask, 0], feats_2d[pos_mask, 1],
+                   c=[cmap(c % 10)], s=12, alpha=0.7, edgecolors='none',
+                   label=f'{class_names[c]} (n={pos_mask.sum()})')
+
+        ax.set_title(f"{class_names[c]}", fontsize=10, fontweight='bold')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.legend(fontsize=7, loc='upper right')
+
+    for c in range(n_classes, len(axes)):
+        axes[c].set_visible(False)
+
+    fig.suptitle(f"{title_prefix} t-SNE Per-Class Highlight (perplexity={perplexity})", fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    perclass_path = save_path.replace('.png', '_perclass.png')
+    plt.savefig(perclass_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"  t-SNE (per-class) saved to {perclass_path}")
 
 
 # ============================================================================
@@ -366,6 +636,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--eval_only", action="store_true")
+    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"],
+                        help="Which split to evaluate on (default: test)")
     parser.add_argument("--checkpoint", type=str, default=None, help="Resume/load checkpoint")
     parser.add_argument("--output_dir", type=str, default="checkpoints/feature_only")
     args = parser.parse_args()
@@ -423,14 +695,36 @@ def main():
 
     # Eval only
     if args.eval_only:
-        print("\n=== Evaluation Only ===")
-        eval_loader = test_loader or val_loader
-        if eval_loader is None:
-            print("No evaluation data found!")
+        print(f"\n=== Evaluation Only (split={args.split}) ===")
+        split_loader = {"train": train_loader, "val": val_loader, "test": test_loader}.get(args.split)
+        if split_loader is None:
+            print(f"No {args.split} data found! Make sure the split exists in the data.")
             return
-        metrics = evaluate(model, eval_loader, loss_fn, device)
-        for k, v in metrics.items():
-            print(f"  {k}: {v:.4f}")
+
+        metrics = evaluate(model, split_loader, loss_fn, device, return_details=True)
+        for k in ["loss", "exact_match", "micro_f1", "macro_f1"]:
+            print(f"  {k}: {metrics[k]:.4f}")
+
+        # Confusion matrices
+        if HAS_MPL:
+            cm_dir = Path(args.output_dir)
+            cm_dir.mkdir(parents=True, exist_ok=True)
+            prefix = args.split.capitalize()
+            plot_confusion_matrices(
+                metrics["all_preds"], metrics["all_labels"],
+                class_names, str(cm_dir / f"confusion_per_class_{args.split}.png"),
+                title_prefix=prefix,
+            )
+            plot_combined_confusion_matrix(
+                metrics["all_preds"], metrics["all_labels"],
+                class_names, str(cm_dir / f"confusion_combined_{args.split}.png"),
+                title_prefix=prefix,
+            )
+            plot_tsne(
+                metrics["all_features"], metrics["all_labels"],
+                class_names, str(cm_dir / f"tsne_{args.split}.png"),
+                title_prefix=prefix,
+            )
         return
 
     # Training loop
@@ -474,9 +768,26 @@ def main():
     # Final test evaluation
     print("\n=== Final Test Evaluation ===")
     if test_loader:
-        test_metrics = evaluate(model, test_loader, loss_fn, device)
-        for k, v in test_metrics.items():
-            print(f"  {k}: {v:.4f}")
+        test_metrics = evaluate(model, test_loader, loss_fn, device, return_details=True)
+        for k in ["loss", "exact_match", "micro_f1", "macro_f1"]:
+            print(f"  {k}: {test_metrics[k]:.4f}")
+
+        if HAS_MPL:
+            plot_confusion_matrices(
+                test_metrics["all_preds"], test_metrics["all_labels"],
+                class_names, str(output_dir / "confusion_per_class_test.png"),
+                title_prefix="Test",
+            )
+            plot_combined_confusion_matrix(
+                test_metrics["all_preds"], test_metrics["all_labels"],
+                class_names, str(output_dir / "confusion_combined_test.png"),
+                title_prefix="Test",
+            )
+            plot_tsne(
+                test_metrics["all_features"], test_metrics["all_labels"],
+                class_names, str(output_dir / "tsne_test.png"),
+                title_prefix="Test",
+            )
     else:
         print("No test data available.")
 
