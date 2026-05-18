@@ -277,3 +277,45 @@ czsl:
     use_combinations: true   # 是否使用组合特征
     max_combination_size: 2  # 最大组合大小
     threshold: 0.14      # 多标签预测阈值
+
+# ============================================================================
+# STFT 数据增强配置 — 用于抑制 shortcut learning
+# 总开关: augmentation.enabled
+# 增强在 __getitem__ 中 CLIP 标准化之后应用于单张图像 [C, H, W]
+# 仅在训练集生效, 验证/测试集不受影响
+# ============================================================================
+augmentation:
+  enabled: false                  # 总开关
+
+  # 1. SpecAugment — 时频带掩码 (最稳定, 物理意义最明确)
+  specaugment:
+    enabled: false
+    time_mask_param: 0.1          # 时间掩码最大宽度 (占 H 的比例)
+    freq_mask_param: 0.1          # 频率掩码最大宽度 (占 W 的比例)
+    num_time_masks: 2             # 时间掩码条数
+    num_freq_masks: 2             # 频率掩码条数
+    mask_value: 0.0               # 填充值 (0 = CLIP 归一化后的均值)
+    p: 1.0                        # 应用概率
+
+  # 2. Patch-Level Random Masking — ViT patch-grid 对齐的整块掩码
+  patch_mask:
+    enabled: false
+    patch_size: [16, 16]          # patch 尺寸 (独立于 model.patch_sizes 配置)
+    mask_ratio: 0.3               # 掩码 patch 的比例 (0.0-1.0)
+    mask_value: 0.0
+    p: 1.0
+
+  # 3. Energy-Aware Masking — 针对高能量欺骗前景的概率掩码
+  energy_mask:
+    enabled: false
+    top_percentile: 20.0          # 高能量百分位阈值 (如前 20% = 80th percentile 以上)
+    mask_prob: 0.8                # 对高能量像素的掩码概率 (推荐 0.5~0.8, 不要设 1.0)
+    mask_value: 0.0
+    p: 1.0
+
+  # 4. Asymmetric Augmentation — 对纯压制样本施加更强增强
+  asymmetric:
+    enabled: false
+    mode: "stronger_mask"         # stronger_mask | loss_weight (loss_weight 留作未来扩展)
+    extra_patch_mask_ratio: 0.2   # 纯压制样本额外增加的 patch mask 比例
+    extra_specaug_ratio: 0.05     # 纯压制样本额外增加的 specaug 参数比例

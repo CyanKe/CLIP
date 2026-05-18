@@ -179,6 +179,7 @@ class STFTDataset(Dataset):
         features_file: str = None,
         feature_norm_stats: dict = None,
         use_feature_context: bool = False,
+        augmentation: object = None,
     ):
         """
         Args:
@@ -199,6 +200,7 @@ class STFTDataset(Dataset):
         self.metadata_file = metadata_file
         self.stft_var_name = stft_var_name
         self.use_feature_context = use_feature_context
+        self.augmentation = augmentation
 
         # 延迟加载 STFT 样本数
         with h5py.File(stft_file, 'r') as f:
@@ -418,17 +420,26 @@ class STFTDataset(Dataset):
                 align_corners=False
             ).squeeze(0)
 
+        # 6b. 保存 CLIP 标准化前的能量图 (用于 Energy-Aware Masking)
+        energy_map = None
+        if self.augmentation is not None:
+            energy_map = stft_tensor[0].clone()  # [H, W], 值域约 [0, 1]
+
         # 7. CLIP 标准化
         if self.clip_norm is not None:
             stft_tensor = self.clip_norm(stft_tensor)
 
-        # 8. 从预构建的标签数组获取标签
-        label_tensor = torch.from_numpy(self._labels[index])
-
-        # 9. 获取 metadata (用于生成文本描述)
+        # 8. 获取 metadata (用于文本描述和数据增强)
         metadata = self._get_metadata(index)
 
-        # 10. 获取多域特征 (如果启用)
+        # 9. 数据增强 (在 CLIP 标准化之后, mean≈0 所以 mask=0 表示无信息)
+        if self.augmentation is not None:
+            stft_tensor, _ = self.augmentation(stft_tensor, metadata=metadata, energy_map=energy_map)
+
+        # 10. 从预构建的标签数组获取标签
+        label_tensor = torch.from_numpy(self._labels[index])
+
+        # 11. 获取多域特征 (如果启用)
         if self.use_feature_context:
             features = self._get_features(index)
             return stft_tensor, label_tensor, metadata, features
@@ -461,6 +472,7 @@ class DualBranchSTFTDataset(Dataset):
         suppression_classes: list = None,
         normalize_mode: str = 'per_sample',
         normalize_method: str = 'p99',
+        augmentation: object = None,
     ):
         """
         Args:
@@ -509,6 +521,7 @@ class DualBranchSTFTDataset(Dataset):
         self.apply_clip_norm = apply_clip_norm
         self.normalize_mode = normalize_mode
         self.normalize_method = normalize_method
+        self.augmentation = augmentation
 
         if apply_clip_norm:
             self.clip_norm = transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
@@ -624,16 +637,25 @@ class DualBranchSTFTDataset(Dataset):
                 align_corners=False
             ).squeeze(0)
 
+        # 保存 CLIP 标准化前的能量图 (用于 Energy-Aware Masking)
+        energy_map = None
+        if self.augmentation is not None:
+            energy_map = stft_tensor[0].clone()  # [H, W], 值域约 [0, 1]
+
         # CLIP 标准化
         if self.clip_norm is not None:
             stft_tensor = self.clip_norm(stft_tensor)
 
+        # 获取 metadata (用于文本描述和数据增强)
+        metadata = self._get_metadata(index)
+
+        # 数据增强 (在 CLIP 标准化之后, mean≈0 所以 mask=0 表示无信息)
+        if self.augmentation is not None:
+            stft_tensor, _ = self.augmentation(stft_tensor, metadata=metadata, energy_map=energy_map)
+
         # 获取双分支标签
         label_deception = torch.from_numpy(self._labels_deception[index])
         label_suppression = torch.from_numpy(self._labels_suppression[index])
-
-        # 获取 metadata
-        metadata = self._get_metadata(index)
 
         return stft_tensor, label_deception, label_suppression, metadata
 
@@ -724,8 +746,18 @@ def create_dual_branch_dataloaders(
     deception_classes = jamming_groups.get("deception", {}).get("classes", ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"])
     suppression_classes = jamming_groups.get("suppression", {}).get("classes", ["AJ", "BJ", "SJ", "NCJ", "NPJ", "NFMJ", "NPMJ", "NAMJ", "PJ"])
 
+    # 构建数据增强 (仅训练集)
+    train_aug = None
+    aug_config = config.get('augmentation', {})
+    if aug_config.get('enabled', False):
+        from multi.augmentation import STFTAugmentation
+        train_aug = STFTAugmentation(aug_config)
+        print(f"Data augmentation enabled: {[k for k, v in aug_config.items() if isinstance(v, dict) and v.get('enabled')]}")
+
     def load_split(split_name: str, required: bool = True):
         datasets = []
+        # 仅训练集使用增强
+        aug = train_aug if split_name == 'train' else None
 
         for jnr in jnr_levels:
             jnr_folder = f"JNR_{'+' if jnr >= 0 else ''}{jnr}"
@@ -748,6 +780,7 @@ def create_dual_branch_dataloaders(
                 normalization_stats=normalization_stats,
                 deception_classes=deception_classes,
                 suppression_classes=suppression_classes,
+                augmentation=aug,
             )
             datasets.append(dataset)
             print(f"Loaded {split_name} data from {jnr_folder}: {len(dataset)} samples")
@@ -857,8 +890,17 @@ def create_czsl_dataloaders(
     # 类别名称
     class_names = [cls['name'] for cls in config.get('jamming_classes', [])]
 
+    # 构建数据增强 (仅训练集)
+    train_aug = None
+    aug_config = config.get('augmentation', {})
+    if aug_config.get('enabled', False):
+        from multi.augmentation import STFTAugmentation
+        train_aug = STFTAugmentation(aug_config)
+        print(f"Data augmentation enabled: {[k for k, v in aug_config.items() if isinstance(v, dict) and v.get('enabled')]}")
+
     # 加载所有 JNR 级别的数据
     def load_split(split_name: str, required: bool = True):
+        aug = train_aug if split_name == 'train' else None
         """加载单个 split 的数据集
 
         Args:
@@ -895,6 +937,7 @@ def create_czsl_dataloaders(
                 features_file=features_file if use_feature_context else None,
                 feature_norm_stats=feature_norm_stats,
                 use_feature_context=use_feature_context,
+                augmentation=aug,
             )
             datasets.append(stft_dataset)
             print(f"Loaded {split_name} data from {jnr_folder}: {len(stft_dataset)} samples")
