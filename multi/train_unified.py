@@ -271,9 +271,12 @@ class CZSLStrategy(TrainingStrategy):
     def forward_pass(self, model: nn.Module, batch: dict, loss_fn: nn.Module) -> StepResult:
         from multi.loss import LabelAwareInfoNCELoss, MultiLabelSigmoidLoss
 
+        extra_kwargs = {}
+        if batch.get("features") is not None:
+            extra_kwargs["features_dict"] = batch["features"]
         image_features, text_features = model(
             batch["images"], batch["text_tokens"], batch["time_signals"],
-            features_dict=batch.get("features"),
+            **extra_kwargs,
         )
         labels = batch["labels"]
         batch_size = batch["images"].size(0)

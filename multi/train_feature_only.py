@@ -44,11 +44,52 @@ from multi.prompt_learner import FeatureConditionedPromptLearner
 
 
 # ============================================================================
-# FeatureOnlyModel
+# Models
 # ============================================================================
 
-class FeatureOnlyModel(nn.Module):
-    """仅使用信号特征进行分类，不依赖 STFT 图像
+class PlainMLPModel(nn.Module):
+    """Plain MLP baseline: 22-dim → 2-layer MLP → logits
+
+    不做 domain 分离，不做 context token 膨胀，直接全连接。
+    使用 LayerNorm（非 BatchNorm）避免多标签小批次统计不稳定。
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.hidden_dim = hidden_dim
+
+        self.fc1 = nn.Linear(22, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.drop1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.drop2 = nn.Dropout(dropout)
+        self.head = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, features_dict: dict, return_features: bool = False):
+        # Concat 5 domains → [B, 22]
+        flat = torch.cat([
+            features_dict[d]
+            for d in FeatureConditionedPromptLearner.DOMAIN_ORDER
+        ], dim=1)
+
+        h = self.drop1(F.relu(self.ln1(self.fc1(flat))))
+        h = self.drop2(F.relu(self.ln2(self.fc2(h))))
+        logits = self.head(h)
+
+        if return_features:
+            return logits, h
+        return logits
+
+
+class MetaNetModel(nn.Module):
+    """Meta-Net 模型（保留作对比）
 
     22维信号特征 → FeatureConditionedPromptLearner (Meta-Net)
     → context vectors [B, M, D] → mean pool → [B, D]
@@ -58,9 +99,9 @@ class FeatureOnlyModel(nn.Module):
     def __init__(
         self,
         num_classes: int,
-        context_dim: int = 512,
+        context_dim: int = 128,
         n_ctx_per_domain: dict = None,
-        classifier_hidden: int = 256,
+        classifier_hidden: int = 128,
         dropout: float = 0.3,
     ):
         super().__init__()
@@ -70,7 +111,6 @@ class FeatureOnlyModel(nn.Module):
         self.prompt_learner = FeatureConditionedPromptLearner(
             transformer_width=context_dim,
             n_ctx_per_domain=n_ctx_per_domain,
-            hidden_dim=context_dim // 2,
         )
 
         self.classifier = nn.Sequential(
@@ -94,6 +134,7 @@ class FeatureOnlyModel(nn.Module):
 # ============================================================================
 
 FEATURE_DOMAINS = {
+    
     'time': {
         'prefix': 'time_domain',
         'keys': ['skewness', 'kurtosis', 'envelope_variation', 'modulation_bandwidth', 'modulation_rate'],
@@ -286,7 +327,7 @@ def build_dataloaders(config: dict) -> Tuple[DataLoader, DataLoader, Optional[Da
 # Train / Eval
 # ============================================================================
 
-def train_epoch(model, dataloader, loss_fn, optimizer, device):
+def train_epoch(model, dataloader, loss_fn, optimizer, device, threshold: float = 0.5):
     model.train()
     total_loss, total_correct, total_samples = 0.0, 0, 0
 
@@ -301,7 +342,7 @@ def train_epoch(model, dataloader, loss_fn, optimizer, device):
         optimizer.step()
 
         total_loss += loss.item() * labels.size(0)
-        preds = (torch.sigmoid(logits) > 0.5).float()
+        preds = (torch.sigmoid(logits) > threshold).float()
         total_correct += (preds == labels).all(dim=1).sum().item()
         total_samples += labels.size(0)
 
@@ -312,10 +353,11 @@ def train_epoch(model, dataloader, loss_fn, optimizer, device):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, loss_fn, device, return_details: bool = False):
+def evaluate(model, dataloader, loss_fn, device, return_details: bool = False, threshold: float = 0.5):
     model.eval()
     total_loss, total_correct, total_samples = 0.0, 0, 0
     all_preds, all_labels = [], []
+    all_probs = [] if return_details else None
     all_features = [] if return_details else None
 
     for features_dict, labels in tqdm(dataloader, desc="Eval"):
@@ -331,9 +373,14 @@ def evaluate(model, dataloader, loss_fn, device, return_details: bool = False):
 
         total_loss += loss.item() * labels.size(0)
         probs = torch.sigmoid(logits)
-        preds = (probs > 0.5).float()
+        preds = (probs > threshold).float()
         total_correct += (preds == labels).all(dim=1).sum().item()
         total_samples += labels.size(0)
+
+        all_preds.append(preds.cpu().numpy())
+        all_labels.append(labels.cpu().numpy())
+        if return_details:
+            all_probs.append(probs.cpu().numpy())
 
         all_preds.append(preds.cpu().numpy())
         all_labels.append(labels.cpu().numpy())
@@ -374,7 +421,14 @@ def evaluate(model, dataloader, loss_fn, device, return_details: bool = False):
         result["all_preds"] = all_preds
         result["all_labels"] = all_labels
         result["all_features"] = np.concatenate(all_features)
+        result["all_probs"] = np.concatenate(all_probs)
         result["per_class"] = per_class
+        # Probability diagnostics
+        all_probs_arr = result["all_probs"]
+        result["prob_mean"] = float(all_probs_arr.mean())
+        result["prob_std"] = float(all_probs_arr.std())
+        result["prob_max"] = float(all_probs_arr.max())
+        result["pred_positive_rate"] = float(all_preds.mean())
     return result
 
 
@@ -494,6 +548,26 @@ def plot_combined_confusion_matrix(
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Combined confusion matrix saved to {save_path}")
+
+
+# ============================================================================
+# Raw Feature Collector (for t-SNE on original 22-dim features)
+# ============================================================================
+
+def collect_raw_features(dataloader: DataLoader, device: str = "cpu") -> Tuple[np.ndarray, np.ndarray]:
+    """从 DataLoader 收集展平的原始 22 维特征和标签
+
+    Returns:
+        raw_feats: [N, 22] 拼接的原始特征向量
+        all_labels: [N, C] 多热标签
+    """
+    all_feats, all_labels = [], []
+    for features_dict, labels in tqdm(dataloader, desc="Collecting raw features"):
+        # 按 DOMAIN_ORDER 拼接 → [B, 22]
+        flat = torch.cat([features_dict[d] for d in FeatureConditionedPromptLearner.DOMAIN_ORDER], dim=1)
+        all_feats.append(flat.numpy())
+        all_labels.append(labels.numpy())
+    return np.concatenate(all_feats), np.concatenate(all_labels)
 
 
 # ============================================================================
@@ -629,15 +703,21 @@ def plot_tsne(
 def main():
     parser = argparse.ArgumentParser(description="Feature-Only Training (no STFT)")
     parser.add_argument("--config", type=str, default="multi/config.yaml")
-    parser.add_argument("--context_dim", type=int, default=512, help="Prompt learner output dim")
-    parser.add_argument("--classifier_hidden", type=int, default=256)
-    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--model_type", type=str, default="mlp", choices=["mlp", "meta_net"],
+                        help="Model architecture: mlp (plain baseline) or meta_net")
+    parser.add_argument("--context_dim", type=int, default=128, help="[meta_net] Prompt learner output dim")
+    parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden layer dim")
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"],
                         help="Which split to evaluate on (default: test)")
+    parser.add_argument("--tsne_raw", action="store_true",
+                        help="Run t-SNE on raw 22-dim features (no model needed)")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Prediction threshold (default: from config or 0.5)")
     parser.add_argument("--checkpoint", type=str, default=None, help="Resume/load checkpoint")
     parser.add_argument("--output_dir", type=str, default="checkpoints/feature_only")
     args = parser.parse_args()
@@ -646,6 +726,12 @@ def main():
     import yaml
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+
+    # Threshold: CLI > config.evaluation.threshold > default 0.5
+    threshold = args.threshold
+    if threshold is None:
+        threshold = config.get("evaluation", {}).get("threshold", 0.5)
+    print(f"Prediction threshold: {threshold}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -656,28 +742,81 @@ def main():
     num_classes = len(class_names)
     print(f"Classes: {num_classes}")
 
+    # --- Data diagnostics ---
+    print("\n--- Data Diagnostics ---")
+    # Sample one batch to check feature stats
+    sample_batch, sample_labels = next(iter(train_loader))
+    flat_feats = torch.cat([sample_batch[d] for d in FeatureConditionedPromptLearner.DOMAIN_ORDER], dim=1)
+    print(f"  Feature shape: {list(flat_feats.shape)}")
+    print(f"  Feature value range: [{flat_feats.min().item():.3f}, {flat_feats.max().item():.3f}]")
+    print(f"  Feature std (mean): {flat_feats.std(dim=0).mean().item():.3f}")
+    # Label distribution
+    pos_counts = sample_labels.sum(dim=0)
+    print(f"  Label distribution (batch):")
+    for i, name in enumerate(class_names):
+        print(f"    {name:6s}: {int(pos_counts[i]):4d}")
+    print(f"  Total positive labels: {int(sample_labels.sum())} (avg {sample_labels.sum()/sample_labels.size(0):.1f} per sample)")
+    print("-----------------------------\n")
+
+    # Raw feature t-SNE (no model needed)
+    if args.tsne_raw:
+        print(f"\n=== t-SNE on Raw 22-dim Features (split={args.split}) ===")
+        split_loader = {"train": train_loader, "val": val_loader, "test": test_loader}.get(args.split)
+        if split_loader is None:
+            print(f"No {args.split} data found!")
+            return
+        raw_feats, raw_labels = collect_raw_features(split_loader)
+        print(f"  Raw features shape: {raw_feats.shape}, Labels shape: {raw_labels.shape}")
+        if HAS_MPL:
+            out_dir = Path(args.output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            prefix = f"{args.split.capitalize()} Raw Features"
+            plot_tsne(raw_feats, raw_labels, class_names,
+                      str(out_dir / f"tsne_raw_{args.split}.png"),
+                      title_prefix=prefix)
+        return
+
     # Model
-    n_ctx_config = config.get("n_ctx_per_domain", None)
-    model = FeatureOnlyModel(
-        num_classes=num_classes,
-        context_dim=args.context_dim,
-        n_ctx_per_domain=n_ctx_config,
-        classifier_hidden=args.classifier_hidden,
-        dropout=args.dropout,
-    ).to(device)
+    if args.model_type == "mlp":
+        model = PlainMLPModel(
+            num_classes=num_classes,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+        ).to(device)
+        print(f"Model: PlainMLP ({args.hidden_dim} hidden)")
+    else:
+        n_ctx_config = config.get("n_ctx_per_domain", None)
+        model = MetaNetModel(
+            num_classes=num_classes,
+            context_dim=args.context_dim,
+            n_ctx_per_domain=n_ctx_config,
+            classifier_hidden=args.hidden_dim,
+            dropout=args.dropout,
+        ).to(device)
+        print(f"Model: MetaNet (context_dim={args.context_dim})")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Params: {total_params:,} total, {trainable_params:,} trainable")
 
-    # Loss
-    loss_fn = nn.BCEWithLogitsLoss()
+    # Loss — compute pos_weight to handle class imbalance
+    # Count positives per class across all training data
+    pos_counts = torch.zeros(num_classes)
+    total_samples_train = 0
+    for _, labels in train_loader:
+        pos_counts += labels.sum(dim=0)
+        total_samples_train += labels.size(0)
+    neg_counts = total_samples_train - pos_counts
+    pos_weight = neg_counts / (pos_counts + 1e-8)  # higher weight for rare classes
+    pos_weight = pos_weight.to(device)
+    print(f"Pos weight (neg/pos per class): {[f'{w:.1f}' for w in pos_weight.tolist()]}")
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     # Optimizer & scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = args.epochs * len(train_loader)
     warmup_steps = min(500, total_steps // 5)
-    warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
+    warmup = LinearLR(optimizer, start_factor=0.5, total_iters=warmup_steps)
     cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
     scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
 
@@ -701,7 +840,7 @@ def main():
             print(f"No {args.split} data found! Make sure the split exists in the data.")
             return
 
-        metrics = evaluate(model, split_loader, loss_fn, device, return_details=True)
+        metrics = evaluate(model, split_loader, loss_fn, device, return_details=True, threshold=threshold)
         for k in ["loss", "exact_match", "micro_f1", "macro_f1"]:
             print(f"  {k}: {metrics[k]:.4f}")
 
@@ -733,14 +872,26 @@ def main():
     print(f"\nTraining {args.epochs} epochs, saving to {output_dir}")
 
     for epoch in range(start_epoch, args.epochs):
-        train_metrics = train_epoch(model, train_loader, loss_fn, optimizer, device)
+        train_metrics = train_epoch(model, train_loader, loss_fn, optimizer, device, threshold=threshold)
         scheduler.step()
 
-        val_metrics = evaluate(model, val_loader or train_loader, loss_fn, device)
+        val_metrics = evaluate(model, val_loader or train_loader, loss_fn, device,
+                               return_details=((epoch + 1) % 5 == 0 or epoch == 0),
+                               threshold=threshold)
 
-        print(f"Epoch {epoch+1}/{args.epochs} | "
-              f"Train loss={train_metrics['loss']:.4f} em={train_metrics['exact_match']:.4f} | "
-              f"Val loss={val_metrics['loss']:.4f} micro_f1={val_metrics['micro_f1']:.4f} macro_f1={val_metrics['macro_f1']:.4f}")
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            per_class = val_metrics.get("per_class", {})
+            f1s = [per_class[c]["f1"] for c in range(num_classes)]
+            print(f"Epoch {epoch+1}/{args.epochs} | "
+                  f"Train loss={train_metrics['loss']:.4f} em={train_metrics['exact_match']:.4f} | "
+                  f"Val loss={val_metrics['loss']:.4f} micro_f1={val_metrics['micro_f1']:.4f} macro_f1={val_metrics['macro_f1']:.4f}")
+            print(f"  Prob: mean={val_metrics.get('prob_mean', 0):.3f} max={val_metrics.get('prob_max', 0):.3f} pos_rate={val_metrics.get('pred_positive_rate', 0):.3f}")
+            print(f"  Per-class F1: " + " | ".join(
+                f"{class_names[c]}:{f1s[c]:.3f}" for c in range(num_classes)))
+        else:
+            print(f"Epoch {epoch+1}/{args.epochs} | "
+                  f"Train loss={train_metrics['loss']:.4f} em={train_metrics['exact_match']:.4f} | "
+                  f"Val loss={val_metrics['loss']:.4f} micro_f1={val_metrics['micro_f1']:.4f} macro_f1={val_metrics['macro_f1']:.4f}")
 
         current_f1 = val_metrics["micro_f1"]
 
@@ -768,7 +919,7 @@ def main():
     # Final test evaluation
     print("\n=== Final Test Evaluation ===")
     if test_loader:
-        test_metrics = evaluate(model, test_loader, loss_fn, device, return_details=True)
+        test_metrics = evaluate(model, test_loader, loss_fn, device, return_details=True, threshold=threshold)
         for k in ["loss", "exact_match", "micro_f1", "macro_f1"]:
             print(f"  {k}: {test_metrics[k]:.4f}")
 

@@ -16,11 +16,16 @@ class DomainMetaNet(nn.Module):
 
     每个 Domain 一个 2 层 MLP，将域特征映射为 n_ctx 个上下文 token。
     最后一层零初始化，保证训练初期 context 接近零向量，不破坏预训练表征。
+
+    hidden_dim 按输入维度自适应缩放: max(16, min(in_dim * 8, transformer_width))
+    避免小域（如 bispectrum 2维）产生过大隐层导致过拟合。
     """
 
     def __init__(self, in_dim: int, hidden_dim: int, n_ctx: int, transformer_width: int):
         super().__init__()
         self.n_ctx = n_ctx
+        if hidden_dim is None or hidden_dim <= 0:
+            hidden_dim = max(16, min(in_dim * 8, transformer_width))
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
@@ -72,13 +77,13 @@ class FeatureConditionedPromptLearner(nn.Module):
         self.n_ctx_per_domain = n_ctx_per_domain
         self.total_n_ctx = sum(n_ctx_per_domain.values())
 
-        hidden = hidden_dim or (transformer_width // 2)
-
+        # hidden_dim=None 时各域自适应: max(16, min(in_dim * 8, transformer_width))
+        # 传入具体值则所有域共用
         self.meta_nets = nn.ModuleDict()
         for domain in self.DOMAIN_ORDER:
             self.meta_nets[domain] = DomainMetaNet(
                 in_dim=self.DOMAIN_DIMS[domain],
-                hidden_dim=hidden,
+                hidden_dim=hidden_dim,
                 n_ctx=n_ctx_per_domain[domain],
                 transformer_width=transformer_width,
             )

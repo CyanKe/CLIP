@@ -6,12 +6,7 @@
 model:
   # CLIP 模型选项 (OpenAI):
   # - "ViT-B/32", "ViT-B/16", "ViT-L/14", "RN50", "RN101", "resnet18"
-  #
-  # SigLIP 模型选项 (HuggingFace):
-  # - "siglip-base-patch16-224"
-  # - "siglip-large-patch16-384"
-  # - "google/siglip-base-patch16-224" (完整名称)
-  clip_model: "siglip-base-patch16-224"
+  clip_model: "ViT-B/32"
 
   freeze_vision: false         # 设为 false 以启用部分解冻
   vision_layers_unfreeze: 2    # 只解冻视觉编码器最后2层
