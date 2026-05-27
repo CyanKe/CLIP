@@ -41,8 +41,8 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from multi.rectangular_patch_vit import MultiShapePatchViTForCZSL, create_multi_shape_patch_model
-from multi.data import create_czsl_dataloaders
-from multi.loss import create_loss_function, LabelAwareInfoNCELoss
+from multi.data import create_czsl_dataloaders, create_preprocessed_dataloaders
+from multi.loss import create_loss_function, LabelAwareInfoNCELoss, MultiLabelInfoNCELoss, MultiLabelSigmoidLoss
 
 
 class MultiShapeViTTrainer:
@@ -81,6 +81,8 @@ class MultiShapeViTTrainer:
         # 损失函数
         self.loss_fn = create_loss_function(config)
         self.use_label_aware_loss = isinstance(self.loss_fn, LabelAwareInfoNCELoss)
+        self.use_multilabel_infonce = isinstance(self.loss_fn, MultiLabelInfoNCELoss)
+        self.use_sigmoid_loss = isinstance(self.loss_fn, MultiLabelSigmoidLoss)
         print(f"Using loss function: {type(self.loss_fn).__name__}")
 
     def train_epoch(self, debug: bool = False) -> dict:
@@ -94,11 +96,18 @@ class MultiShapeViTTrainer:
 
         debug_done = False
         for batch_idx, batch_data in enumerate(train_bar):
-            if len(batch_data) == 6:
+            if len(batch_data) >= 7:
+                stft_images, time_signals, text_tokens, labels, texts, metas, features_batched = batch_data
+                has_time_signal = time_signals is not None
+            elif len(batch_data) == 6:
                 stft_images, time_signals, text_tokens, labels, texts, metas = batch_data
+                features_batched = None
+                has_time_signal = True
             else:
                 stft_images, text_tokens, labels, texts, metas = batch_data
                 time_signals = None
+                features_batched = None
+                has_time_signal = False
 
             stft_images = stft_images.to(self.device)
             text_tokens = text_tokens.to(self.device)
@@ -125,7 +134,10 @@ class MultiShapeViTTrainer:
             image_features, text_features = self.model(stft_images, text_tokens, time_signals)
 
             # 计算损失
-            if self.use_label_aware_loss:
+            if self.use_sigmoid_loss:
+                loss, logits_per_image, _ = self.loss_fn(image_features, text_features, labels)
+                logits_per_text = logits_per_image.T
+            elif self.use_label_aware_loss or self.use_multilabel_infonce:
                 loss, logits_per_image, _ = self.loss_fn(image_features, text_features, labels)
                 logits_per_text = logits_per_image.T
             else:
@@ -147,13 +159,14 @@ class MultiShapeViTTrainer:
 
             total_loss += loss.item() * batch_size
 
-            # 准确率
+            # 标签感知准确率（argmax 命中共享标签的样本即算正确）
             with torch.no_grad():
-                targets = torch.arange(batch_size, device=self.device)
+                labels_f = labels.float()
+                pos_mask = (labels_f @ labels_f.T) > 0
                 pred_i2t = logits_per_image.argmax(dim=1)
+                total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
                 pred_t2i = logits_per_text.argmax(dim=1)
-                total_correct += (pred_i2t == targets).sum().item()
-                total_correct += (pred_t2i == targets).sum().item()
+                total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
                 total_samples += batch_size * 2
 
             train_bar.set_postfix(loss=loss.item())
@@ -174,14 +187,22 @@ class MultiShapeViTTrainer:
         val_bar = tqdm(self.val_loader, desc=f"Epoch {self.current_epoch + 1} [Val]")
 
         for batch_data in val_bar:
-            if len(batch_data) == 6:
+            if len(batch_data) >= 7:
+                stft_images, time_signals, text_tokens, labels, texts, metas, features_batched = batch_data
+                has_time_signal = time_signals is not None
+            elif len(batch_data) == 6:
                 stft_images, time_signals, text_tokens, labels, texts, metas = batch_data
+                features_batched = None
+                has_time_signal = True
             else:
                 stft_images, text_tokens, labels, texts, metas = batch_data
                 time_signals = None
+                features_batched = None
+                has_time_signal = False
 
             stft_images = stft_images.to(self.device)
             text_tokens = text_tokens.to(self.device)
+            labels = labels.to(self.device)
 
             if stft_images.shape[-1] != 224:
                 stft_images = nn.functional.interpolate(
@@ -192,8 +213,11 @@ class MultiShapeViTTrainer:
 
             image_features, text_features = self.model(stft_images, text_tokens, time_signals)
 
-            if self.use_label_aware_loss:
-                loss, logits_per_image, _ = self.loss_fn(image_features, text_features, labels.to(self.device))
+            if self.use_sigmoid_loss:
+                loss, logits_per_image, _ = self.loss_fn(image_features, text_features, labels)
+                logits_per_text = logits_per_image.T
+            elif self.use_label_aware_loss or self.use_multilabel_infonce:
+                loss, logits_per_image, _ = self.loss_fn(image_features, text_features, labels)
                 logits_per_text = logits_per_image.T
             else:
                 logit_scale = self.model.logit_scale.exp()
@@ -207,11 +231,13 @@ class MultiShapeViTTrainer:
 
             total_loss += loss.item() * batch_size
 
-            targets = torch.arange(batch_size, device=self.device)
+            # 标签感知准确率
+            labels_f = labels.float()
+            pos_mask = (labels_f @ labels_f.T) > 0
             pred_i2t = logits_per_image.argmax(dim=1)
+            total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
             pred_t2i = logits_per_text.argmax(dim=1)
-            total_correct += (pred_i2t == targets).sum().item()
-            total_correct += (pred_t2i == targets).sum().item()
+            total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
             total_samples += batch_size * 2
 
             val_bar.set_postfix(loss=loss.item())
@@ -338,6 +364,7 @@ def main():
     parser.add_argument("--config", type=str, default="multi/config.yaml", help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--debug", action="store_true", help="Print debug info")
+    parser.add_argument("--preprocessed", action="store_true", help="Use preprocessed .pt files (run preprocess_stft.py first)")
     parser.add_argument("--patch-sizes", type=str, default=None, help="Override patch sizes, e.g., '8,32;32,8;16,16'")
     parser.add_argument("--fusion-mode", type=str, default="late_fusion", choices=["early_fusion", "late_fusion"])
     parser.add_argument("--embed-dim", type=int, default=512)
@@ -365,13 +392,22 @@ def main():
 
     # 创建数据加载器
     print("\nLoading datasets...")
-    train_loader, val_loader, test_loader, num_classes = create_czsl_dataloaders(
-        config=config,
-        batch_size=config.get("train", {}).get("batch_size", 16),
-        num_workers=config.get("data", {}).get("num_workers", 4),
-        pin_memory=config.get("data", {}).get("pin_memory", True),
-        load_test=False,
-    )
+    if args.preprocessed:
+        train_loader, val_loader, test_loader, num_classes = create_preprocessed_dataloaders(
+            config=config,
+            batch_size=config.get("train", {}).get("batch_size", 16),
+            num_workers=config.get("data", {}).get("num_workers", 4),
+            pin_memory=config.get("data", {}).get("pin_memory", True),
+            load_test=False,
+        )
+    else:
+        train_loader, val_loader, test_loader, num_classes = create_czsl_dataloaders(
+            config=config,
+            batch_size=config.get("train", {}).get("batch_size", 16),
+            num_workers=config.get("data", {}).get("num_workers", 4),
+            pin_memory=config.get("data", {}).get("pin_memory", True),
+            load_test=False,
+        )
 
     # 创建模型
     print("\nCreating Multi-Shape Patch ViT model...")

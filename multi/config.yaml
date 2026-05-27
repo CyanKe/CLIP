@@ -2,7 +2,7 @@
 # 组合零样本学习配置文件
 # ============================================================================
 
-# CLIP/SigLIP 模型配置
+# CLIP 模型配置
 model:
   # CLIP 模型选项 (OpenAI):
   # - "ViT-B/32", "ViT-B/16", "ViT-L/14", "RN50", "RN101", "resnet18"
@@ -40,7 +40,6 @@ train:
   grad_clip: 1.0
 
 # 损失函数配置
-# 注意：SigLIP 模型会自动使用 Sigmoid Loss，无需手动设置
 loss:
   type: "multilabel_infonce"   # label_aware_infonce, infonce, multilabel_infonce, asymmetric, bce
   temperature: 0.1             # 对比损失温度参数 (SigLIP 默认 0.1, CLIP 默认 0.07)
@@ -54,9 +53,9 @@ loss:
 
 # 数据配置
 data:
-  base_path: "D:/output/output/20us_single"
-  jnr_start: 0
-  jnr_end: 20
+  base_path: "D:/VScode/Jamming_signal_simulation/output/test"
+  jnr_start: 10
+  jnr_end: 10
   jnr_step: 5
   num_workers: 4
   pin_memory: true
@@ -290,8 +289,8 @@ augmentation:
   # 1. SpecAugment — 时频带掩码 (最稳定, 物理意义最明确)
   specaugment:
     enabled: false
-    time_mask_param: 0.1          # 时间掩码最大宽度 (占 H 的比例)
-    freq_mask_param: 0.1          # 频率掩码最大宽度 (占 W 的比例)
+    time_mask_param: 0.2          # 时间掩码最大宽度 (占 H 的比例)
+    freq_mask_param: 0.2          # 频率掩码最大宽度 (占 W 的比例)
     num_time_masks: 2             # 时间掩码条数
     num_freq_masks: 2             # 频率掩码条数
     mask_value: 0.0               # 填充值 (0 = CLIP 归一化后的均值)

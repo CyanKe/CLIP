@@ -27,36 +27,19 @@ def tokenize_texts(
     max_length: int = None
 ) -> torch.Tensor:
     """
-    统一的文本分词函数，支持 CLIP 和 SigLIP
+    统一的文本分词函数，支持 CLIP
 
     Args:
         texts: 文本列表
-        model_type: 模型类型 ("clip" 或 "siglip-xxx")
-        processor: SigLIP processor（SigLIP 模型需要）
+        model_type: 模型类型 ("clip")
         max_length: 最大序列长度（可选）
 
     Returns:
         tokens: token 张量 [batch_size, seq_len]
     """
-    if model_type.startswith("siglip"):
-        # SigLIP tokenization
-        from multi.siglip_loader import get_siglip_text_length
-
-        if max_length is None:
-            max_length = get_siglip_text_length(model_type)
-
-        encoded = processor(
-            text=texts,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=max_length
-        )
-        return encoded["input_ids"]
-    else:
-        # CLIP tokenization
-        import clip
-        return clip.tokenize(texts, truncate=True)
+    # CLIP tokenization
+    import clip
+    return clip.tokenize(texts, truncate=True)
 
 
 def collate_fn(batch):
@@ -104,7 +87,7 @@ def collate_fn(batch):
 
 
 def _collate_fn(batch, model_type="clip", processor=None):
-    """Collate 函数，支持 CLIP 和 SigLIP tokenization（模块级别以便 pickle）"""
+    """Collate 函数，支持 CLIP tokenization（模块级别以便 pickle）"""
     from multi.text_templates import generate_text_descriptions
 
     # 检测样本格式
@@ -138,11 +121,10 @@ def _collate_fn(batch, model_type="clip", processor=None):
 
 def create_collate_fn(model_type: str = "clip", processor=None):
     """
-    创建支持 CLIP 或 SigLIP 的 collate 函数
+    创建支持 CLIP 或  的 collate 函数
 
     Args:
-        model_type: 模型类型 ("clip" 或 "siglip-xxx")
-        processor: SigLIP processor（SigLIP 模型需要）
+        model_type: 模型类型 ("clip")
 
     Returns:
         collate 函数
@@ -180,6 +162,7 @@ class STFTDataset(Dataset):
         feature_norm_stats: dict = None,
         use_feature_context: bool = False,
         augmentation: object = None,
+        return_raw_mag: bool = False,
     ):
         """
         Args:
@@ -193,6 +176,7 @@ class STFTDataset(Dataset):
             features_file: 多域特征 .json 文件路径 (可选)
             feature_norm_stats: 特征归一化统计量 (可选)
             use_feature_context: 是否启用特征条件上下文
+            return_raw_mag: 是否额外返回 CLIP 标准化前的幅度图
         """
         super().__init__()
 
@@ -201,10 +185,12 @@ class STFTDataset(Dataset):
         self.stft_var_name = stft_var_name
         self.use_feature_context = use_feature_context
         self.augmentation = augmentation
+        self.return_raw_mag = return_raw_mag
 
-        # 延迟加载 STFT 样本数
+        # 一次性加载全部 STFT 数据到内存，避免逐 slice 的 HDF5 随机磁盘 I/O
         with h5py.File(stft_file, 'r') as f:
-            self.num_samples = f[stft_var_name].shape[2]
+            self._all_stfts = f[stft_var_name][()]
+            self.num_samples = self._all_stfts.shape[2]
 
         self.class_names = class_names or []
         self.num_classes = len(class_names)
@@ -239,9 +225,6 @@ class STFTDataset(Dataset):
             self.clip_norm = transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
         else:
             self.clip_norm = None
-
-        # 延迟加载的文件句柄
-        self._h5_file = None
 
         # 特征条件上下文
         self._raw_features = None
@@ -349,12 +332,6 @@ class STFTDataset(Dataset):
 
         return labels
 
-    def _lazy_load(self):
-        """延迟加载 h5 文件 (每个 worker 独立)"""
-        if self._h5_file is None:
-            self._h5_file = h5py.File(self.stft_file, 'r')
-        return self._h5_file
-
     def __len__(self):
         return self.num_samples
 
@@ -371,10 +348,8 @@ class STFTDataset(Dataset):
         return None
 
     def __getitem__(self, index: int):
-        h5_file = self._lazy_load()
-
-        # 1. 读取 STFT 数据 (structured complex64)
-        raw_stft = h5_file[self.stft_var_name][:, :, index]
+        # 1. 读取 STFT 数据 (structured complex64) — 纯内存切片，无磁盘 I/O
+        raw_stft = self._all_stfts[:, :, index]
 
         # 2. 转换为复数
         stft_complex = raw_stft['real'] + 1j * raw_stft['imag']
@@ -420,10 +395,9 @@ class STFTDataset(Dataset):
                 align_corners=False
             ).squeeze(0)
 
-        # 6b. 保存 CLIP 标准化前的能量图 (用于 Energy-Aware Masking)
-        energy_map = None
-        if self.augmentation is not None:
-            energy_map = stft_tensor[0].clone()  # [H, W], 值域约 [0, 1]
+        # 6b. 保存 CLIP 标准化前的幅度图 (用于 Energy-Aware Masking 或 STFT 预览)
+        raw_mag = stft_tensor[0].clone()  # [H, W], 值域约 [0, 1]
+        energy_map = raw_mag if self.augmentation is not None else None
 
         # 7. CLIP 标准化
         if self.clip_norm is not None:
@@ -442,9 +416,83 @@ class STFTDataset(Dataset):
         # 11. 获取多域特征 (如果启用)
         if self.use_feature_context:
             features = self._get_features(index)
+            if self.return_raw_mag:
+                return stft_tensor, label_tensor, metadata, features, raw_mag
             return stft_tensor, label_tensor, metadata, features
         else:
+            if self.return_raw_mag:
+                return stft_tensor, label_tensor, metadata, raw_mag
             return stft_tensor, label_tensor, metadata
+
+
+class PreprocessedSTFTDataset(Dataset):
+    """
+    预处理 STFT 数据集 — 加载预处理好的 .pt 文件，零计算开销
+
+    与 STFTDataset 不同，此类不做任何归一化/缩放/percentile，
+    仅从预处理好的 .pt 文件索引已归一化的 tensor。
+
+    预处理脚本: multi/preprocess_stft.py
+    """
+
+    def __init__(
+        self,
+        preprocessed_file: str,
+        class_names: list = None,
+        augmentation: object = None,
+    ):
+        super().__init__()
+        self.preprocessed_file = preprocessed_file
+        self.augmentation = augmentation
+
+        data = torch.load(preprocessed_file, map_location='cpu', weights_only=False)
+        self._tensors = data['tensors']       # [N, 3, 224, 224] float16
+        self._metadata = data['metadata']     # list of dict
+
+        self.class_names = class_names or []
+        self.num_classes = len(class_names)
+        self.num_samples = len(self._metadata)
+
+        # 预构建标签
+        self._labels = self._build_labels()
+
+    def _build_labels(self):
+        labels = np.zeros((self.num_samples, self.num_classes), dtype=np.float32)
+        name_to_idx = {name: i for i, name in enumerate(self.class_names)}
+        for i, meta in enumerate(self._metadata):
+            jam_types = meta.get('jam_types', [])
+            if isinstance(jam_types, str):
+                jam_types = [jam_types] if jam_types else []
+            for jt in jam_types:
+                jt = jt.strip() if isinstance(jt, str) else str(jt)
+                if jt in name_to_idx:
+                    labels[i, name_to_idx[jt]] = 1.0
+        return labels
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, index: int):
+        stft_tensor = self._tensors[index].float()  # float16 → float32
+        label = torch.from_numpy(self._labels[index])
+        metadata = self._metadata[index].copy() if isinstance(self._metadata[index], dict) else self._metadata[index]
+
+        if self.augmentation is not None:
+            energy_map = stft_tensor[0].clone()
+            stft_tensor, _ = self.augmentation(stft_tensor, metadata=metadata, energy_map=energy_map)
+
+        return stft_tensor, label, metadata
+
+
+def collate_fn_preprocessed(batch):
+    """
+    Collate 函数 — 与 collate_fn 兼容但更简单（无需 tokenize，因为
+    tokenization 保留在 collate_fn 中处理，和之前一致）
+
+    实际直接复用 collate_fn，因为 PreprocessedSTFTDataset 返回
+    (stft_tensor, label, metadata) 与 STFTDataset (无 feature_context) 格式一致。
+    """
+    return collate_fn(batch)
 
 
 # ============================================================================
@@ -487,9 +535,10 @@ class DualBranchSTFTDataset(Dataset):
         self.metadata_file = metadata_file
         self.stft_var_name = stft_var_name
 
-        # 延迟加载 STFT 样本数
+        # 一次性加载全部 STFT 数据到内存，避免逐 slice 的 HDF5 随机磁盘 I/O
         with h5py.File(stft_file, 'r') as f:
-            self.num_samples = f[stft_var_name].shape[2]
+            self._all_stfts = f[stft_var_name][()]
+            self.num_samples = self._all_stfts.shape[2]
 
         # 干扰类型分组
         self.deception_classes = deception_classes or ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"]
@@ -527,8 +576,6 @@ class DualBranchSTFTDataset(Dataset):
             self.clip_norm = transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
         else:
             self.clip_norm = None
-
-        self._h5_file = None
 
     def _build_dual_branch_labels(self) -> tuple:
         """
@@ -583,11 +630,6 @@ class DualBranchSTFTDataset(Dataset):
 
         return labels_deception, labels_suppression
 
-    def _lazy_load(self):
-        if self._h5_file is None:
-            self._h5_file = h5py.File(self.stft_file, 'r')
-        return self._h5_file
-
     def __len__(self):
         return self.num_samples
 
@@ -602,10 +644,8 @@ class DualBranchSTFTDataset(Dataset):
         return None
 
     def __getitem__(self, index: int):
-        h5_file = self._lazy_load()
-
-        # 读取 STFT 数据
-        raw_stft = h5_file[self.stft_var_name][:, :, index]
+        # 读取 STFT 数据 — 纯内存切片，无磁盘 I/O
+        raw_stft = self._all_stfts[:, :, index]
         stft_complex = raw_stft['real'] + 1j * raw_stft['imag']
 
         # 归一化
@@ -855,8 +895,7 @@ def create_czsl_dataloaders(
         num_workers: 数据加载 worker 数
         pin_memory: 是否 pin memory
         load_test: 是否加载测试集
-        model_type: 模型类型 ("clip" 或 "siglip-xxx")
-        processor: SigLIP processor（SigLIP 模型需要）
+        model_type: 模型类型 ("clip")
 
     Returns:
         (train_loader, val_loader, test_loader, num_classes)
@@ -956,7 +995,7 @@ def create_czsl_dataloaders(
     val_dataset = load_split('val', required=True)
     test_dataset = load_split('test', required=False) if load_test else None
 
-    # 创建 collate 函数（支持 CLIP 和 SigLIP）
+    # 创建 collate 函数（支持 CLIP ）
     _collate_fn = create_collate_fn(model_type, processor)
 
     # 创建数据加载器
@@ -987,6 +1026,93 @@ def create_czsl_dataloaders(
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=_collate_fn,
+        )
+
+    return train_loader, val_loader, test_loader, len(class_names)
+
+
+def create_preprocessed_dataloaders(
+    config: dict,
+    batch_size: int = 16,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    load_test: bool = True,
+    model_type: str = "clip",
+    processor=None,
+) -> tuple:
+    """
+    创建基于预处理 .pt 文件的 CZSL 数据加载器
+
+    使用前需先运行:
+        python -m multi.preprocess_stft --config multi/config.yaml
+
+    预处理后的 __getitem__ 只需 tensor 索引 + float16→float32 转换，
+    无 h5py 读取 / percentile / interpolate / clip_norm，速度提升 10-20x。
+    """
+    data_config = config.get('data', {})
+    base_path = data_config.get('base_path')
+    jnr_start = data_config.get('jnr_start', 0)
+    jnr_end = data_config.get('jnr_end', 20)
+    jnr_step = data_config.get('jnr_step', 5)
+    stft_suffix = data_config.get('stft_suffix', 'echo_stfts')
+
+    jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
+    class_names = [cls['name'] for cls in config.get('jamming_classes', [])]
+
+    # 数据增强（仅训练集）
+    train_aug = None
+    aug_config = config.get('augmentation', {})
+    if aug_config.get('enabled', False):
+        from multi.augmentation import STFTAugmentation
+        train_aug = STFTAugmentation(aug_config)
+
+    def load_split(split_name: str, required: bool = True):
+        aug = train_aug if split_name == 'train' else None
+        datasets = []
+
+        for jnr in jnr_levels:
+            jnr_folder = f"JNR_{'+' if jnr >= 0 else ''}{jnr}"
+            data_folder = os.path.join(base_path, jnr_folder)
+            pt_file = os.path.join(data_folder, f'{split_name}_{stft_suffix}_preprocessed.pt')
+
+            if not os.path.exists(pt_file):
+                print(f"  Skip {jnr_folder}/{split_name} — not preprocessed. Run: python -m multi.preprocess_stft")
+                continue
+
+            dataset = PreprocessedSTFTDataset(
+                preprocessed_file=pt_file,
+                class_names=class_names,
+                augmentation=aug,
+            )
+            datasets.append(dataset)
+            print(f"Loaded preprocessed {split_name} from {jnr_folder}: {len(dataset)} samples")
+
+        if not datasets:
+            if required:
+                raise ValueError(f"No preprocessed data found for {split_name}! Run preprocess_stft first.")
+            return None
+
+        return ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+
+    train_dataset = load_split('train', required=True)
+    val_dataset = load_split('val', required=True)
+    test_dataset = load_split('test', required=False) if load_test else None
+
+    _collate_fn = create_collate_fn(model_type, processor)
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=pin_memory, collate_fn=_collate_fn,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=pin_memory, collate_fn=_collate_fn,
+    )
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=pin_memory, collate_fn=_collate_fn,
         )
 
     return train_loader, val_loader, test_loader, len(class_names)

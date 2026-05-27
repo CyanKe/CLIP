@@ -705,9 +705,9 @@ class DualBranchContrastiveLoss(nn.Module):
 
 class SigmoidLoss(nn.Module):
     """
-    SigLIP 风格的 Sigmoid Loss
+    SigLIP 风格的 Sigmoid Loss?
 
-    与 InfoNCE 不同，Sigmoid Loss:
+    与 InfoNCE 不同,Sigmoid Loss:
     - 使用二元交叉熵处理每个 (image, text) pair
     - 不需要对整个 batch 做 softmax
     - 训练更稳定，对 batch size 不敏感
@@ -727,7 +727,7 @@ class SigmoidLoss(nn.Module):
         Args:
             temperature: 温度参数
             learnable_temperature: 是否学习温度参数
-            initial_bias: 初始 logit bias（SigLIP 使用负值）
+            initial_bias: 初始 logit bias
         """
         super().__init__()
 
@@ -887,7 +887,7 @@ def create_loss_function(config: dict, model_type: str = "clip") -> nn.Module:
 
     Args:
         config: 配置字典
-        model_type: 模型类型 ("clip" 或 "siglip-xxx")
+        model_type: 模型类型 ("clip")
 
     Returns:
         损失函数实例
@@ -895,15 +895,6 @@ def create_loss_function(config: dict, model_type: str = "clip") -> nn.Module:
     loss_config = config.get("loss", {})
     loss_type = loss_config.get("type", "bce")
 
-    # SigLIP 模型自动使用 Sigmoid Loss
-    if model_type.startswith("siglip"):
-        print(f"Using MultiLabelSigmoidLoss for SigLIP model")
-        return MultiLabelSigmoidLoss(
-            temperature=loss_config.get("temperature", 0.1),
-            learnable_temperature=loss_config.get("learnable_temperature", True),
-            initial_bias=loss_config.get("initial_bias", -10.0),
-            similarity_metric=loss_config.get("similarity_metric", "iou")
-        )
 
     if loss_type == "infonce":
         return InfoNCELoss(

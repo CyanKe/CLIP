@@ -31,9 +31,9 @@ def build_augmentation(config):
     aug_cfg = config.get('augmentation', {}).copy()
     # 强制开启四项增强以展示完整效果
     aug_cfg['specaugment'] = dict(aug_cfg.get('specaugment', {}), enabled=True, p=1.0)
-    aug_cfg['patch_mask']  = dict(aug_cfg.get('patch_mask', {}),  enabled=True, p=1.0)
-    aug_cfg['energy_mask'] = dict(aug_cfg.get('energy_mask', {}), enabled=True, p=1.0)
-    aug_cfg['asymmetric']  = dict(aug_cfg.get('asymmetric', {}),  enabled=True)
+    aug_cfg['patch_mask']  = dict(aug_cfg.get('patch_mask', {}),  enabled=False, p=1.0)
+    aug_cfg['energy_mask'] = dict(aug_cfg.get('energy_mask', {}), enabled=False, p=1.0)
+    aug_cfg['asymmetric']  = dict(aug_cfg.get('asymmetric', {}),  enabled=False)
     return STFTAugmentation(aug_cfg)
 
 
@@ -72,7 +72,7 @@ def main():
             meta_list = json.load(f)
         for idx, meta in enumerate(meta_list):
             jt = meta.get('jam_types', ['?'])
-            key = tuple(sorted(jt)) if isinstance(jt, list) else str(jt)
+            key = tuple(sorted(jt)) if isinstance(jt, list) else (str(jt),)
             if key not in type_to_indices:
                 type_to_indices[key] = []
             type_to_indices[key].append((jnr, idx, stft_path, meta_path))

@@ -1,13 +1,14 @@
 """
-多形状 Patch ViT 推理脚本
+多形状 Patch ViT 评估脚本 — 支持多模式评估和可视化
 
-支持:
-- 零样本分类
-- 组合零样本学习 (CZSL)
-- 详细评估报告
+模式:
+  zero_shot      — 零样本组合识别评估
+  by_combination — Seen/Unseen 组合分类评估
+  by_jnr         — 按 JNR 级别分别评估
 
-使用方法:
-    python -m multi.evaluate_multishape_vit --checkpoint checkpoints/multishape_vit_best.pt --config multi/config.yaml
+用法:
+  python -m multi.evaluate_multishape_vit --checkpoint checkpoints/multishape_vit_best.pt --mode zero_shot
+  python -m multi.evaluate_multishape_vit --checkpoint checkpoints/multishape_vit_best.pt --mode by_jnr --visualize
 """
 import os
 import sys
@@ -15,18 +16,23 @@ import yaml
 import argparse
 import json
 from pathlib import Path
-from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
-from sklearn.metrics import classification_report, f1_score, precision_score, recall_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_curve, auc
+from sklearn.manifold import TSNE
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from multi.rectangular_patch_vit import MultiShapePatchViTForCZSL, create_multi_shape_patch_model
 from multi.data import create_czsl_dataloaders
+from multi.evaluate_czsl import (
+    plot_roc_curves, create_jnr_dataloaders, convert_combination_names_to_indices
+)
 
 
 class MultiShapeViTEvaluator:
@@ -35,402 +41,808 @@ class MultiShapeViTEvaluator:
     def __init__(
         self,
         model: MultiShapePatchViTForCZSL,
-        test_loader,
         device: torch.device,
-        config: dict
+        class_names: list,
+        seen_combinations: list = None,
+        unseen_combinations: list = None,
     ):
         self.model = model
-        self.test_loader = test_loader
         self.device = device
-        self.config = config
+        self.class_names = class_names
+        self.num_classes = len(class_names)
+        self.seen_combinations = seen_combinations or []
+        self.unseen_combinations = unseen_combinations or []
 
-        # 获取类别信息
-        self.class_names = model.class_names
-        self.num_classes = len(self.class_names)
-
-        # CZSL 配置
-        czsl_config = config.get("czsl", {})
-        self.seen_combinations = czsl_config.get("seen_combinations", [])
-        self.unseen_combinations = czsl_config.get("unseen_combinations", [])
-
+    # ── 模式 1: 零样本评估 ──────────────────────────────────────
     @torch.no_grad()
     def evaluate_zero_shot(
         self,
+        data_loader,
         use_combinations: bool = True,
-        threshold: float = 0.5
+        debug: bool = False,
     ) -> dict:
-        """
-        零样本评估
-
-        Args:
-            use_combinations: 是否使用组合特征
-            threshold: 多标签预测阈值
-
-        Returns:
-            评估结果字典
-        """
         self.model.eval()
 
-        # 缓存文本特征
-        self.model.cache_text_features(
-            max_combination_size=2,
-            include_single=True,
-            seen_combinations=self.seen_combinations
-        )
-
-        all_preds = []
         all_labels = []
-        all_similarities = []
+        all_preds = []
+        all_features = []
+        all_combination_correct = 0
+        all_multilabel_correct = 0
+        total_samples = 0
 
-        test_bar = tqdm(self.test_loader, desc="Zero-shot evaluation")
+        eval_bar = tqdm(data_loader, desc="Zero-Shot Evaluation")
 
-        for batch_data in test_bar:
-            if len(batch_data) == 6:
-                stft_images, time_signals, text_tokens, labels, texts, metas = batch_data
+        if debug:
+            print("\n" + "=" * 80)
+            print("[DEBUG] Cached text features for inference:")
+            print("=" * 80)
+            cached_names = self.model._combination_names if use_combinations else self.class_names
+            for i, name in enumerate(cached_names[:20]):
+                print(f"  [{i}] {name}")
+            if len(cached_names) > 20:
+                print(f"  ... ({len(cached_names) - 20} more)")
+            print("=" * 80 + "\n")
+
+        debug_done = False
+        for batch_idx, (images, _, text_tokens, labels, texts, metas, *_) in enumerate(eval_bar):
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+
+            if images.shape[-1] != 224:
+                images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+
+            batch_size = images.shape[0]
+            image_features = self.model.encode_image(images)
+            image_features = F.normalize(image_features, dim=-1)
+            all_features.append(image_features.cpu().numpy())
+
+            if use_combinations:
+                similarities, indices, pred_names = self.model.zero_shot_predict(
+                    images, use_combinations=True, top_k=1
+                )
+                preds = torch.zeros(batch_size, len(self.class_names), device=self.device)
+                for i, name in enumerate(pred_names):
+                    if name and len(name) > 0:
+                        parts = name[0].split('+')
+                        for part in parts:
+                            if part in self.class_names:
+                                preds[i, self.class_names.index(part)] = 1
             else:
-                stft_images, text_tokens, labels, texts, metas = batch_data
-                time_signals = None
+                text_features = self.model.get_cached_text_features()
+                logit_scale = self.model.logit_scale.exp()
+                logits = logit_scale * (image_features @ text_features.T)
+                probs = torch.softmax(logits, dim=-1)
+                threshold = 1.0 / self.num_classes
+                topk_values, topk_indices = torch.topk(probs, k=3, dim=-1)
+                preds = torch.zeros(batch_size, self.num_classes, device=self.device)
+                for b in range(batch_size):
+                    for j, idx in enumerate(topk_indices[b]):
+                        if topk_values[b, j] > threshold:
+                            preds[b, idx] = 1.0
 
-            stft_images = stft_images.to(self.device)
+            all_labels.append(labels.cpu())
+            all_preds.append(preds.cpu())
 
-            # 调整图像尺寸
-            if stft_images.shape[-1] != 224:
-                stft_images = F.interpolate(stft_images, size=(224, 224), mode='bilinear', align_corners=False)
+            if debug and not debug_done:
+                print("\n" + "=" * 80)
+                print(f"[DEBUG] Batch {batch_idx} — batch_size={batch_size}")
+                print("Predictions vs Labels:")
+                for i in range(min(5, batch_size)):
+                    true_idx = torch.where(labels[i] == 1)[0].tolist()
+                    pred_idx = torch.where(preds[i] == 1)[0].tolist()
+                    true_n = [self.class_names[j] for j in true_idx]
+                    pred_n = [self.class_names[j] for j in pred_idx]
+                    print(f"  [{i}] True: {true_n} | Pred: {pred_n}")
+                print("=" * 80 + "\n")
+                debug_done = True
 
-            # 零样本预测
-            similarities, indices, pred_names = self.model.zero_shot_predict(
-                stft_images,
-                time_signal=time_signals.to(self.device) if time_signals is not None else None,
-                use_combinations=use_combinations,
-                top_k=self.num_classes
-            )
+            for i in range(batch_size):
+                true_set = set(torch.where(labels[i] == 1)[0].tolist())
+                pred_set = set(torch.where(preds[i] == 1)[0].tolist())
+                if true_set == pred_set:
+                    all_combination_correct += 1
+                if true_set.issubset(pred_set) or pred_set.issubset(true_set):
+                    all_multilabel_correct += 1
+            total_samples += batch_size
 
-            all_similarities.append(similarities.cpu())
-            all_labels.append(labels)
+        all_labels_np = torch.cat(all_labels).numpy()
+        all_preds_np = torch.cat(all_preds).numpy()
+        all_features_np = np.concatenate(all_features, axis=0)
 
-        # 合并结果
-        all_similarities = torch.cat(all_similarities, dim=0)
-        all_labels = torch.cat(all_labels, dim=0)
-
-        # 获取预测文本特征
-        if use_combinations:
-            text_features = self.model.get_cached_combination_features()
-            names = self.model._combination_names
-        else:
-            text_features = self.model.get_cached_text_features()
-            names = self.class_names
-
-        # 计算多标签预测
-        logit_scale = self.model.logit_scale.exp()
-        logits = logit_scale * all_similarities
-
-        # 转换为单干扰类型预测
-        # 对于组合预测，需要分解为单个类别
-        preds_binary = torch.zeros(all_labels.shape[0], self.num_classes)
-
-        for i in range(all_similarities.shape[0]):
-            top_k_indices = torch.topk(all_similarities[i], k=5).indices
-            for idx in top_k_indices:
-                pred_name = names[idx]
-                if '+' in pred_name:
-                    # 组合预测
-                    parts = pred_name.split('+')
-                    for part in parts:
-                        if part in self.class_names:
-                            cls_idx = self.class_names.index(part)
-                            preds_binary[i, cls_idx] = 1
-                else:
-                    # 单类别预测
-                    if pred_name in self.class_names:
-                        cls_idx = self.class_names.index(pred_name)
-                        preds_binary[i, cls_idx] = 1
-
-        # 计算指标
-        labels_np = all_labels.numpy()
-        preds_np = preds_binary.numpy()
-
-        results = {
-            "hamming_accuracy": (preds_np == labels_np).mean(),
-            "exact_match": (preds_np == labels_np).all(axis=1).mean(),
-            "macro_f1": f1_score(labels_np, preds_np, average='macro', zero_division=0),
-            "micro_f1": f1_score(labels_np, preds_np, average='micro', zero_division=0),
-            "samples_f1": f1_score(labels_np, preds_np, average='samples', zero_division=0),
+        metrics = {
+            "combination_accuracy": all_combination_correct / total_samples,
+            "partial_match_accuracy": all_multilabel_correct / total_samples,
+            "f1_macro": f1_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
+            "f1_micro": f1_score(all_labels_np, all_preds_np, average='micro', zero_division=0),
+            "precision_macro": precision_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
+            "recall_macro": recall_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
         }
+        per_class_f1 = f1_score(all_labels_np, all_preds_np, average=None, zero_division=0)
+        metrics["per_class"] = {
+            "f1": per_class_f1,
+            "precision": precision_score(all_labels_np, all_preds_np, average=None, zero_division=0),
+            "recall": recall_score(all_labels_np, all_preds_np, average=None, zero_division=0),
+        }
+        return {"metrics": metrics, "labels": all_labels_np, "predictions": all_preds_np, "features": all_features_np}
 
-        # 每个类别的详细指标
-        per_class_metrics = {}
-        for i, cls_name in enumerate(self.class_names):
-            per_class_metrics[cls_name] = {
-                "precision": precision_score(labels_np[:, i], preds_np[:, i], zero_division=0),
-                "recall": recall_score(labels_np[:, i], preds_np[:, i], zero_division=0),
-                "f1": f1_score(labels_np[:, i], preds_np[:, i], zero_division=0),
-                "support": labels_np[:, i].sum()
-            }
-
-        results["per_class_metrics"] = per_class_metrics
-
-        return results
-
+    # ── 模式 2: 按组合类型评估 ──────────────────────────────────
     @torch.no_grad()
-    def evaluate_seen_unseen(
+    def evaluate_by_combination_type(
         self,
-        threshold: float = 0.5
+        data_loader,
+        debug: bool = False,
     ) -> dict:
-        """
-        分别评估 seen 和 unseen 组合的性能
-
-        Returns:
-            seen 和 unseen 的评估结果
-        """
         self.model.eval()
 
-        # 缓存文本特征
-        self.model.cache_text_features(
-            max_combination_size=2,
-            include_single=True,
-            seen_combinations=self.seen_combinations
-        )
+        seen_set = set(tuple(sorted(c)) for c in self.seen_combinations)
+        unseen_set = set(tuple(sorted(c)) for c in self.unseen_combinations)
 
-        # 解析 seen/unseen 组合
-        seen_set = set()
-        for combo in self.seen_combinations:
-            if len(combo) == 1:
-                seen_set.add(combo[0])
-            else:
-                seen_set.add('+'.join(sorted(combo)))
+        seen_results = {"correct": 0, "total": 0}
+        unseen_results = {"correct": 0, "total": 0}
+        other_results = {"correct": 0, "total": 0}
 
-        unseen_set = set()
-        for combo in self.unseen_combinations:
-            if len(combo) == 1:
-                unseen_set.add(combo[0])
-            else:
-                unseen_set.add('+'.join(sorted(combo)))
+        all_labels = []
+        all_preds = []
+        all_features = []
+        all_probs = []
 
-        seen_correct = 0
-        seen_total = 0
-        unseen_correct = 0
-        unseen_total = 0
+        eval_bar = tqdm(data_loader, desc="Evaluating by Combination Type")
 
-        test_bar = tqdm(self.test_loader, desc="Seen/Unseen evaluation")
+        for batch_idx, (images, _, text_tokens, labels, texts, metas, *_) in enumerate(eval_bar):
+            images = images.to(self.device)
+            labels = labels.to(self.device)
 
-        for batch_data in test_bar:
-            if len(batch_data) == 6:
-                stft_images, time_signals, text_tokens, labels, texts, metas = batch_data
-            else:
-                stft_images, text_tokens, labels, texts, metas = batch_data
-                time_signals = None
+            if images.shape[-1] != 224:
+                images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
 
-            stft_images = stft_images.to(self.device)
+            batch_size = images.shape[0]
+            text_features = self.model.get_cached_text_features()
+            image_features = self.model.encode_image(images)
+            image_features = F.normalize(image_features, dim=-1)
+            logit_scale = self.model.logit_scale.exp()
+            logits = logit_scale * (image_features @ text_features.T)
+            probs = torch.softmax(logits, dim=-1)
 
-            if stft_images.shape[-1] != 224:
-                stft_images = F.interpolate(stft_images, size=(224, 224), mode='bilinear', align_corners=False)
+            threshold = 1.0 / self.num_classes
+            topk_values, topk_indices = torch.topk(probs, k=3, dim=-1)
+            preds = torch.zeros(batch_size, self.num_classes, device=self.device)
+            for b in range(batch_size):
+                for j, idx in enumerate(topk_indices[b]):
+                    if topk_values[b, j] > threshold:
+                        preds[b, idx] = 1.0
 
-            # 零样本预测
-            similarities, indices, pred_names = self.model.zero_shot_predict(
-                stft_images,
-                time_signal=time_signals.to(self.device) if time_signals is not None else None,
-                use_combinations=True,
-                top_k=1
-            )
+            all_labels.append(labels.cpu())
+            all_preds.append(preds.cpu())
+            all_probs.append(probs.cpu())
+            all_features.append(image_features.cpu().numpy())
 
-            # 获取真实标签组合
-            for i, meta in enumerate(metas):
-                jam_types = meta.get('jam_types', [])
-                true_combo = '+'.join(sorted(jam_types)) if jam_types else ''
+            for i in range(batch_size):
+                true_comb = tuple(sorted(torch.where(labels[i] == 1)[0].tolist()))
+                pred_comb = tuple(sorted(torch.where(preds[i] == 1)[0].tolist()))
+                is_correct = (true_comb == pred_comb)
 
-                pred_name = pred_names[i][0] if pred_names[i] else ''
+                if true_comb in seen_set:
+                    seen_results["total"] += 1
+                    if is_correct:
+                        seen_results["correct"] += 1
+                elif true_comb in unseen_set:
+                    unseen_results["total"] += 1
+                    if is_correct:
+                        unseen_results["correct"] += 1
+                else:
+                    other_results["total"] += 1
+                    if is_correct:
+                        other_results["correct"] += 1
 
-                if true_combo in seen_set:
-                    seen_total += 1
-                    if pred_name == true_combo:
-                        seen_correct += 1
-                elif true_combo in unseen_set:
-                    unseen_total += 1
-                    if pred_name == true_combo:
-                        unseen_correct += 1
+        all_labels_np = torch.cat(all_labels).numpy()
+        all_preds_np = torch.cat(all_preds).numpy()
+        all_probs_np = torch.cat(all_probs).numpy()
+        all_features_np = np.concatenate(all_features, axis=0)
 
-        results = {
-            "seen_accuracy": seen_correct / seen_total if seen_total > 0 else 0,
-            "unseen_accuracy": unseen_correct / unseen_total if unseen_total > 0 else 0,
-            "seen_total": seen_total,
-            "unseen_total": unseen_total,
-            "harmonic_mean": self._harmonic_mean(
-                seen_correct / seen_total if seen_total > 0 else 0,
-                unseen_correct / unseen_total if unseen_total > 0 else 0
-            )
+        metrics = {
+            "seen_accuracy": seen_results["correct"] / seen_results["total"] if seen_results["total"] > 0 else 0,
+            "seen_samples": seen_results["total"],
+            "unseen_accuracy": unseen_results["correct"] / unseen_results["total"] if unseen_results["total"] > 0 else 0,
+            "unseen_samples": unseen_results["total"],
+            "other_accuracy": other_results["correct"] / other_results["total"] if other_results["total"] > 0 else 0,
+            "other_samples": other_results["total"],
         }
+        return {"metrics": metrics, "labels": all_labels_np, "predictions": all_preds_np,
+                "probabilities": all_probs_np, "features": all_features_np}
 
+    # ── 模式 3: 按 JNR 评估 ──────────────────────────────────────
+    @torch.no_grad()
+    def evaluate_by_jnr(self, jnr_loaders: dict) -> dict:
+        seen_set = set(tuple(sorted(c)) for c in self.seen_combinations)
+        unseen_set = set(tuple(sorted(c)) for c in self.unseen_combinations)
+        results = {}
+
+        for jnr, data_loader in sorted(jnr_loaders.items()):
+            print(f"\nEvaluating JNR={jnr}...")
+
+            all_labels = []
+            all_preds = []
+            all_probs = []
+            seen_correct, seen_total = 0, 0
+            unseen_correct, unseen_total = 0, 0
+            class_stats = np.zeros((self.num_classes, 4), dtype=np.int64)
+
+            for images, _, _, labels, _, _, *_ in tqdm(data_loader, desc=f"JNR={jnr}"):
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                if images.shape[-1] != 224:
+                    images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+
+                batch_size = images.shape[0]
+                text_features = self.model.get_cached_text_features()
+                image_features = self.model.encode_image(images)
+                image_features = F.normalize(image_features, dim=-1)
+                logit_scale = self.model.logit_scale.exp()
+                logits = logit_scale * (image_features @ text_features.T)
+                probs = torch.softmax(logits, dim=-1)
+
+                threshold = 1.0 / self.num_classes
+                topk_values, topk_indices = torch.topk(probs, k=3, dim=-1)
+                preds = torch.zeros(batch_size, self.num_classes, device=self.device)
+                for b in range(batch_size):
+                    for j, idx in enumerate(topk_indices[b]):
+                        if topk_values[b, j] > threshold:
+                            preds[b, idx] = 1.0
+
+                all_labels.append(labels.cpu())
+                all_preds.append(preds.cpu())
+                all_probs.append(probs.cpu())
+
+                for c in range(self.num_classes):
+                    true_c = labels[:, c].cpu().numpy()
+                    pred_c = preds[:, c].cpu().numpy()
+                    class_stats[c, 0] += np.sum((true_c == 1) & (pred_c == 1))
+                    class_stats[c, 1] += np.sum((true_c == 0) & (pred_c == 1))
+                    class_stats[c, 2] += np.sum((true_c == 1) & (pred_c == 0))
+                    class_stats[c, 3] += np.sum((true_c == 0) & (pred_c == 0))
+
+                for i in range(batch_size):
+                    true_comb = tuple(sorted(torch.where(labels[i] == 1)[0].tolist()))
+                    pred_comb = tuple(sorted(torch.where(preds[i] == 1)[0].tolist()))
+                    is_correct = (true_comb == pred_comb)
+                    if true_comb in seen_set:
+                        seen_total += 1
+                        if is_correct:
+                            seen_correct += 1
+                    elif true_comb in unseen_set:
+                        unseen_total += 1
+                        if is_correct:
+                            unseen_correct += 1
+
+            all_labels_np = torch.cat(all_labels).numpy()
+            all_preds_np = torch.cat(all_preds).numpy()
+            all_probs_np = torch.cat(all_probs).numpy()
+
+            per_class_recall = np.zeros(self.num_classes)
+            per_class_precision = np.zeros(self.num_classes)
+            per_class_f1 = np.zeros(self.num_classes)
+            for c in range(self.num_classes):
+                tp, fp, fn, tn = class_stats[c]
+                per_class_recall[c] = tp / (tp + fn) if (tp + fn) > 0 else 0
+                per_class_precision[c] = tp / (tp + fp) if (tp + fp) > 0 else 0
+                if per_class_precision[c] + per_class_recall[c] > 0:
+                    per_class_f1[c] = 2 * per_class_precision[c] * per_class_recall[c] / (
+                        per_class_precision[c] + per_class_recall[c])
+
+            results[jnr] = {
+                "combination_accuracy": seen_correct + unseen_correct,
+                "total_samples": seen_total + unseen_total,
+                "seen_accuracy": seen_correct / seen_total if seen_total > 0 else 0,
+                "seen_samples": seen_total,
+                "unseen_accuracy": unseen_correct / unseen_total if unseen_total > 0 else 0,
+                "unseen_samples": unseen_total,
+                "f1_macro": f1_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
+                "f1_micro": f1_score(all_labels_np, all_preds_np, average='micro', zero_division=0),
+                "precision_macro": precision_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
+                "recall_macro": recall_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
+                "labels": all_labels_np,
+                "probabilities": all_probs_np,
+                "per_class_recall": per_class_recall,
+                "per_class_precision": per_class_precision,
+                "per_class_f1": per_class_f1,
+            }
         return results
 
-    def _harmonic_mean(self, a: float, b: float) -> float:
-        if a + b == 0:
-            return 0
-        return 2 * a * b / (a + b)
+    # ── 打印 ─────────────────────────────────────────────────────
+    def print_metrics(self, metrics: dict):
+        print("\n" + "=" * 60)
+        print("Zero-Shot Evaluation Results")
+        print("=" * 60)
+        print(f"Combination Accuracy:     {metrics['combination_accuracy']:.4f}")
+        print(f"Partial Match Accuracy:   {metrics['partial_match_accuracy']:.4f}")
+        print(f"Macro F1 Score:           {metrics['f1_macro']:.4f}")
+        print(f"Micro F1 Score:           {metrics['f1_micro']:.4f}")
+        print(f"Macro Precision:          {metrics['precision_macro']:.4f}")
+        print(f"Macro Recall:             {metrics['recall_macro']:.4f}")
+        print("\nPer-class Metrics:")
+        print("-" * 60)
+        print(f"{'Class':<10} {'F1':>8} {'Precision':>12} {'Recall':>10}")
+        print("-" * 60)
+        for i, name in enumerate(self.class_names[:len(metrics['per_class']['f1'])]):
+            print(f"{name:<10} {metrics['per_class']['f1'][i]:>8.4f} "
+                  f"{metrics['per_class']['precision'][i]:>12.4f} "
+                  f"{metrics['per_class']['recall'][i]:>10.4f}")
 
-    def generate_report(self, results: dict, save_path: str = None):
-        """生成详细报告"""
-        report = []
-        report.append("=" * 70)
-        report.append("Multi-Shape Patch ViT Evaluation Report")
-        report.append("=" * 70)
+    def print_jnr_results(self, results: dict, save_path: str = None):
+        print("\n" + "=" * 80)
+        print("Evaluation Results by JNR Level")
+        print("=" * 80)
+        print(f"{'JNR':>6} | {'Accuracy':>10} | {'F1_Macro':>10} | "
+              f"{'Seen_Acc':>10} | {'Unseen_Acc':>10} | {'Samples':>8}")
+        print("-" * 80)
 
-        # 模型配置
-        model_config = self.config.get("model", {})
-        report.append(f"\nModel Configuration:")
-        report.append(f"  Patch sizes: {model_config.get('patch_sizes', [(8,32), (32,8), (16,16)])}")
-        report.append(f"  Fusion mode: {model_config.get('fusion_mode', 'early_fusion')}")
-        report.append(f"  Embed dim: {model_config.get('embed_dim', 512)}")
-        report.append(f"  Depth: {model_config.get('depth', 6)}")
-
-        # 总体指标
-        report.append(f"\nOverall Metrics:")
-        report.append(f"  Hamming Accuracy: {results.get('hamming_accuracy', 0):.4f}")
-        report.append(f"  Exact Match:      {results.get('exact_match', 0):.4f}")
-        report.append(f"  Macro F1:         {results.get('macro_f1', 0):.4f}")
-        report.append(f"  Micro F1:         {results.get('micro_f1', 0):.4f}")
-        report.append(f"  Samples F1:       {results.get('samples_f1', 0):.4f}")
-
-        # Seen/Unseen 结果
-        if 'seen_accuracy' in results:
-            report.append(f"\nCZSL Results:")
-            report.append(f"  Seen Accuracy:   {results['seen_accuracy']:.4f} ({results['seen_total']} samples)")
-            report.append(f"  Unseen Accuracy: {results['unseen_accuracy']:.4f} ({results['unseen_total']} samples)")
-            report.append(f"  Harmonic Mean:   {results['harmonic_mean']:.4f}")
-
-        # 每个类别的指标
-        if 'per_class_metrics' in results:
-            report.append(f"\nPer-Class Metrics:")
-            report.append(f"  {'Class':<15} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
-            report.append(f"  {'-'*55}")
-            for cls_name, metrics in results['per_class_metrics'].items():
-                report.append(f"  {cls_name:<15} {metrics['precision']:>10.4f} {metrics['recall']:>10.4f} "
-                            f"{metrics['f1']:>10.4f} {int(metrics['support']):>10}")
-
-        report.append("\n" + "=" * 70)
-
-        report_text = '\n'.join(report)
-        print(report_text)
+        lines = []
+        for jnr, m in sorted(results.items()):
+            acc = (m["combination_accuracy"] / m["total_samples"] if m["total_samples"] > 0 else 0)
+            print(f"{jnr:>6} | {acc:>10.4f} | {m['f1_macro']:>10.4f} | "
+                  f"{m['seen_accuracy']:>10.4f} | {m['unseen_accuracy']:>10.4f} | {m['total_samples']:>8}")
+            lines.append(f"{jnr},{acc:.4f},{m['f1_macro']:.4f},{m['seen_accuracy']:.4f},{m['unseen_accuracy']:.4f},{m['total_samples']}")
 
         if save_path:
             with open(save_path, 'w', encoding='utf-8') as f:
-                f.write(report_text)
-            print(f"\nReport saved to {save_path}")
+                f.write("JNR,Accuracy,F1_Macro,Seen_Acc,Unseen_Acc,Samples\n")
+                f.write("\n".join(lines))
+            print(f"\nResults saved to {save_path}")
 
-        return report_text
+        # Per-class table
+        print("\n" + "=" * 80)
+        print("Per-Class Recall by JNR Level")
+        print("=" * 80)
+        header = f"{'JNR':>6} | " + " | ".join(f"{name:>8}" for name in self.class_names)
+        print(header)
+        print("-" * len(header))
+        for jnr, m in sorted(results.items()):
+            recalls = m.get("per_class_recall", [])
+            print(f"{jnr:>6} | " + " | ".join(f"{r:>8.4f}" for r in recalls))
+
+    # ── 可视化 ────────────────────────────────────────────────────
+    def plot_confusion_by_combination(
+        self, labels: np.ndarray, preds: np.ndarray,
+        save_path: str = None, seen_combinations: list = None, unseen_combinations: list = None
+    ):
+        configured_combs = []
+        seen_list = seen_combinations or self.seen_combinations
+        unseen_list = unseen_combinations or self.unseen_combinations
+        for comb in seen_list:
+            t = tuple(sorted(comb))
+            if t not in configured_combs:
+                configured_combs.append(t)
+        for comb in unseen_list:
+            t = tuple(sorted(comb))
+            if t not in configured_combs:
+                configured_combs.append(t)
+        unique_combs = configured_combs
+
+        comb_to_idx = {comb: i for i, comb in enumerate(unique_combs)}
+        n_combs = len(unique_combs)
+        confusion = np.zeros((n_combs, n_combs), dtype=int)
+        other_count = 0
+
+        for i in range(len(labels)):
+            true_comb = tuple(sorted(np.where(labels[i] == 1)[0].tolist()))
+            pred_comb = tuple(sorted(np.where(preds[i] == 1)[0].tolist()))
+            if true_comb in comb_to_idx and pred_comb in comb_to_idx:
+                confusion[comb_to_idx[true_comb], comb_to_idx[pred_comb]] += 1
+            else:
+                other_count += 1
+
+        if other_count > 0:
+            print(f"Samples not in configured combinations: {other_count}")
+
+        seen_set = set(tuple(sorted(c)) for c in seen_list)
+        unseen_set = set(tuple(sorted(c)) for c in unseen_list)
+
+        comb_names = []
+        for comb in unique_combs:
+            name = "+".join([self.class_names[i] for i in comb]) if comb else "None"
+            if comb in seen_set:
+                name = f"[S] {name}"
+            elif comb in unseen_set:
+                name = f"[U] {name}"
+            comb_names.append(name)
+
+        fig_size = max(10, n_combs * 0.5)
+        fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+        sns.heatmap(confusion, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=comb_names, yticklabels=comb_names, ax=ax)
+        ax.set_xlabel('Predicted Combination')
+        ax.set_ylabel('True Combination')
+        ax.set_title('Combination Confusion Matrix (MultiShape ViT)')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Confusion matrix saved to {save_path}")
+        else:
+            plt.show()
+        plt.close()
+
+    def plot_feature_tsne(
+        self, features: np.ndarray, labels: np.ndarray,
+        save_path: str = None, seen_combinations: list = None, unseen_combinations: list = None
+    ):
+        print("Computing t-SNE projection...")
+        num_samples = len(features)
+        perplexity = min(30, num_samples - 1) if num_samples > 1 else 1
+
+        tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
+        features_2d = tsne.fit_transform(features)
+
+        comb_labels = [tuple(sorted(np.where(label == 1)[0].tolist())) for label in labels]
+
+        seen_list = seen_combinations or self.seen_combinations
+        unseen_list = unseen_combinations or self.unseen_combinations
+        seen_set = set(tuple(sorted(c)) for c in seen_list)
+        unseen_set = set(tuple(sorted(c)) for c in unseen_list)
+
+        unique_combs = sorted(set(comb_labels))
+        comb_to_name = {}
+        for comb in unique_combs:
+            comb_to_name[comb] = "+".join([self.class_names[i] for i in comb]) if comb else "None"
+
+        num_combs = len(unique_combs)
+        colors = plt.cm.tab20(np.linspace(0, 1, max(20, num_combs)))
+
+        fig, ax = plt.subplots(figsize=(14, 10))
+        for idx, comb in enumerate(unique_combs):
+            mask = np.array([c == comb for c in comb_labels])
+            if mask.sum() > 0:
+                name = comb_to_name[comb]
+                if comb in seen_set:
+                    name, marker = f"[S] {name}", 'o'
+                elif comb in unseen_set:
+                    name, marker = f"[U] {name}", '^'
+                else:
+                    marker = 's'
+                ax.scatter(features_2d[mask, 0], features_2d[mask, 1],
+                          c=[colors[idx % 20]], label=name, alpha=0.6, s=30, marker=marker)
+
+        ax.set_xlabel('t-SNE 1')
+        ax.set_ylabel('t-SNE 2')
+        ax.set_title('Feature Space (t-SNE) — MultiShape ViT\n[S]=Seen, [U]=Unseen')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"t-SNE plot saved to {save_path}")
+        else:
+            plt.show()
+        plt.close()
+
+    def plot_feature_umap(
+        self, features: np.ndarray, labels: np.ndarray,
+        save_path: str = None, seen_combinations: list = None, unseen_combinations: list = None
+    ):
+        try:
+            import umap
+        except ImportError:
+            print("UMAP not installed. Install with: pip install umap-learn")
+            return
+
+        print("Computing UMAP projection...")
+        reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
+        features_2d = reducer.fit_transform(features)
+
+        comb_labels = [tuple(sorted(np.where(label == 1)[0].tolist())) for label in labels]
+
+        seen_list = seen_combinations or self.seen_combinations
+        unseen_list = unseen_combinations or self.unseen_combinations
+        seen_set = set(tuple(sorted(c)) for c in seen_list)
+        unseen_set = set(tuple(sorted(c)) for c in unseen_list)
+
+        unique_combs = sorted(set(comb_labels))
+        comb_to_name = {}
+        for comb in unique_combs:
+            comb_to_name[comb] = "+".join([self.class_names[i] for i in comb]) if comb else "None"
+
+        num_combs = len(unique_combs)
+        colors = plt.cm.tab20(np.linspace(0, 1, max(20, num_combs)))
+
+        fig, ax = plt.subplots(figsize=(14, 10))
+        for idx, comb in enumerate(unique_combs):
+            mask = np.array([c == comb for c in comb_labels])
+            if mask.sum() > 0:
+                name = comb_to_name[comb]
+                if comb in seen_set:
+                    name, marker = f"[S] {name}", 'o'
+                elif comb in unseen_set:
+                    name, marker = f"[U] {name}", '^'
+                else:
+                    marker = 's'
+                ax.scatter(features_2d[mask, 0], features_2d[mask, 1],
+                          c=[colors[idx % 20]], label=name, alpha=0.6, s=30, marker=marker)
+
+        ax.set_xlabel('UMAP 1')
+        ax.set_ylabel('UMAP 2')
+        ax.set_title('Feature Space (UMAP) — MultiShape ViT\n[S]=Seen, [U]=Unseen')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"UMAP plot saved to {save_path}")
+        else:
+            plt.show()
+        plt.close()
+
+    def plot_label_cooccurrence(self, labels: np.ndarray, preds: np.ndarray, save_path: str = None):
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        num_classes = labels.shape[1]
+        true_cooc = (labels.T @ labels).astype(int)
+        sns.heatmap(true_cooc, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=self.class_names[:num_classes],
+                    yticklabels=self.class_names[:num_classes], ax=axes[0])
+        axes[0].set_title('True Label Co-occurrence')
+        axes[0].tick_params(axis='x', rotation=45)
+
+        pred_cooc = (preds.T @ preds).astype(int)
+        sns.heatmap(pred_cooc, annot=True, fmt='d', cmap='Greens',
+                    xticklabels=self.class_names[:num_classes],
+                    yticklabels=self.class_names[:num_classes], ax=axes[1])
+        axes[1].set_title('Predicted Label Co-occurrence')
+        axes[1].tick_params(axis='x', rotation=45)
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Co-occurrence plot saved to {save_path}")
+        else:
+            plt.show()
+        plt.close()
+
+    def plot_jnr_metrics(self, results: dict, save_path: str = None):
+        jnrs = sorted(results.keys())
+        accuracies = []
+        f1_macros = []
+        seen_accs = []
+        unseen_accs = []
+
+        for jnr in jnrs:
+            m = results[jnr]
+            acc = (m["combination_accuracy"] / m["total_samples"] if m["total_samples"] > 0 else 0)
+            accuracies.append(acc)
+            f1_macros.append(m["f1_macro"])
+            seen_accs.append(m["seen_accuracy"])
+            unseen_accs.append(m["unseen_accuracy"])
+
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+        axes[0, 0].plot(jnrs, accuracies, 'b-o', label='Overall Accuracy', linewidth=2)
+        axes[0, 0].plot(jnrs, seen_accs, 'g-s', label='Seen Accuracy', linewidth=2)
+        axes[0, 0].plot(jnrs, unseen_accs, 'r-^', label='Unseen Accuracy', linewidth=2)
+        axes[0, 0].set_xlabel('JNR (dB)')
+        axes[0, 0].set_ylabel('Accuracy')
+        axes[0, 0].set_title('Accuracy vs JNR Level')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+
+        axes[0, 1].plot(jnrs, f1_macros, 'b-o', label='F1 Macro', linewidth=2)
+        axes[0, 1].set_xlabel('JNR (dB)')
+        axes[0, 1].set_ylabel('F1 Score')
+        axes[0, 1].set_title('F1 Score vs JNR Level')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+
+        ax = axes[1, 0]
+        for c, name in enumerate(self.class_names):
+            recalls = [results[jnr].get("per_class_recall", [0] * self.num_classes)[c] for jnr in jnrs]
+            ax.plot(jnrs, recalls, '-o', label=name, linewidth=1.5, markersize=4)
+        ax.set_xlabel('JNR (dB)')
+        ax.set_ylabel('Recall')
+        ax.set_title('Per-Class Recall vs JNR Level')
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[1, 1]
+        for c, name in enumerate(self.class_names):
+            f1s = [results[jnr].get("per_class_f1", [0] * self.num_classes)[c] for jnr in jnrs]
+            ax.plot(jnrs, f1s, '-o', label=name, linewidth=1.5, markersize=4)
+        ax.set_xlabel('JNR (dB)')
+        ax.set_ylabel('F1 Score')
+        ax.set_title('Per-Class F1 Score vs JNR Level')
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"JNR metrics plot saved to {save_path}")
+        else:
+            plt.show()
+        plt.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Shape Patch ViT Evaluation")
+    parser.add_argument("--config", type=str, default="multi/config.yaml")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--config", type=str, default="multi/config.yaml", help="Path to config file")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Prediction threshold")
-    parser.add_argument("--output", type=str, default="results/multishape_vit_eval.json", help="Output file path")
-    parser.add_argument("--use-combinations", action="store_true", default=True, help="Use combination features")
+    parser.add_argument("--mode", type=str, default="zero_shot",
+                        choices=["zero_shot", "by_combination", "by_jnr"])
+    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
+    parser.add_argument("--output_dir", type=str, default="results/multishape_vit")
+    parser.add_argument("--visualize", action="store_true")
+    parser.add_argument("--threshold", type=float, default=0.5)
     args = parser.parse_args()
 
-    # 加载检查点获取模型配置
-    print(f"\nLoading checkpoint: {args.checkpoint}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 加载检查点
+    print(f"\nLoading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
-    # 优先使用检查点中保存的配置
     if "config" in checkpoint:
         config = checkpoint["config"]
         print("  Using config from checkpoint")
     else:
-        # 回退到配置文件
         with open(args.config, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
         print("  Using config from file")
 
     # 确保模型配置存在
     model_config = config.get("model", {})
-    if "patch_sizes" not in model_config:
-        # 设置默认值
-        model_config["patch_sizes"] = [(8, 32), (32, 8), (16, 16)]
-        model_config["fusion_mode"] = "early_fusion"
-        model_config["embed_dim"] = 512
-        model_config["depth"] = 6
-        model_config["num_heads"] = 8
-        config["model"] = model_config
-        print("  Using default model config (not found in checkpoint)")
+    model_config.setdefault("patch_sizes", [(8, 32), (32, 8), (16, 16)])
+    model_config.setdefault("fusion_mode", "early_fusion")
+    model_config.setdefault("embed_dim", 512)
+    model_config.setdefault("depth", 6)
+    model_config.setdefault("num_heads", 8)
+    config["model"] = model_config
 
-    print(f"Using device: {device}")
+    # 类别名称
+    class_names = [cls["name"] for cls in config.get("jamming_classes", [])]
 
-    # 加载数据
-    print("\nLoading test dataset...")
-    train_loader, val_loader, test_loader, num_classes = create_czsl_dataloaders(
-        config=config,
-        batch_size=config.get("train", {}).get("batch_size", 16),
-        num_workers=config.get("data", {}).get("num_workers", 4),
-        pin_memory=config.get("data", {}).get("pin_memory", True),
-        load_test=True,
-    )
-
-    if test_loader is None:
-        print("Error: No test data available!")
-        return
+    # CZSL 组合
+    czsl_config = config.get("czsl", {})
+    seen_comb_names = czsl_config.get("seen_combinations", [])
+    unseen_comb_names = czsl_config.get("unseen_combinations", [])
+    seen_combinations = convert_combination_names_to_indices(seen_comb_names, class_names)
+    unseen_combinations = convert_combination_names_to_indices(unseen_comb_names, class_names)
 
     # 创建模型
     print("\nCreating model...")
     model = create_multi_shape_patch_model(config, device=str(device))
-
-    # 加载模型权重
     model.load_state_dict(checkpoint["model_state_dict"])
-    print(f"  Loaded from epoch {checkpoint.get('epoch', 'unknown')}")
 
-    # 创建评估器
+    # 缓存文本特征
+    model.cache_text_features(max_combination_size=2, include_single=True,
+                              seen_combinations=seen_combinations)
+
+    # 评估器
     evaluator = MultiShapeViTEvaluator(
-        model=model,
-        test_loader=test_loader,
-        device=device,
-        config=config
+        model=model, device=device, class_names=class_names,
+        seen_combinations=seen_combinations, unseen_combinations=unseen_combinations,
     )
 
-    # 运行评估
-    print("\n" + "=" * 70)
-    print("Starting evaluation...")
-    print("=" * 70)
+    # ── 按模式执行 ────────────────────────────────────────────
+    if args.mode in ("zero_shot", "by_combination"):
+        # 加载数据
+        print(f"\nLoading {args.split} dataset...")
+        train_loader, val_loader, test_loader, _ = create_czsl_dataloaders(
+            config=config,
+            batch_size=config.get("train", {}).get("batch_size", 16),
+            num_workers=config.get("data", {}).get("num_workers", 4),
+            pin_memory=config.get("data", {}).get("pin_memory", True),
+            load_test=(args.split == "test"),
+        )
+        data_loader = {"train": train_loader, "val": val_loader, "test": test_loader}[args.split]
+        if data_loader is None:
+            print(f"Error: No {args.split} data available!")
+            return
 
-    # 零样本评估
-    results = evaluator.evaluate_zero_shot(
-        use_combinations=args.use_combinations,
-        threshold=args.threshold
-    )
+    if args.mode == "zero_shot":
+        print(f"\nEvaluating on {args.split} set with zero-shot mode...")
+        results = evaluator.evaluate_zero_shot(data_loader, use_combinations=True, debug=True)
+        evaluator.print_metrics(results["metrics"])
 
-    # Seen/Unseen 评估
-    czsl_results = evaluator.evaluate_seen_unseen(threshold=args.threshold)
-    results.update(czsl_results)
+        np.savez(str(output_dir / f"multishape_vit_results_{args.split}.npz"),
+                 labels=results["labels"], predictions=results["predictions"],
+                 features=results["features"])
 
-    # 保存结果
-    output_dir = Path(args.output).parent
-    output_dir.mkdir(parents=True, exist_ok=True)
+        evaluator.plot_confusion_by_combination(
+            results["labels"], results["predictions"],
+            save_path=str(output_dir / f"multishape_vit_confusion_{args.split}.png"),
+        )
 
-    # 转换为可序列化格式
-    def convert_to_serializable(obj):
-        """将numpy类型转换为Python原生类型"""
-        if isinstance(obj, dict):
-            return {k: convert_to_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return [convert_to_serializable(v) for v in obj]
-        elif isinstance(obj, (np.floating, np.float32, np.float64)):
-            return float(obj)
-        elif isinstance(obj, (np.integer, np.int32, np.int64)):
-            return int(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        else:
-            return obj
+        if args.visualize:
+            print("\nGenerating visualizations...")
+            evaluator.plot_feature_tsne(
+                results["features"], results["labels"],
+                save_path=str(output_dir / f"multishape_vit_tsne_{args.split}.png"),
+            )
+            evaluator.plot_feature_umap(
+                results["features"], results["labels"],
+                save_path=str(output_dir / f"multishape_vit_umap_{args.split}.png"),
+            )
+            evaluator.plot_label_cooccurrence(
+                results["labels"], results["predictions"],
+                save_path=str(output_dir / f"multishape_vit_cooccurrence_{args.split}.png"),
+            )
 
-    results_to_save = convert_to_serializable(results)
+    elif args.mode == "by_combination":
+        print(f"\nEvaluating by combination type on {args.split} set...")
+        results = evaluator.evaluate_by_combination_type(data_loader)
+        metrics = results["metrics"]
+        print("\n" + "=" * 60)
+        print("Evaluation by Combination Type")
+        print("=" * 60)
+        print(f"Seen Accuracy:    {metrics['seen_accuracy']:.4f} ({metrics['seen_samples']} samples)")
+        print(f"Unseen Accuracy:  {metrics['unseen_accuracy']:.4f} ({metrics['unseen_samples']} samples)")
+        print(f"Other Accuracy:   {metrics['other_accuracy']:.4f} ({metrics['other_samples']} samples)")
 
-    with open(args.output, 'w', encoding='utf-8') as f:
-        json.dump(results_to_save, f, indent=2, ensure_ascii=False)
-    print(f"\nResults saved to {args.output}")
+        np.savez(str(output_dir / f"multishape_vit_results_{args.split}.npz"),
+                 labels=results["labels"], predictions=results["predictions"],
+                 features=results["features"])
 
-    # 生成报告
-    report_path = args.output.replace('.json', '_report.txt')
-    evaluator.generate_report(results, save_path=report_path)
+        evaluator.plot_confusion_by_combination(
+            results["labels"], results["predictions"],
+            save_path=str(output_dir / f"multishape_vit_confusion_{args.split}.png"),
+        )
+
+        plot_roc_curves(
+            results["labels"], results["probabilities"], class_names,
+            save_dir=str(output_dir), prefix="multishape_vit",
+            mode_title="by_combination"
+        )
+
+        if args.visualize:
+            evaluator.plot_feature_tsne(
+                results["features"], results["labels"],
+                save_path=str(output_dir / f"multishape_vit_tsne_{args.split}.png"),
+            )
+            evaluator.plot_feature_umap(
+                results["features"], results["labels"],
+                save_path=str(output_dir / f"multishape_vit_umap_{args.split}.png"),
+            )
+
+    elif args.mode == "by_jnr":
+        print(f"\nEvaluating by JNR level on {args.split} set...")
+
+        # 加载归一化统计量
+        stats_file = os.path.join(os.path.dirname(args.config), 'normalization_stats.json')
+        normalization_stats = None
+        if os.path.exists(stats_file):
+            with open(stats_file, 'r') as f:
+                normalization_stats = json.load(f)
+
+        jnr_loaders = create_jnr_dataloaders(
+            config=config, split=args.split,
+            normalization_stats=normalization_stats,
+            batch_size=config.get('train', {}).get('batch_size', 32),
+            num_workers=config.get('data', {}).get('num_workers', 4),
+        )
+
+        results = evaluator.evaluate_by_jnr(jnr_loaders)
+        evaluator.print_jnr_results(
+            results, save_path=str(output_dir / f"jnr_results_{args.split}.csv"))
+
+        evaluator.plot_jnr_metrics(
+            results, save_path=str(output_dir / f"jnr_metrics_{args.split}.png"))
+
+        for jnr_val, jnr_results in sorted(results.items()):
+            if "probabilities" in jnr_results and jnr_results["probabilities"].size > 0:
+                plot_roc_curves(
+                    jnr_results["labels"], jnr_results["probabilities"], class_names,
+                    save_dir=str(output_dir), prefix=f"jnr_{jnr_val:+.0f}",
+                    mode_title=f"JNR={jnr_val:+d}"
+                )
+
+    # 保存评估摘要
+    print(f"\nResults saved to {output_dir}")
 
 
 if __name__ == "__main__":

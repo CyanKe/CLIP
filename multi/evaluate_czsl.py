@@ -276,7 +276,7 @@ class CZSLEvaluator:
             print("=" * 80 + "\n")
 
         debug_done = False
-        for batch_idx, (images, _, text_tokens, labels, texts, metas) in enumerate(eval_bar):
+        for batch_idx, (images, _, text_tokens, labels, texts, metas, *_) in enumerate(eval_bar):
             images = images.to(self.device)
             labels = labels.to(self.device)
 
@@ -459,7 +459,7 @@ class CZSLEvaluator:
             print("=" * 80 + "\n")
 
         debug_done = False
-        for batch_idx, (images, _, text_tokens, labels, texts, metas) in enumerate(eval_bar):
+        for batch_idx, (images, _, text_tokens, labels, texts, metas, *_) in enumerate(eval_bar):
             images = images.to(self.device)
             labels = labels.to(self.device)
 
@@ -970,7 +970,7 @@ class CZSLEvaluator:
             # 每个类别的统计: TP, FP, FN, TN
             class_stats = np.zeros((num_classes, 4), dtype=np.int64)
 
-            for images, _, _, labels, _, _ in tqdm(
+            for images, _, _, labels, _, _, *_ in tqdm(
                 data_loader, desc=f"JNR={jnr}"
             ):
                 images = images.to(self.device)
@@ -1280,7 +1280,7 @@ class CZSLEvaluator:
 
         eval_bar = tqdm(data_loader, desc="Saving STFT images")
 
-        for images, _, text_tokens, labels, texts, metas in eval_bar:
+        for images, _, text_tokens, labels, texts, metas, *_ in eval_bar:
             images = images.to(self.device)
             labels = labels.to(self.device)
 

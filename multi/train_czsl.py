@@ -25,10 +25,9 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from multi.model import create_czsl_model, CLIPForCZSL, SigLIPForCZSL
-from multi.siglip_loader import is_siglip_model
-from multi.data import create_czsl_dataloaders
-from multi.loss import create_loss_function, LabelAwareInfoNCELoss, MultiLabelSigmoidLoss
+from multi.model import create_czsl_model, CLIPForCZSL
+from multi.data import create_czsl_dataloaders, create_preprocessed_dataloaders
+from multi.loss import create_loss_function, LabelAwareInfoNCELoss, MultiLabelSigmoidLoss, MultiLabelInfoNCELoss
 
 
 class CZSLTrainer:
@@ -65,14 +64,13 @@ class CZSLTrainer:
 
         # 检测模型类型
         self.model_type = config.get("model", {}).get("clip_model", "ViT-B/32")
-        self.is_siglip = is_siglip_model(self.model_type)
 
         # 初始化损失函数（根据模型类型选择）
         self.loss_fn = create_loss_function(config, model_type=self.model_type)
         self.use_label_aware_loss = isinstance(self.loss_fn, LabelAwareInfoNCELoss)
+        self.use_multilabel_infonce = isinstance(self.loss_fn, MultiLabelInfoNCELoss)
         self.use_sigmoid_loss = isinstance(self.loss_fn, MultiLabelSigmoidLoss)
 
-        print(f"Model type: {'SigLIP' if self.is_siglip else 'CLIP'}")
         print(f"Loss function: {type(self.loss_fn).__name__}")
         if self.use_label_aware_loss:
             print(f"  handle_zero_sum: {self.loss_fn.handle_zero_sum}")
@@ -87,14 +85,19 @@ class CZSLTrainer:
         train_bar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1} [Train]")
 
         debug_done = False
-        # 数据解包：现在 collate_fn 返回 (stft_images, time_signals, text_tokens, labels, texts, metas)
+        # 数据解包：collate_fn 返回 (stft_images, time_signals, text_tokens, labels, texts, metas, features_batched)
         for batch_idx, batch_data in enumerate(train_bar):
-            if len(batch_data) == 6:
+            if len(batch_data) >= 7:
+                stft_images, time_signals, text_tokens, labels, texts, metas, features_batched = batch_data
+                has_time_signal = time_signals is not None
+            elif len(batch_data) == 6:
                 stft_images, time_signals, text_tokens, labels, texts, metas = batch_data
+                features_batched = None
                 has_time_signal = True
             else:
                 stft_images, text_tokens, labels, texts, metas = batch_data
                 time_signals = None
+                features_batched = None
                 has_time_signal = False
 
             stft_images = stft_images.to(self.device)
@@ -133,19 +136,16 @@ class CZSLTrainer:
 
             # 计算损失（根据模型类型选择不同的损失计算方式）
             if self.use_sigmoid_loss:
-                # SigLIP Sigmoid Loss
                 loss, logits_per_image, loss_info = self.loss_fn(
                     image_features, text_features, labels
                 )
                 logits_per_text = logits_per_image.T
-            elif self.use_label_aware_loss:
-                # CLIP Label-Aware InfoNCE Loss
+            elif self.use_label_aware_loss or self.use_multilabel_infonce:
                 loss, logits_per_image, loss_info = self.loss_fn(
                     image_features, text_features, labels
                 )
                 logits_per_text = logits_per_image.T
             else:
-                # 标准 CLIP InfoNCE 损失：对角线为正样本对
                 logit_scale = self.model.model.logit_scale.exp()
                 logits_per_image = logit_scale * (image_features @ text_features.t())
                 logits_per_text = logits_per_image.t()
@@ -157,7 +157,6 @@ class CZSLTrainer:
 
             loss.backward()
 
-            # 梯度裁剪
             if self.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
@@ -165,15 +164,17 @@ class CZSLTrainer:
 
             total_loss += loss.item() * batch_size
 
-            # 计算对比学习准确率（对角线准确率作为参考指标）
+            # 计算标签感知准确率（基于 logits 的 argmax 是否命中正样本）
             with torch.no_grad():
-                # 对于 label-aware 模式，对角线准确率仅供参考
-                # 实际评估应使用 zero-shot 或 KNN
-                targets = torch.arange(batch_size, device=self.device)
+                # 构建正样本 mask: [B, B], mask[i,j]=1 表示样本 i 和 j 共享标签
+                labels_f = labels.float()
+                pos_mask = (labels_f @ labels_f.T) > 0
+                # i2t: 对每行，argmax 命中的样本是否与 i 有共享标签
                 pred_i2t = logits_per_image.argmax(dim=1)
+                total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
+                # t2i: 同理
                 pred_t2i = logits_per_text.argmax(dim=1)
-                total_correct += (pred_i2t == targets).sum().item()
-                total_correct += (pred_t2i == targets).sum().item()
+                total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
                 total_samples += batch_size * 2
 
             train_bar.set_postfix(loss=loss.item())
@@ -195,12 +196,17 @@ class CZSLTrainer:
 
         debug_done = False
         for batch_idx, batch_data in enumerate(val_bar):
-            if len(batch_data) == 6:
+            if len(batch_data) >= 7:
+                stft_images, time_signals, text_tokens, labels, texts, metas, features_batched = batch_data
+                has_time_signal = time_signals is not None
+            elif len(batch_data) == 6:
                 stft_images, time_signals, text_tokens, labels, texts, metas = batch_data
+                features_batched = None
                 has_time_signal = True
             else:
                 stft_images, text_tokens, labels, texts, metas = batch_data
                 time_signals = None
+                features_batched = None
                 has_time_signal = False
 
             stft_images = stft_images.to(self.device)
@@ -236,21 +242,18 @@ class CZSLTrainer:
 
             image_features, text_features = self.model(stft_images, text_tokens, time_signals)
 
-            # 计算损失（根据模型类型选择不同的损失计算方式）
+            # 计算损失
             if self.use_sigmoid_loss:
-                # SigLIP Sigmoid Loss
                 loss, logits_per_image, loss_info = self.loss_fn(
                     image_features, text_features, labels
                 )
                 logits_per_text = logits_per_image.T
-            elif self.use_label_aware_loss:
-                # CLIP Label-Aware InfoNCE Loss
+            elif self.use_label_aware_loss or self.use_multilabel_infonce:
                 loss, logits_per_image, loss_info = self.loss_fn(
                     image_features, text_features, labels
                 )
                 logits_per_text = logits_per_image.T
             else:
-                # 标准 CLIP InfoNCE 损失
                 logit_scale = self.model.model.logit_scale.exp()
                 logits_per_image = logit_scale * (image_features @ text_features.t())
                 logits_per_text = logits_per_image.t()
@@ -262,12 +265,13 @@ class CZSLTrainer:
 
             total_loss += loss.item() * batch_size
 
-            # 计算对角线准确率（仅供参考）
-            targets = torch.arange(batch_size, device=self.device)
+            # 标签感知准确率
+            labels_f = labels.float()
+            pos_mask = (labels_f @ labels_f.T) > 0
             pred_i2t = logits_per_image.argmax(dim=1)
+            total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
             pred_t2i = logits_per_text.argmax(dim=1)
-            total_correct += (pred_i2t == targets).sum().item()
-            total_correct += (pred_t2i == targets).sum().item()
+            total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
             total_samples += batch_size * 2
 
             val_bar.set_postfix(loss=loss.item())
@@ -394,10 +398,11 @@ def create_optimizer_and_scheduler(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CZSL Training with CLIP or SigLIP")
+    parser = argparse.ArgumentParser(description="CZSL Training with CLIP")
     parser.add_argument("--config", type=str, default="multi/config.yaml", help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--debug", action="store_true", help="Print debug info for first batch of train/val")
+    parser.add_argument("--preprocessed", action="store_true", help="Use preprocessed .pt files (run preprocess_stft.py first)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -406,7 +411,6 @@ def main():
 
     # 获取模型类型
     model_type = config.get("model", {}).get("clip_model", "ViT-B/32")
-    is_siglip = is_siglip_model(model_type)
 
     # 创建模型（需要先创建模型以获取 processor）
     print("\nCreating CZSL model...")
@@ -417,15 +421,26 @@ def main():
 
     # 创建数据加载器
     print("\nLoading CZSL datasets...")
-    train_loader, val_loader, test_loader, num_classes = create_czsl_dataloaders(
-        config=config,
-        batch_size=config.get("train", {}).get("batch_size", 16),
-        num_workers=config.get("data", {}).get("num_workers", 4),
-        pin_memory=config.get("data", {}).get("pin_memory", True),
-        load_test=False,
-        model_type=model_type,
-        processor=processor,
-    )
+    if args.preprocessed:
+        train_loader, val_loader, test_loader, num_classes = create_preprocessed_dataloaders(
+            config=config,
+            batch_size=config.get("train", {}).get("batch_size", 16),
+            num_workers=config.get("data", {}).get("num_workers", 4),
+            pin_memory=config.get("data", {}).get("pin_memory", True),
+            load_test=False,
+            model_type=model_type,
+            processor=processor,
+        )
+    else:
+        train_loader, val_loader, test_loader, num_classes = create_czsl_dataloaders(
+            config=config,
+            batch_size=config.get("train", {}).get("batch_size", 16),
+            num_workers=config.get("data", {}).get("num_workers", 4),
+            pin_memory=config.get("data", {}).get("pin_memory", True),
+            load_test=False,
+            model_type=model_type,
+            processor=processor,
+        )
 
     # 缓存文本特征（使用配置文件中的 seen_combinations）
     czsl_config = config.get("czsl", {})

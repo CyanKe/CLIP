@@ -63,7 +63,7 @@ def convert_combination_names_to_indices(combinations_list: list, class_names: l
             else:
                 print(f"Warning: Unknown class name '{name}' in combination {comb}")
         if indices:
-            result.append(sorted(indices))
+            result.append(tuple(sorted(indices)))
     return result
 
 
