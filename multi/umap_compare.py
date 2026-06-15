@@ -47,6 +47,8 @@ import clip
 JAM_TYPE_COLORS = {
     'DFTJ': '#1f77b4', 'ISRJ': '#ff7f0e', 'SMSPJ': '#2ca02c',
     'CIJ': '#d62728', 'CSJ': '#9467bd',
+    'ISCJ': '#FF0000',
+    'ISDJ': '#800080', 'MISRJ': '#FF00FF',
     'AJ': '#8c564b', 'BJ': '#e377c2', 'SJ': '#7f7f7f',
     'NCJ': '#bcbd22', 'NPJ': '#17becf', 'NFMJ': '#aec7e8',
     'NPMJ': '#ffbb78', 'NAMJ': '#98df8a', 'PJ': '#c5b0d5',

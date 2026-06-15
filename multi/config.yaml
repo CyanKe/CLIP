@@ -53,10 +53,10 @@ loss:
 
 # 数据配置
 data:
-  base_path: "D:/VScode/Jamming_signal_simulation/output/test"
-  jnr_start: 10
-  jnr_end: 10
-  jnr_step: 5
+  base_path: "D:\\VScode\\Jamming_signal_simulation\\output\\fine"
+  jnr_start: 0
+  jnr_end: 20
+  jnr_step: 1
   num_workers: 4
   pin_memory: true
 
@@ -195,19 +195,20 @@ czsl:
     # 单干扰类型（全部为seen）
     # 欺骗干扰
     - ["DFTJ"]
-    - ["ISRJ"]
     - ["SMSPJ"]
-    - ["C&IJ"]
     - ["CSJ"]
+    - ["ISRJ"]
+    - ["C&IJ"]
+
     # 压制干扰
     - ["AJ"]
     - ["BJ"]
     - ["SJ"]
     - ["NCJ"]
     - ["NPJ"]
-    - ["NFMJ"]
-    - ["NPMJ"]
     - ["NAMJ"]
+    - ["NPMJ"]
+    - ["NFMJ"]
     - ["PJ"]
 
   # 合作为seen（训练时可见）

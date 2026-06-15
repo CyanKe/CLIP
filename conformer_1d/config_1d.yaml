@@ -1,0 +1,226 @@
+# ============================================================================
+# 1D Conformer for CZSL Radar Jamming Signal Classification
+# ============================================================================
+
+# Conformer + CLIP Text Encoder 配置
+model:
+  clip_model: "ViT-B/32"            # 仅用于文本编码器 (不加载 ViT)
+  freeze_text: true
+  embed_dim: 512
+
+  # Conformer 架构参数
+  conformer:
+    in_channels: 2                  # I/Q 双通道
+    hidden_dim: 256
+    num_blocks: 6
+    num_heads: 4
+    ffn_expansion: 4
+    conv_kernel_size: 15
+    dropout: 0.1
+
+# 训练配置
+train:
+  batch_size: 16                    # 较小 batch，Conformer 从头训练
+  epochs: 30
+  lr: 0.0001                        # 1e-4 (比 ViT 微调高，因为从头训练)
+  weight_decay: 0.01
+  warmup_epochs: 3
+  threshold: 0.07                   # 多标签预测阈值
+
+  scheduler:
+    type: "cosine"
+    min_lr: 0.000001                # 1e-6
+
+  use_amp: false                    # 混合精度（建议关闭）
+  grad_clip: 1.0
+
+# 损失函数配置
+loss:
+  type: "multilabel_infonce"        # label_aware_infonce | infonce | multilabel_infonce | asymmetric | bce
+  temperature: 0.07                 # CLIP 默认温度
+  label_smoothing: 0.0
+  learnable_temperature: true
+  handle_zero_sum: "self_only"
+  similarity_metric: "iou"
+
+# 数据配置
+data:
+  base_path: "C:\\output\\output\\know_more"
+  jnr_start: 0
+  jnr_end: 20
+  jnr_step: 5                      # JNR_+0, JNR_+1, ..., JNR_+20
+  num_workers: 0
+  pin_memory: true
+  time_seq_len: 8000
+  time_var_name: "all_times"
+
+# 特征条件上下文 (CoOp-style, 可选)
+use_feature_context: false          # 总开关
+n_ctx_per_domain:
+  time: 2
+  freq: 2
+  bispectrum: 1
+  wavelet: 3
+  statistical: 2
+feature_norm_stats_path: "multi/feature_normalization_stats.json"
+prompt_lr: 0.002
+
+# 日志配置
+logging:
+  type: "console"                   # wandb | console | tensorboard
+  name: "Conformer_CZSL_1D"
+
+  wandb:
+    project: "CLIP-CZSL-Jamming"
+    entity: "cyanke9142-xidian-university"
+    tags: ["Conformer", "CZSL", "1D", "Time-Domain"]
+    notes: "1D Conformer on raw I/Q time-domain signals for CZSL radar jamming classification"
+
+  tensorboard:
+    log_dir: "runs/conformer_1d"
+
+# 评估配置
+evaluation:
+  threshold: 0.5
+  save_predictions: true
+  visualize_embeddings: true
+
+# 保存配置
+checkpoint:
+  save_dir: "checkpoints/conformer"
+  save_best_only: true
+  monitor: "val_loss"
+  mode: "min"
+
+# 干扰类型定义
+jamming_classes:
+  - name: "DFTJ"
+  - name: "ISRJ"
+  - name: "ISCJ"
+  - name: "ISDJ"
+  - name: "MISRJ"
+  - name: "AJ"
+  - name: "BJ"
+  - name: "SJ"
+  - name: "NCJ"
+  - name: "NPJ"
+  - name: "SMSPJ"
+  - name: "C&IJ"
+  - name: "NFMJ"
+  - name: "NPMJ"
+  - name: "NAMJ"
+  - name: "CSJ"
+  - name: "PJ"
+
+# 类别名称翻译
+label_translations:
+  DFTJ: "Dense False Target Jamming"
+  ISRJ: "Interrupted Sampling Repeater Jamming"
+  AJ: "Aim-point Jamming"
+  BJ: "Barrage Jamming"
+  SJ: "Sweep Jamming"
+  NCJ: "Noise FM Jamming"
+  NPJ: "Noise PM Jamming"
+  SMSPJ: "Smoothed Pseudo Wigner-Ville Jamming"
+  "C&IJ": "Chopping and Interleaved Jamming"
+  NFMJ: "Noise Frequency Modulation Jamming"
+  NPMJ: "Noise Phase Modulation Jamming"
+  NAMJ: "Noise Amplitude Modulation Jamming"
+  CSJ: "Comb Spectrum Jamming"
+  PJ: "Phase Jamming"
+
+# CZSL 配置 - Seen/Unseen 组合划分
+czsl:
+  seen_combinations:
+  
+    - ["DFTJ"]
+    - ["SMSPJ"]
+    - ["CSJ"]
+    - ["ISCJ"]
+    - ["ISDJ"]
+    - ["ISRJ"]
+    - ["MISRJ"]
+    - ["C&IJ"]
+
+    - ["AJ"]
+    - ["BJ"]
+    - ["SJ"]
+    - ["NCJ"]
+    - ["NPJ"]
+    - ["NAMJ"]
+    - ["NPMJ"]
+    - ["NFMJ"]
+    - ["PJ"]
+
+  unseen_combinations:
+    - ["DFTJ", "AJ"]
+    - ["DFTJ", "BJ"]
+    - ["DFTJ", "SJ"]
+    - ["DFTJ", "NAMJ"]
+    - ["DFTJ", "NPMJ"]
+    - ["DFTJ", "NFMJ"]
+    - ["DFTJ", "PJ"]
+
+    - ["SMSPJ", "AJ"]
+    - ["SMSPJ", "BJ"]
+    - ["SMSPJ", "SJ"]
+    - ["SMSPJ", "NAMJ"]
+    - ["SMSPJ", "NPMJ"]
+    - ["SMSPJ", "NFMJ"]
+    - ["SMSPJ", "PJ"]
+
+    - ["CSJ", "AJ"]
+    - ["CSJ", "BJ"]
+    - ["CSJ", "SJ"]
+    - ["CSJ", "NAMJ"]
+    - ["CSJ", "NPMJ"]
+    - ["CSJ", "NFMJ"]
+    - ["CSJ", "PJ"]
+
+    - ["ISCJ", "AJ"]
+    - ["ISCJ", "BJ"]
+    - ["ISCJ", "SJ"]
+    - ["ISCJ", "NAMJ"]
+    - ["ISCJ", "NPMJ"]
+    - ["ISCJ", "NFMJ"]
+    - ["ISCJ", "PJ"]
+
+    - ["ISDJ", "AJ"]
+    - ["ISDJ", "BJ"]
+    - ["ISDJ", "SJ"]
+    - ["ISDJ", "NAMJ"]
+    - ["ISDJ", "NPMJ"]
+    - ["ISDJ", "NFMJ"]
+    - ["ISDJ", "PJ"]
+
+    - ["ISRJ", "AJ"]
+    - ["ISRJ", "BJ"]
+    - ["ISRJ", "SJ"]
+    - ["ISRJ", "NAMJ"]
+    - ["ISRJ", "NPMJ"]
+    - ["ISRJ", "NFMJ"]
+    - ["ISRJ", "PJ"]
+
+    - ["MISRJ", "AJ"]
+    - ["MISRJ", "BJ"]
+    - ["MISRJ", "SJ"]
+    - ["MISRJ", "NAMJ"]
+    - ["MISRJ", "NPMJ"]
+    - ["MISRJ", "NFMJ"]
+    - ["MISRJ", "PJ"]
+    
+    - ["C&IJ", "AJ"]
+    - ["C&IJ", "BJ"]
+    - ["C&IJ", "SJ"]
+    - ["C&IJ", "NAMJ"]
+    - ["C&IJ", "NPMJ"]
+    - ["C&IJ", "NFMJ"]
+    - ["C&IJ", "PJ"]
+
+  unseen_ratio: 0
+  split_seed: 42
+
+  zero_shot:
+    use_combinations: true
+    max_combination_size: 2
+    threshold: 0.14
