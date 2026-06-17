@@ -1,0 +1,235 @@
+# ============================================================================
+# Persistence Spectrum (持续时间谱) CLIP 训练配置
+# ============================================================================
+
+# CLIP 模型配置
+model:
+  clip_model: "ViT-B/32"
+
+  freeze_vision: false         # 设为 false 以启用部分解冻
+  vision_layers_unfreeze: 2    # 只解冻视觉编码器最后2层
+  freeze_text: true            # 冻结文本编码器
+
+# 训练配置
+train:
+  batch_size: 32
+  epochs: 20
+  lr: 0.00001                     # 1e-5
+  weight_decay: 0.01
+  warmup_epochs: 2
+  threshold: 0.07                  # 多标签预测阈值
+
+  scheduler:
+    type: "cosine"
+    min_lr: 0.0000001             # 1e-7
+
+  use_amp: false
+  grad_clip: 1.0
+
+# 损失函数配置
+loss:
+  type: "multilabel_infonce"   # label_aware_infonce | infonce | multilabel_infonce | asymmetric | bce
+  temperature: 0.1             # 对比损失温度参数
+  label_smoothing: 0.0
+  learnable_temperature: true
+  handle_zero_sum: "self_only"
+  similarity_metric: "iou"
+
+# 数据配置
+data:
+  base_path: "D:\\VScode\\Jamming_signal_simulation\\output\\fine"
+  jnr_start: 0
+  jnr_end: 20
+  jnr_step: 1
+  num_workers: 4
+  pin_memory: true
+  image_size: 224
+  persistence_var_name: "all_persistences"
+  persistence_suffix: "echo_persistences"
+
+# 特征条件上下文 (CoOp-style, 可选)
+use_feature_context: false
+
+n_ctx_per_domain:
+  time: 2
+  freq: 2
+  bispectrum: 1
+  wavelet: 3
+  statistical: 2
+
+feature_norm_stats_path: "multi/feature_normalization_stats.json"
+prompt_lr: 0.002
+
+# 日志配置
+logging:
+  type: "console"                # wandb | console | tensorboard
+  name: "CLIP_Persistence_CZSL"
+
+  wandb:
+    project: "CLIP-CZSL-Jamming"
+    entity: "cyanke9142-xidian-university"
+    tags: ["CLIP", "CZSL", "Persistence", "Jamming"]
+    notes: "CLIP fine-tuning on persistence spectrum for CZSL radar jamming classification"
+
+  tensorboard:
+    log_dir: "runs/persistence"
+
+# 评估配置
+evaluation:
+  threshold: 0.5
+  save_predictions: true
+  visualize_embeddings: true
+
+# 保存配置
+checkpoint:
+  save_dir: "checkpoints/persistence"
+  save_best_only: true
+  monitor: "val_loss"
+  mode: "min"
+
+# 干扰类型定义 (与 STFT 相同)
+jamming_classes:
+  - name: "DFTJ"
+  - name: "ISRJ"
+  - name: "AJ"
+  - name: "BJ"
+  - name: "SJ"
+  - name: "NCJ"
+  - name: "NPJ"
+  - name: "SMSPJ"
+  - name: "C&IJ"
+  - name: "NFMJ"
+  - name: "NPMJ"
+  - name: "NAMJ"
+  - name: "CSJ"
+  - name: "PJ"
+
+# 类别名称翻译字典
+label_translations:
+  DFTJ: "Dense False Target Jamming"
+  ISRJ: "Interrupted Sampling Repeater Jamming"
+  AJ: "Aim-point Jamming"
+  BJ: "Barrage Jamming"
+  SJ: "Sweep Jamming"
+  NCJ: "Noise FM Jamming"
+  NPJ: "Noise PM Jamming"
+  SMSPJ: "Smoothed Pseudo Wigner-Ville Jamming"
+  "C&IJ": "Chopping and Interleaved Jamming"
+  NFMJ: "Noise Frequency Modulation Jamming"
+  NPMJ: "Noise Phase Modulation Jamming"
+  NAMJ: "Noise Amplitude Modulation Jamming"
+  CSJ: "Comb Spectrum Jamming"
+  PJ: "Phase Jamming"
+
+# CZSL 配置 - Seen/Unseen 组合划分
+czsl:
+  seen_combinations:
+    - ["DFTJ"]
+    - ["SMSPJ"]
+    - ["CSJ"]
+    - ["ISRJ"]
+    - ["C&IJ"]
+
+    - ["AJ"]
+    - ["BJ"]
+    - ["SJ"]
+    - ["NCJ"]
+    - ["NPJ"]
+    - ["NAMJ"]
+    - ["NPMJ"]
+    - ["NFMJ"]
+    - ["PJ"]
+
+  unseen_combinations:
+    - ["DFTJ", "AJ"]
+    - ["DFTJ", "BJ"]
+    - ["DFTJ", "SJ"]
+    - ["DFTJ", "NCJ"]
+    - ["DFTJ", "NPJ"]
+    - ["DFTJ", "NAMJ"]
+    - ["DFTJ", "NPMJ"]
+    - ["DFTJ", "NFMJ"]
+    - ["DFTJ", "PJ"]
+
+    - ["ISRJ", "AJ"]
+    - ["ISRJ", "BJ"]
+    - ["ISRJ", "SJ"]
+    - ["ISRJ", "NCJ"]
+    - ["ISRJ", "NPJ"]
+    - ["ISRJ", "NAMJ"]
+    - ["ISRJ", "NPMJ"]
+    - ["ISRJ", "NFMJ"]
+    - ["ISRJ", "PJ"]
+
+    - ["SMSPJ", "AJ"]
+    - ["SMSPJ", "BJ"]
+    - ["SMSPJ", "SJ"]
+    - ["SMSPJ", "NCJ"]
+    - ["SMSPJ", "NPJ"]
+    - ["SMSPJ", "NAMJ"]
+    - ["SMSPJ", "NPMJ"]
+    - ["SMSPJ", "NFMJ"]
+    - ["SMSPJ", "PJ"]
+
+    - ["C&IJ", "AJ"]
+    - ["C&IJ", "BJ"]
+    - ["C&IJ", "SJ"]
+    - ["C&IJ", "NCJ"]
+    - ["C&IJ", "NPJ"]
+    - ["C&IJ", "NAMJ"]
+    - ["C&IJ", "NPMJ"]
+    - ["C&IJ", "NFMJ"]
+    - ["C&IJ", "PJ"]
+
+    - ["CSJ", "AJ"]
+    - ["CSJ", "BJ"]
+    - ["CSJ", "SJ"]
+    - ["CSJ", "NCJ"]
+    - ["CSJ", "NPJ"]
+    - ["CSJ", "NAMJ"]
+    - ["CSJ", "NPMJ"]
+    - ["CSJ", "NFMJ"]
+    - ["CSJ", "PJ"]
+
+  unseen_ratio: 0
+  split_seed: 42
+
+  zero_shot:
+    use_combinations: true
+    max_combination_size: 2
+    threshold: 0.14
+
+# ============================================================================
+# STFT 数据增强配置 (同样适用于 persistence 频谱)
+# ============================================================================
+augmentation:
+  enabled: false
+
+  specaugment:
+    enabled: false
+    time_mask_param: 0.2
+    freq_mask_param: 0.2
+    num_time_masks: 2
+    num_freq_masks: 2
+    mask_value: 0.0
+    p: 1.0
+
+  patch_mask:
+    enabled: false
+    patch_size: [16, 16]
+    mask_ratio: 0.3
+    mask_value: 0.0
+    p: 1.0
+
+  energy_mask:
+    enabled: false
+    top_percentile: 20.0
+    mask_prob: 0.8
+    mask_value: 0.0
+    p: 1.0
+
+  asymmetric:
+    enabled: false
+    mode: "stronger_mask"
+    extra_patch_mask_ratio: 0.2
+    extra_specaug_ratio: 0.05
