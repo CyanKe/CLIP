@@ -271,7 +271,10 @@ def create_persistence_dataloaders(config: dict):
     jnr_start = data_config.get('jnr_start', 0)
     jnr_end = data_config.get('jnr_end', 20)
     jnr_step = data_config.get('jnr_step', 1)
-    num_workers = data_config.get('num_workers', 0)
+    # Force num_workers=0: PersistenceDataset loads all data into RAM,
+    # so multiprocessing workers provide no I/O benefit and break on
+    # Windows (spawn mode pickles the entire dataset, causing OOM).
+    num_workers = 0
     pin_memory = data_config.get('pin_memory', True)
     image_size = data_config.get('image_size', 224)
     persistence_var_name = data_config.get('persistence_var_name', 'all_persistences')

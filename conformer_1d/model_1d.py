@@ -1,9 +1,15 @@
 """
-ConformerForCZSL: 1D Conformer + CLIP Text Encoder for CZSL.
+1D CZSL Models: Conformer / ResNet1D / CNN1D + CLIP Text Encoder.
 
-Replaces the 2D ViT vision encoder with a 1D Conformer that processes
-raw I/Q time-domain signals directly, while reusing CLIP's text encoder
-for contrastive learning.
+Provides three model variants that all share the same CLIP text encoder
+interface for contrastive learning on I/Q time-domain signals:
+
+  - ConformerForCZSL  (Conformer encoder, Gulati et al. 2020)
+  - ResNet1DForCZSL   (ResNet-18 1D encoder)
+  - CNN1DForCZSL      (Simple stacked CNN-1D encoder)
+
+All three produce L2-normalized (signal_features, text_features) pairs
+and support cache_text_features / zero_shot_predict for CZSL inference.
 """
 
 import os
@@ -21,17 +27,23 @@ if _parent not in sys.path:
     sys.path.insert(0, _parent)
 
 from conformer_1d.conformer import ConformerEncoder
+from conformer_1d.resnet1d import ResNet1DEncoder
+from conformer_1d.cnn1d import SimpleCNN1DEncoder
 
 
 # ---------------------------------------------------------------------------
-# Main model class
+# Base class — shared CLIP text encoder + CZSL logic
 # ---------------------------------------------------------------------------
 
-class ConformerForCZSL(nn.Module):
-    """1D Conformer vision encoder + CLIP text encoder for CZSL.
+class Base1DCZSLModel(nn.Module):
+    """Abstract base for 1D signal encoder + CLIP text encoder CZSL models.
+
+    Subclasses set ``self.signal_encoder`` in their ``__init__`` and implement
+    ``encode_signal()`` (or rely on the default which just calls
+    ``self.signal_encoder(x)``).
 
     Forward returns (signal_features, text_features) — both L2-normalized —
-    for contrastive learning with standard InfoNCE / LabelAwareInfoNCE loss.
+    for contrastive learning with InfoNCE / LabelAwareInfoNCE loss.
     """
 
     def __init__(
@@ -41,15 +53,6 @@ class ConformerForCZSL(nn.Module):
         class_names: List[str] = None,
         freeze_text: bool = True,
         device: str = "cuda",
-        # Conformer params
-        in_channels: int = 2,
-        input_len: int = 8000,
-        hidden_dim: int = 256,
-        num_blocks: int = 6,
-        num_heads: int = 4,
-        ffn_expansion: int = 4,
-        conv_kernel_size: int = 15,
-        dropout: float = 0.1,
         embed_dim: int = 512,
         # Feature-conditioned context (CoOp-style)
         use_feature_context: bool = False,
@@ -90,18 +93,8 @@ class ConformerForCZSL(nn.Module):
             self.text_projection.requires_grad = False
         self._freeze_text = freeze_text
 
-        # ---- 1D Conformer encoder ----
-        self.signal_encoder = ConformerEncoder(
-            in_channels=in_channels,
-            input_len=input_len,
-            hidden_dim=hidden_dim,
-            num_blocks=num_blocks,
-            num_heads=num_heads,
-            ffn_expansion=ffn_expansion,
-            conv_kernel_size=conv_kernel_size,
-            dropout=dropout,
-            embed_dim=embed_dim,
-        )
+        # ---- Subclass MUST set self.signal_encoder ----
+        self.signal_encoder = None
 
         # ---- Feature-conditioned context (CoOp-style) ----
         if use_feature_context:
@@ -118,8 +111,8 @@ class ConformerForCZSL(nn.Module):
         self._combination_features_cache = None
         self._combination_names = None
 
-        # Move to device
-        self.to(device)
+        # NOTE: self.to(device) is deferred — subclasses call it after
+        # setting self.signal_encoder so the encoder lands on the right device.
 
     # ------------------------------------------------------------------
     # dtype helper
@@ -135,7 +128,7 @@ class ConformerForCZSL(nn.Module):
         return self
 
     # ------------------------------------------------------------------
-    # Signal encoding
+    # Signal encoding (subclass may override)
     # ------------------------------------------------------------------
 
     def encode_image(self, time_signal: torch.Tensor) -> torch.Tensor:
@@ -143,7 +136,7 @@ class ConformerForCZSL(nn.Module):
         return self.encode_signal(time_signal)
 
     def encode_signal(self, time_signal: torch.Tensor) -> torch.Tensor:
-        """Encode I/Q time-domain signal with Conformer.
+        """Encode I/Q time-domain signal.
 
         Args:
             time_signal: (B, 2, T) — I/Q channels
@@ -247,7 +240,7 @@ class ConformerForCZSL(nn.Module):
         Returns:
             (signal_features, text_features) — both (B, embed_dim), L2-normalized
         """
-        # 1. Encode signal with Conformer
+        # 1. Encode signal
         signal_features = self.encode_signal(time_signal)
 
         # 2. Encode text
@@ -383,7 +376,6 @@ class ConformerForCZSL(nn.Module):
         if features_dict is not None and self.prompt_learner is not None:
             from multi.text_templates import get_inference_description
             import clip
-            import itertools
 
             context_vectors = self.prompt_learner(features_dict)
             all_features = []
@@ -432,29 +424,158 @@ class ConformerForCZSL(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Factory function
+# ConformerForCZSL
 # ---------------------------------------------------------------------------
 
-def create_conformer_model(config: dict, device: str = None) -> ConformerForCZSL:
-    """Build a ConformerForCZSL model from a config dict.
+class ConformerForCZSL(Base1DCZSLModel):
+    """1D Conformer + CLIP text encoder for CZSL."""
 
-    Args:
-        config: full config dict (from config_1d.yaml)
-        device: torch device string (default: "cuda" if available else "cpu")
+    def __init__(
+        self,
+        clip_model_name: str = "ViT-B/32",
+        num_classes: int = 14,
+        class_names: List[str] = None,
+        freeze_text: bool = True,
+        device: str = "cuda",
+        # Conformer params
+        in_channels: int = 2,
+        input_len: int = 8000,
+        hidden_dim: int = 256,
+        num_blocks: int = 6,
+        num_heads: int = 4,
+        ffn_expansion: int = 4,
+        conv_kernel_size: int = 15,
+        dropout: float = 0.1,
+        embed_dim: int = 512,
+        # Feature-conditioned context (CoOp-style)
+        use_feature_context: bool = False,
+        n_ctx_per_domain: dict = None,
+    ):
+        super().__init__(
+            clip_model_name=clip_model_name,
+            num_classes=num_classes,
+            class_names=class_names,
+            freeze_text=freeze_text,
+            device=device,
+            embed_dim=embed_dim,
+            use_feature_context=use_feature_context,
+            n_ctx_per_domain=n_ctx_per_domain,
+        )
 
-    Returns:
-        ConformerForCZSL model
-    """
+        self.signal_encoder = ConformerEncoder(
+            in_channels=in_channels,
+            input_len=input_len,
+            hidden_dim=hidden_dim,
+            num_blocks=num_blocks,
+            num_heads=num_heads,
+            ffn_expansion=ffn_expansion,
+            conv_kernel_size=conv_kernel_size,
+            dropout=dropout,
+            embed_dim=embed_dim,
+        )
+        self.to(device)
+
+
+# ---------------------------------------------------------------------------
+# ResNet1DForCZSL
+# ---------------------------------------------------------------------------
+
+class ResNet1DForCZSL(Base1DCZSLModel):
+    """ResNet-18 1D + CLIP text encoder for CZSL."""
+
+    def __init__(
+        self,
+        clip_model_name: str = "ViT-B/32",
+        num_classes: int = 14,
+        class_names: List[str] = None,
+        freeze_text: bool = True,
+        device: str = "cuda",
+        # ResNet1D params
+        in_channels: int = 2,
+        embed_dim: int = 512,
+        # Feature-conditioned context (CoOp-style)
+        use_feature_context: bool = False,
+        n_ctx_per_domain: dict = None,
+    ):
+        super().__init__(
+            clip_model_name=clip_model_name,
+            num_classes=num_classes,
+            class_names=class_names,
+            freeze_text=freeze_text,
+            device=device,
+            embed_dim=embed_dim,
+            use_feature_context=use_feature_context,
+            n_ctx_per_domain=n_ctx_per_domain,
+        )
+
+        self.signal_encoder = ResNet1DEncoder(
+            in_channels=in_channels,
+            embed_dim=embed_dim,
+        )
+        self.to(device)
+
+
+# ---------------------------------------------------------------------------
+# CNN1DForCZSL
+# ---------------------------------------------------------------------------
+
+class CNN1DForCZSL(Base1DCZSLModel):
+    """Simple CNN-1D + CLIP text encoder for CZSL."""
+
+    def __init__(
+        self,
+        clip_model_name: str = "ViT-B/32",
+        num_classes: int = 14,
+        class_names: List[str] = None,
+        freeze_text: bool = True,
+        device: str = "cuda",
+        # CNN1D params
+        in_channels: int = 2,
+        embed_dim: int = 512,
+        # Feature-conditioned context (CoOp-style)
+        use_feature_context: bool = False,
+        n_ctx_per_domain: dict = None,
+    ):
+        super().__init__(
+            clip_model_name=clip_model_name,
+            num_classes=num_classes,
+            class_names=class_names,
+            freeze_text=freeze_text,
+            device=device,
+            embed_dim=embed_dim,
+            use_feature_context=use_feature_context,
+            n_ctx_per_domain=n_ctx_per_domain,
+        )
+
+        self.signal_encoder = SimpleCNN1DEncoder(
+            in_channels=in_channels,
+            embed_dim=embed_dim,
+        )
+        self.to(device)
+
+
+# ---------------------------------------------------------------------------
+# Factory functions
+# ---------------------------------------------------------------------------
+
+def _get_class_names(config: dict) -> List[str]:
+    """Extract class name strings from config."""
+    jamming_classes = config.get('jamming_classes', [])
+    return [jc['name'] if isinstance(jc, dict) else jc for jc in jamming_classes]
+
+
+def _get_device(device: str = None) -> str:
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
 
+
+def create_conformer_model(config: dict, device: str = None) -> ConformerForCZSL:
+    """Build a ConformerForCZSL model from a config dict."""
+    device = _get_device(device)
     model_cfg = config['model']
     conformer_cfg = model_cfg.get('conformer', {})
-    train_cfg = config.get('train', {})
-
-    # Class names
-    jamming_classes = config.get('jamming_classes', [])
-    class_names = [jc['name'] if isinstance(jc, dict) else jc for jc in jamming_classes]
+    class_names = _get_class_names(config)
 
     model = ConformerForCZSL(
         clip_model_name=model_cfg.get('clip_model', 'ViT-B/32'),
@@ -472,18 +593,83 @@ def create_conformer_model(config: dict, device: str = None) -> ConformerForCZSL
         conv_kernel_size=conformer_cfg.get('conv_kernel_size', 15),
         dropout=conformer_cfg.get('dropout', 0.1),
         embed_dim=model_cfg.get('embed_dim', 512),
-        # Feature context
         use_feature_context=config.get('use_feature_context', False),
         n_ctx_per_domain=config.get('n_ctx_per_domain', None),
     )
+    _print_model_info(model, "ConformerForCZSL", len(class_names))
+    return model
 
-    print(f"ConformerForCZSL created:")
+
+def create_resnet1d_model(config: dict, device: str = None) -> ResNet1DForCZSL:
+    """Build a ResNet1DForCZSL model from a config dict."""
+    device = _get_device(device)
+    model_cfg = config['model']
+    class_names = _get_class_names(config)
+
+    model = ResNet1DForCZSL(
+        clip_model_name=model_cfg.get('clip_model', 'ViT-B/32'),
+        num_classes=len(class_names),
+        class_names=class_names,
+        freeze_text=model_cfg.get('freeze_text', True),
+        device=device,
+        in_channels=2,
+        embed_dim=model_cfg.get('embed_dim', 512),
+        use_feature_context=config.get('use_feature_context', False),
+        n_ctx_per_domain=config.get('n_ctx_per_domain', None),
+    )
+    _print_model_info(model, "ResNet1DForCZSL", len(class_names))
+    return model
+
+
+def create_cnn1d_model(config: dict, device: str = None) -> CNN1DForCZSL:
+    """Build a CNN1DForCZSL model from a config dict."""
+    device = _get_device(device)
+    model_cfg = config['model']
+    class_names = _get_class_names(config)
+
+    model = CNN1DForCZSL(
+        clip_model_name=model_cfg.get('clip_model', 'ViT-B/32'),
+        num_classes=len(class_names),
+        class_names=class_names,
+        freeze_text=model_cfg.get('freeze_text', True),
+        device=device,
+        in_channels=2,
+        embed_dim=model_cfg.get('embed_dim', 512),
+        use_feature_context=config.get('use_feature_context', False),
+        n_ctx_per_domain=config.get('n_ctx_per_domain', None),
+    )
+    _print_model_info(model, "CNN1DForCZSL", len(class_names))
+    return model
+
+
+def _print_model_info(model: nn.Module, name: str, num_classes: int):
+    print(f"{name} created:")
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
     print(f"  Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    print(f"  Classes: {len(class_names)}")
+    print(f"  Classes: {num_classes}")
     print(f"  Embed dim: {model.embed_dim}")
 
-    return model
+
+# ---------------------------------------------------------------------------
+# Unified factory — selects model by backbone name
+# ---------------------------------------------------------------------------
+
+def create_1d_model(config: dict, device: str = None) -> Base1DCZSLModel:
+    """Create a 1D CZSL model based on config['model']['backbone'].
+
+    Supported backbones: "conformer", "resnet1d", "cnn1d"
+    """
+    backbone = config.get('model', {}).get('backbone', 'conformer')
+    factories = {
+        'conformer': create_conformer_model,
+        'resnet1d': create_resnet1d_model,
+        'cnn1d': create_cnn1d_model,
+    }
+    if backbone not in factories:
+        raise ValueError(f"Unknown backbone '{backbone}'. "
+                         f"Choose from: {list(factories.keys())}")
+    print(f"Selected backbone: {backbone}")
+    return factories[backbone](config, device)
 
 
 # ---------------------------------------------------------------------------
@@ -491,42 +677,54 @@ def create_conformer_model(config: dict, device: str = None) -> ConformerForCZSL
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("Testing ConformerForCZSL...")
+    import clip
 
     jamming_classes = [
         "DFTJ", "ISRJ", "AJ", "BJ", "SJ", "NCJ", "NPJ",
         "SMSPJ", "C&IJ", "NFMJ", "NPMJ", "NAMJ", "CSJ", "PJ",
     ]
 
-    model = ConformerForCZSL(
-        clip_model_name="ViT-B/32",
-        num_classes=14,
-        class_names=jamming_classes,
-        freeze_text=True,
-        device="cpu",
-    )
+    def test_model(model, name: str):
+        print(f"\n{'─'*60}")
+        print(f"Testing {name}...")
+        dummy_signal = torch.randn(2, 2, 8000)
+        dummy_text = clip.tokenize(["DFTJ", "AJ"], truncate=True)
 
-    # Test forward pass
-    import clip
-    dummy_signal = torch.randn(2, 2, 8000)
-    dummy_text = clip.tokenize(["DFTJ", "AJ"], truncate=True)
+        with torch.no_grad():
+            sig_feat, txt_feat = model(dummy_signal, dummy_text)
+            assert sig_feat.shape == (2, 512), f"Bad signal shape: {sig_feat.shape}"
+            assert txt_feat.shape == (2, 512), f"Bad text shape: {txt_feat.shape}"
+            print(f"  Signal features: {sig_feat.shape}, norm={sig_feat.norm(dim=-1)}")
+            print(f"  Text features:   {txt_feat.shape}, norm={txt_feat.norm(dim=-1)}")
 
-    with torch.no_grad():
-        sig_feat, txt_feat = model(dummy_signal, dummy_text)
-        print(f"Signal features: {sig_feat.shape}, norm={sig_feat.norm(dim=-1)}")
-        print(f"Text features:   {txt_feat.shape}, norm={txt_feat.norm(dim=-1)}")
+        # Test caching
+        with torch.no_grad():
+            model.cache_text_features()
+            combos = model.get_cached_combination_features()
+            print(f"  Combination features: {combos.shape}")
 
-    # Test caching
-    with torch.no_grad():
-        model.cache_text_features()
-        combos = model.get_cached_combination_features()
-        print(f"Combination features: {combos.shape}")
+        # Test zero-shot
+        with torch.no_grad():
+            sims, idxs, names = model.zero_shot_predict(dummy_signal[:1])
+            print(f"  Similarities: {sims.shape}, candidates: {len(names)}")
+            print(f"  Top-1: {names[idxs[0, 0].item()]}")
 
-    # Test zero-shot
-    with torch.no_grad():
-        sims, idxs, names = model.zero_shot_predict(dummy_signal[:1])
-        print(f"Similarities: {sims.shape}")
-        print(f"Top-1 indices: {idxs.shape}")
-        print(f"Candidate names ({len(names)}): {names[:5]}...")
+        print(f"  ✓ {name} passed!")
 
+    # Test all three backbones
+    for backbone_cls, name in [
+        (ConformerForCZSL, "ConformerForCZSL"),
+        (ResNet1DForCZSL, "ResNet1DForCZSL"),
+        (CNN1DForCZSL, "CNN1DForCZSL"),
+    ]:
+        model = backbone_cls(
+            clip_model_name="ViT-B/32",
+            num_classes=14,
+            class_names=jamming_classes,
+            freeze_text=True,
+            device="cpu",
+        )
+        test_model(model, name)
+
+    print(f"\n{'─'*60}")
     print("All tests passed!")

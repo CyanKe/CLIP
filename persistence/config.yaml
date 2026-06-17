@@ -37,10 +37,10 @@ loss:
 
 # 数据配置
 data:
-  base_path: "D:\\VScode\\Jamming_signal_simulation\\output\\fine"
+  base_path: "C:\\output\\output\\know_more"
   jnr_start: 0
   jnr_end: 20
-  jnr_step: 1
+  jnr_step: 5
   num_workers: 4
   pin_memory: true
   image_size: 224
@@ -91,6 +91,9 @@ checkpoint:
 jamming_classes:
   - name: "DFTJ"
   - name: "ISRJ"
+  - name: "ISDJ"
+  - name: "ISCJ"
+  - name: "MISRJ"
   - name: "AJ"
   - name: "BJ"
   - name: "SJ"
@@ -124,12 +127,19 @@ label_translations:
 # CZSL 配置 - Seen/Unseen 组合划分
 czsl:
   seen_combinations:
+    seen_combinations:
+    # 单干扰类型（全部为seen）
+    # 欺骗干扰
     - ["DFTJ"]
     - ["SMSPJ"]
     - ["CSJ"]
+    - ["ISCJ"]
+    - ["ISDJ"]
     - ["ISRJ"]
+    - ["MISRJ"]
     - ["C&IJ"]
 
+    # 压制干扰
     - ["AJ"]
     - ["BJ"]
     - ["SJ"]
@@ -140,57 +150,74 @@ czsl:
     - ["NFMJ"]
     - ["PJ"]
 
+
   unseen_combinations:
+  # 未见组合（用于零样本测试）
+  # 这些组合在训练时不出现，但测试时需要识别
+
     - ["DFTJ", "AJ"]
     - ["DFTJ", "BJ"]
     - ["DFTJ", "SJ"]
-    - ["DFTJ", "NCJ"]
-    - ["DFTJ", "NPJ"]
     - ["DFTJ", "NAMJ"]
     - ["DFTJ", "NPMJ"]
     - ["DFTJ", "NFMJ"]
     - ["DFTJ", "PJ"]
 
-    - ["ISRJ", "AJ"]
-    - ["ISRJ", "BJ"]
-    - ["ISRJ", "SJ"]
-    - ["ISRJ", "NCJ"]
-    - ["ISRJ", "NPJ"]
-    - ["ISRJ", "NAMJ"]
-    - ["ISRJ", "NPMJ"]
-    - ["ISRJ", "NFMJ"]
-    - ["ISRJ", "PJ"]
-
     - ["SMSPJ", "AJ"]
     - ["SMSPJ", "BJ"]
     - ["SMSPJ", "SJ"]
-    - ["SMSPJ", "NCJ"]
-    - ["SMSPJ", "NPJ"]
     - ["SMSPJ", "NAMJ"]
     - ["SMSPJ", "NPMJ"]
     - ["SMSPJ", "NFMJ"]
     - ["SMSPJ", "PJ"]
 
-    - ["C&IJ", "AJ"]
-    - ["C&IJ", "BJ"]
-    - ["C&IJ", "SJ"]
-    - ["C&IJ", "NCJ"]
-    - ["C&IJ", "NPJ"]
-    - ["C&IJ", "NAMJ"]
-    - ["C&IJ", "NPMJ"]
-    - ["C&IJ", "NFMJ"]
-    - ["C&IJ", "PJ"]
-
     - ["CSJ", "AJ"]
     - ["CSJ", "BJ"]
     - ["CSJ", "SJ"]
-    - ["CSJ", "NCJ"]
-    - ["CSJ", "NPJ"]
     - ["CSJ", "NAMJ"]
     - ["CSJ", "NPMJ"]
     - ["CSJ", "NFMJ"]
     - ["CSJ", "PJ"]
 
+    - ["ISCJ", "AJ"]
+    - ["ISCJ", "BJ"]
+    - ["ISCJ", "SJ"]
+    - ["ISCJ", "NAMJ"]
+    - ["ISCJ", "NPMJ"]
+    - ["ISCJ", "NFMJ"]
+    - ["ISCJ", "PJ"]
+
+    - ["ISDJ", "AJ"]
+    - ["ISDJ", "BJ"]
+    - ["ISDJ", "SJ"]
+    - ["ISDJ", "NAMJ"]
+    - ["ISDJ", "NPMJ"]
+    - ["ISDJ", "NFMJ"]
+    - ["ISDJ", "PJ"]
+
+    - ["ISRJ", "AJ"]
+    - ["ISRJ", "BJ"]
+    - ["ISRJ", "SJ"]
+    - ["ISRJ", "NAMJ"]
+    - ["ISRJ", "NPMJ"]
+    - ["ISRJ", "NFMJ"]
+    - ["ISRJ", "PJ"]
+
+    - ["MISRJ", "AJ"]
+    - ["MISRJ", "BJ"]
+    - ["MISRJ", "SJ"]
+    - ["MISRJ", "NAMJ"]
+    - ["MISRJ", "NPMJ"]
+    - ["MISRJ", "NFMJ"]
+    - ["MISRJ", "PJ"]
+
+    - ["C&IJ", "AJ"]
+    - ["C&IJ", "BJ"]
+    - ["C&IJ", "SJ"]
+    - ["C&IJ", "NAMJ"]
+    - ["C&IJ", "NPMJ"]
+    - ["C&IJ", "NFMJ"]
+    - ["C&IJ", "PJ"]
   unseen_ratio: 0
   split_seed: 42
 
@@ -198,38 +225,3 @@ czsl:
     use_combinations: true
     max_combination_size: 2
     threshold: 0.14
-
-# ============================================================================
-# STFT 数据增强配置 (同样适用于 persistence 频谱)
-# ============================================================================
-augmentation:
-  enabled: false
-
-  specaugment:
-    enabled: false
-    time_mask_param: 0.2
-    freq_mask_param: 0.2
-    num_time_masks: 2
-    num_freq_masks: 2
-    mask_value: 0.0
-    p: 1.0
-
-  patch_mask:
-    enabled: false
-    patch_size: [16, 16]
-    mask_ratio: 0.3
-    mask_value: 0.0
-    p: 1.0
-
-  energy_mask:
-    enabled: false
-    top_percentile: 20.0
-    mask_prob: 0.8
-    mask_value: 0.0
-    p: 1.0
-
-  asymmetric:
-    enabled: false
-    mode: "stronger_mask"
-    extra_patch_mask_ratio: 0.2
-    extra_specaug_ratio: 0.05

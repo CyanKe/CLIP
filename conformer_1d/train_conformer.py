@@ -1,9 +1,11 @@
 """
-Training script for 1D Conformer CZSL.
+Unified training script for 1D CZSL models (Conformer / ResNet1D / CNN1D).
+
+Select backbone via config:  model.backbone = "conformer" | "resnet1d" | "cnn1d"
 
 Usage:
     python conformer_1d/train_conformer.py --config conformer_1d/config_1d.yaml
-    python conformer_1d/train_conformer.py --config conformer_1d/config_1d.yaml --resume checkpoints/conformer/conformer_latest.pt
+    python conformer_1d/train_conformer.py --config conformer_1d/config_1d.yaml --resume checkpoints/resnet1d/resnet1d_latest.pt
     python conformer_1d/train_conformer.py --config conformer_1d/config_1d.yaml --debug
 """
 
@@ -31,21 +33,58 @@ except ImportError:
 _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _parent)
 
-from conformer_1d.model_1d import ConformerForCZSL, create_conformer_model
+from conformer_1d.model_1d import Base1DCZSLModel, create_1d_model
 from conformer_1d.data_1d import create_1d_dataloaders
 from multi.loss import create_loss_function, LabelAwareInfoNCELoss, MultiLabelSigmoidLoss
 
 
+# ============================================================================
+# Backbone strategies — lightweight model-selection helpers
+# ============================================================================
+
+BACKBONE_CONFIG = {
+    "conformer": {
+        "checkpoint_prefix": "conformer",
+        "wandb_tag": "Conformer",
+        "display_name": "Conformer 1D",
+    },
+    "resnet1d": {
+        "checkpoint_prefix": "resnet1d",
+        "wandb_tag": "ResNet1D",
+        "display_name": "ResNet-18 1D",
+    },
+    "cnn1d": {
+        "checkpoint_prefix": "cnn1d",
+        "wandb_tag": "CNN1D",
+        "display_name": "CNN 1D",
+    },
+}
+
+
+def get_backbone_info(config: dict) -> dict:
+    """Return the backbone config dict for the selected backbone."""
+    backbone = config.get("model", {}).get("backbone", "conformer")
+    if backbone not in BACKBONE_CONFIG:
+        raise ValueError(
+            f"Unknown backbone '{backbone}'. "
+            f"Choose from: {list(BACKBONE_CONFIG.keys())}"
+        )
+    return BACKBONE_CONFIG[backbone]
+
+
 # ---------------------------------------------------------------------------
-# Trainer
+# Trainer (model-agnostic)
 # ---------------------------------------------------------------------------
 
-class ConformerTrainer:
-    """Trainer for 1D Conformer + CLIP text encoder CZSL."""
+class Trainer1D:
+    """Unified trainer for 1D signal encoder + CLIP text encoder CZSL models.
+
+    Works with any Base1DCZSLModel subclass — Conformer, ResNet1D, or CNN1D.
+    """
 
     def __init__(
         self,
-        model: ConformerForCZSL,
+        model: Base1DCZSLModel,
         train_loader,
         val_loader,
         optimizer,
@@ -68,8 +107,16 @@ class ConformerTrainer:
         self.train_config = config.get("train", {})
         self.grad_clip = self.train_config.get("grad_clip", 1.0)
 
+        # Checkpoint dir based on backbone
+        backbone_info = get_backbone_info(config)
+        self.checkpoint_prefix = backbone_info["checkpoint_prefix"]
+        self.display_name = backbone_info["display_name"]
+        self.wandb_tags = backbone_info.get("wandb_tags", [])
+        if isinstance(self.wandb_tags, str):
+            self.wandb_tags = [self.wandb_tags]
+
         self.checkpoint_config = config.get("checkpoint", {})
-        self.save_dir = Path(self.checkpoint_config.get("save_dir", "checkpoints/conformer"))
+        self.save_dir = Path(self.checkpoint_config.get("save_dir", "checkpoints"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         # Loss function (reused from multi/loss.py)
@@ -257,11 +304,11 @@ class ConformerTrainer:
             "config": self.config,
         }
 
-        latest_path = self.save_dir / "conformer_latest_checkpoint.pt"
+        latest_path = self.save_dir / f"{self.checkpoint_prefix}_latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
 
         if is_best:
-            best_path = self.save_dir / "conformer_best_model.pt"
+            best_path = self.save_dir / f"{self.checkpoint_prefix}_best_model.pt"
             torch.save(checkpoint, best_path)
             print(f"  ★ Saved best model with loss: {metrics['loss']:.4f}")
 
@@ -271,8 +318,10 @@ class ConformerTrainer:
 
     def fit(self, num_epochs: int, debug: bool = False) -> dict:
         print(f"\n{'='*60}")
-        print(f"Starting Conformer CZSL Training for {num_epochs} epochs")
+        print(f"Starting {self.display_name} CZSL Training for {num_epochs} epochs")
         print(f"Device: {self.device}")
+        print(f"Checkpoint prefix: {self.checkpoint_prefix}")
+        print(f"Save dir: {self.save_dir}")
         print(f"{'='*60}\n")
 
         if self.use_wandb:
@@ -280,9 +329,9 @@ class ConformerTrainer:
             wandb.init(
                 project=wandb_config.get("project", "CLIP-CZSL-Jamming"),
                 entity=wandb_config.get("entity", None),
-                name=f"Conformer_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                tags=wandb_config.get("tags", []) + ["Conformer", "1D", "CZSL"],
-                notes=wandb_config.get("notes", "1D Conformer CZSL training"),
+                name=f"{self.checkpoint_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                tags=wandb_config.get("tags", []) + self.wandb_tags + ["1D", "CZSL"],
+                notes=wandb_config.get("notes", f"{self.display_name} CZSL training"),
                 config=self.config,
             )
             wandb.watch(self.model, log="all", log_freq=100)
@@ -388,7 +437,7 @@ def create_optimizer_and_scheduler(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="1D Conformer CZSL Training")
+    parser = argparse.ArgumentParser(description="1D CZSL Model Training (Conformer / ResNet1D / CNN1D)")
     parser.add_argument("--config", type=str, default="conformer_1d/config_1d.yaml",
                         help="Path to config file")
     parser.add_argument("--resume", type=str, default=None,
@@ -401,9 +450,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Create model
-    print("\nCreating Conformer CZSL model...")
-    model = create_conformer_model(config, device=str(device))
+    # Create model from config backbone
+    print("\nCreating CZSL model...")
+    model = create_1d_model(config, device=str(device))
 
     # Create dataloaders
     print("\nLoading 1D time-domain datasets...")
@@ -430,7 +479,7 @@ def main():
     optimizer, scheduler = create_optimizer_and_scheduler(model, config)
 
     # Create trainer
-    trainer = ConformerTrainer(
+    trainer = Trainer1D(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,

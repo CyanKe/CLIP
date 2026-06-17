@@ -1,14 +1,16 @@
 # ============================================================================
-# 1D Conformer for CZSL Radar Jamming Signal Classification
+# 1D Model for CZSL Radar Jamming Signal Classification
+# Supports: Conformer / ResNet1D / CNN1D (select via model.backbone)
 # ============================================================================
 
-# Conformer + CLIP Text Encoder 配置
+# 通用模型配置
 model:
+  backbone: "resnet1d"              # "conformer" | "resnet1d" | "cnn1d"
   clip_model: "ViT-B/32"            # 仅用于文本编码器 (不加载 ViT)
   freeze_text: true
   embed_dim: 512
 
-  # Conformer 架构参数
+  # Conformer 架构参数 (仅在 backbone=conformer 时生效)
   conformer:
     in_channels: 2                  # I/Q 双通道
     hidden_dim: 256
@@ -17,6 +19,8 @@ model:
     ffn_expansion: 4
     conv_kernel_size: 15
     dropout: 0.1
+
+  # ResNet1D / CNN1D 无需额外参数，使用标准架构
 
 # 训练配置
 train:
@@ -45,10 +49,10 @@ loss:
 
 # 数据配置
 data:
-  base_path: "C:\\output\\output\\know_more"
+  base_path: "C:\\output\\output\\fine_more"
   jnr_start: 0
   jnr_end: 20
-  jnr_step: 5                      # JNR_+0, JNR_+1, ..., JNR_+20
+  jnr_step: 1                      # JNR_+0, JNR_+1, ..., JNR_+20
   num_workers: 0
   pin_memory: true
   time_seq_len: 8000
@@ -73,7 +77,7 @@ logging:
   wandb:
     project: "CLIP-CZSL-Jamming"
     entity: "cyanke9142-xidian-university"
-    tags: ["Conformer", "CZSL", "1D", "Time-Domain"]
+    tags: ["1D", "CZSL", "Time-Domain"]
     notes: "1D Conformer on raw I/Q time-domain signals for CZSL radar jamming classification"
 
   tensorboard:
@@ -87,7 +91,7 @@ evaluation:
 
 # 保存配置
 checkpoint:
-  save_dir: "checkpoints/conformer"
+  save_dir: "checkpoints"            # 自动加 backbone 前缀 (e.g. checkpoints/conformer_best_model.pt)
   save_best_only: true
   monitor: "val_loss"
   mode: "min"

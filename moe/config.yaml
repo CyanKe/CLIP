@@ -1,0 +1,192 @@
+# ============================================================================
+# MoE Hybrid Interference Evaluation Configuration
+#
+# Fuses Persistence (偏向压制) + Conformer (偏向欺骗) models via MoE:
+#   Expert 1 (Conformer): contributes deception predictions
+#   Expert 2 (Persistence): contributes suppression predictions
+# ============================================================================
+
+# ── Checkpoint paths ──────────────────────────────────────────────────────
+checkpoint:
+  persistence: "checkpoints/persistence/persistence_best_model.pt"
+  conformer: "checkpoints/conformer/conformer_best_model.pt"
+
+# ── Persistence model architecture config ──────────────────────────────────
+persistence_model:
+  clip_model: "ViT-B/32"
+  freeze_vision: false
+  vision_layers_unfreeze: 2
+  freeze_text: true
+
+# ── Conformer model architecture config ────────────────────────────────────
+conformer_model:
+  clip_model: "ViT-B/32"
+  freeze_text: true
+  embed_dim: 512
+  conformer:
+    in_channels: 2
+    hidden_dim: 256
+    num_blocks: 6
+    num_heads: 4
+    ffn_expansion: 4
+    conv_kernel_size: 15
+    dropout: 0.1
+
+# ── Data configuration (shared base path, both modalities) ─────────────────
+data:
+  base_path: "C:\\output\\output\\fine_more"
+  jnr_start: 0
+  jnr_end: 20
+  jnr_step: 1
+  num_workers: 0
+  pin_memory: true
+  batch_size: 16
+  image_size: 224
+  time_seq_len: 8000
+  persistence_var_name: "all_persistences"
+  persistence_suffix: "echo_persistences"
+  time_var_name: "all_times"
+
+# ── Jamming classes (17 total, consistent across both modules) ────────────
+jamming_classes:
+  - name: "DFTJ"
+  - name: "ISRJ"
+  - name: "ISCJ"
+  - name: "ISDJ"
+  - name: "MISRJ"
+  - name: "AJ"
+  - name: "BJ"
+  - name: "SJ"
+  - name: "NCJ"
+  - name: "NPJ"
+  - name: "SMSPJ"
+  - name: "C&IJ"
+  - name: "NFMJ"
+  - name: "NPMJ"
+  - name: "NAMJ"
+  - name: "CSJ"
+  - name: "PJ"
+
+# ── Deception / Suppression split (critical for MoE fusion rule) ───────────
+# Expert 1 (Conformer) trusts deception; Expert 2 (Persistence) trusts suppression
+deception_classes:
+  - "DFTJ"
+  - "ISRJ"
+  - "ISCJ"
+  - "ISDJ"
+  - "MISRJ"
+  - "SMSPJ"
+  - "C&IJ"
+  - "CSJ"
+
+suppression_classes:
+  - "AJ"
+  - "BJ"
+  - "SJ"
+  - "NCJ"
+  - "NPJ"
+  - "NFMJ"
+  - "NPMJ"
+  - "NAMJ"
+  - "PJ"
+
+# ── CZSL configuration ─────────────────────────────────────────────────────
+czsl:
+  seen_combinations:
+    # Single-type (all seen during training)
+    - ["DFTJ"]
+    - ["SMSPJ"]
+    - ["CSJ"]
+    - ["ISCJ"]
+    - ["ISDJ"]
+    - ["ISRJ"]
+    - ["MISRJ"]
+    - ["C&IJ"]
+    - ["AJ"]
+    - ["BJ"]
+    - ["SJ"]
+    - ["NCJ"]
+    - ["NPJ"]
+    - ["NAMJ"]
+    - ["NPMJ"]
+    - ["NFMJ"]
+    - ["PJ"]
+
+  unseen_combinations:
+    # Deception × Suppression pairs (unseen during training)
+    - ["DFTJ", "AJ"]
+    - ["DFTJ", "BJ"]
+    - ["DFTJ", "SJ"]
+    - ["DFTJ", "NAMJ"]
+    - ["DFTJ", "NPMJ"]
+    - ["DFTJ", "NFMJ"]
+    - ["DFTJ", "PJ"]
+    - ["SMSPJ", "AJ"]
+    - ["SMSPJ", "BJ"]
+    - ["SMSPJ", "SJ"]
+    - ["SMSPJ", "NAMJ"]
+    - ["SMSPJ", "NPMJ"]
+    - ["SMSPJ", "NFMJ"]
+    - ["SMSPJ", "PJ"]
+    - ["CSJ", "AJ"]
+    - ["CSJ", "BJ"]
+    - ["CSJ", "SJ"]
+    - ["CSJ", "NAMJ"]
+    - ["CSJ", "NPMJ"]
+    - ["CSJ", "NFMJ"]
+    - ["CSJ", "PJ"]
+    - ["ISCJ", "AJ"]
+    - ["ISCJ", "BJ"]
+    - ["ISCJ", "SJ"]
+    - ["ISCJ", "NAMJ"]
+    - ["ISCJ", "NPMJ"]
+    - ["ISCJ", "NFMJ"]
+    - ["ISCJ", "PJ"]
+    - ["ISDJ", "AJ"]
+    - ["ISDJ", "BJ"]
+    - ["ISDJ", "SJ"]
+    - ["ISDJ", "NAMJ"]
+    - ["ISDJ", "NPMJ"]
+    - ["ISDJ", "NFMJ"]
+    - ["ISDJ", "PJ"]
+    - ["ISRJ", "AJ"]
+    - ["ISRJ", "BJ"]
+    - ["ISRJ", "SJ"]
+    - ["ISRJ", "NAMJ"]
+    - ["ISRJ", "NPMJ"]
+    - ["ISRJ", "NFMJ"]
+    - ["ISRJ", "PJ"]
+    - ["MISRJ", "AJ"]
+    - ["MISRJ", "BJ"]
+    - ["MISRJ", "SJ"]
+    - ["MISRJ", "NAMJ"]
+    - ["MISRJ", "NPMJ"]
+    - ["MISRJ", "NFMJ"]
+    - ["MISRJ", "PJ"]
+    - ["C&IJ", "AJ"]
+    - ["C&IJ", "BJ"]
+    - ["C&IJ", "SJ"]
+    - ["C&IJ", "NAMJ"]
+    - ["C&IJ", "NPMJ"]
+    - ["C&IJ", "NFMJ"]
+    - ["C&IJ", "PJ"]
+
+  unseen_ratio: 0
+  split_seed: 42
+
+  zero_shot:
+    use_combinations: true
+    max_combination_size: 2
+    threshold: 0.14
+
+# ── Evaluation settings ────────────────────────────────────────────────────
+evaluation:
+  threshold: 0.14
+  top_k: 3
+  output_dir: "results/moe_hybrid"
+  save_predictions: true
+
+# ── Logging ────────────────────────────────────────────────────────────────
+logging:
+  type: "console"
+  name: "MoE_Hybrid_CZSL"

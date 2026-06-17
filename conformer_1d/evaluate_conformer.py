@@ -1,5 +1,5 @@
 """
-Evaluation script for 1D Conformer CZSL model.
+Evaluation script for 1D CZSL models (Conformer / ResNet1D / CNN1D).
 
 Supports three modes:
     zero_shot       — global zero-shot evaluation
@@ -7,11 +7,10 @@ Supports three modes:
     by_jnr          — per-JNR performance analysis
 
 Usage:
-    python conformer_1d/evaluate_conformer.py --checkpoint checkpoints/conformer/conformer_best_model.pt --mode zero_shot
+    python conformer_1d/evaluate_conformer.py --checkpoint checkpoints/conformer_best_model.pt --mode zero_shot
     python conformer_1d/evaluate_conformer.py --checkpoint CHKPT --mode by_combination --split test
     python conformer_1d/evaluate_conformer.py --checkpoint CHKPT --mode by_jnr --split test --output_dir results
-
-Adapted from multi/evaluate_czsl.py for ConformerForCZSL.
+    python conformer_1d/evaluate_conformer.py --checkpoint CHKPT --backbone resnet1d --mode by_combination
 """
 
 import os
@@ -34,7 +33,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_sc
 _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _parent)
 
-from conformer_1d.model_1d import ConformerForCZSL, create_conformer_model
+from conformer_1d.model_1d import Base1DCZSLModel, create_1d_model
 from conformer_1d.data_1d import TimeSignalDataset, create_1d_dataloaders, collate_fn_conformer, TokenizerWrapper
 
 
@@ -105,13 +104,13 @@ def create_1d_jnr_dataloaders(
 # ---------------------------------------------------------------------------
 
 class ConformerEvaluator:
-    """Evaluation suite for ConformerForCZSL.
+    """Evaluation suite for 1D CZSL models (Conformer / ResNet1D / CNN1D).
 
-    Mirrors CZSLEvaluator (evaluate_czsl.py:214) but handles time-domain
-    signals instead of STFT images.
+    Works with any Base1DCZSLModel subclass. Mirrors CZSLEvaluator
+    (evaluate_czsl.py:214) but handles time-domain signals instead of STFT images.
     """
 
-    def __init__(self, model: ConformerForCZSL, config: dict, device: torch.device):
+    def __init__(self, model: Base1DCZSLModel, config: dict, device: torch.device):
         self.model = model
         self.config = config
         self.device = device
@@ -701,9 +700,12 @@ class ConformerEvaluator:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Conformer CZSL Evaluation")
+    parser = argparse.ArgumentParser(description="1D CZSL Model Evaluation (Conformer / ResNet1D / CNN1D)")
     parser.add_argument("--config", type=str, default="conformer_1d/config_1d.yaml")
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--backbone", type=str, default=None,
+                        choices=["conformer", "resnet1d", "cnn1d"],
+                        help="Override config model.backbone (auto-detected if not set)")
     parser.add_argument("--mode", type=str, default="by_combination",
                         choices=["zero_shot", "by_combination", "by_jnr"])
     parser.add_argument("--split", type=str, default="test")
@@ -722,9 +724,14 @@ def main():
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
-    # Create model
-    print("\nBuilding ConformerForCZSL...")
-    model = create_conformer_model(config, str(device))
+    # Override backbone from CLI if specified
+    if args.backbone is not None:
+        config.setdefault('model', {})['backbone'] = args.backbone
+        print(f"Backbone override: {args.backbone}")
+
+    # Create model (backbone from config)
+    print("\nBuilding model...")
+    model = create_1d_model(config, str(device))
 
     # Load checkpoint
     print(f"\nLoading checkpoint: {args.checkpoint}")
