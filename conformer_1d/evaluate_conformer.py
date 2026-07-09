@@ -183,7 +183,11 @@ class ConformerEvaluator:
 
     @torch.no_grad()
     def evaluate_zero_shot(self, data_loader, debug: bool = False, output_dir: str = None):
-        """Global zero-shot evaluation using single-class text features."""
+        """Global zero-shot evaluation using combo-space text features.
+
+        Uses combo-space prediction (topk=1) matching multi/evaluate_czsl.py zero_shot.
+        Single-class probs are computed separately for ROC/PR curves.
+        """
         self.model.eval()
         all_labels, all_preds, all_probs = [], [], []
 
@@ -197,14 +201,38 @@ class ConformerEvaluator:
         for batch in tqdm(data_loader, desc="Zero-shot eval"):
             time_signals, _, _, labels, texts, metas = batch[:6]
             labels = labels.to(self.device)
-            probs, preds = self._predict_batch(time_signals)
+            batch_size = time_signals.shape[0]
+
+            # ── Single-class probs for ROC/PR curves ──
+            single_text_features = self.model.get_cached_text_features()
+            single_text_features = F.normalize(single_text_features, dim=-1)
+            signal_features = self.model.encode_image(time_signals)
+            signal_features = F.normalize(signal_features, dim=-1)
+            logit_scale = self.model.model.logit_scale.exp()
+            single_logits = logit_scale * (signal_features @ single_text_features.T)
+            single_probs = torch.softmax(single_logits, dim=-1)
+            all_probs.append(single_probs.cpu())
+
+            # ── Combo-space prediction (matching multi's zero_shot) ──
+            _, top_indices, all_names = self.model.zero_shot_predict(
+                time_signals, use_combinations=True, top_k=1
+            )
+            preds = torch.zeros(batch_size, self.num_classes, device=self.device)
+            pred_names_list = []
+            for i in range(batch_size):
+                comb_name = all_names[top_indices[i, 0].item()]
+                pred_names_list.append(comb_name)
+                for part in comb_name.split('+'):
+                    part = part.strip()
+                    if part in self.class_names:
+                        preds[i, self.class_names.index(part)] = 1.0
+
             all_labels.append(labels.cpu())
-            all_preds.append(preds)
-            all_probs.append(probs)
+            all_preds.append(preds.cpu())
 
             # 按 seen/unseen/other 分类统计
             if has_seen_unseen:
-                for i in range(time_signals.shape[0]):
+                for i in range(batch_size):
                     true_comb = tuple(sorted(torch.where(labels[i] == 1)[0].tolist()))
                     pred_comb = tuple(sorted(torch.where(preds[i] == 1)[0].tolist()))
                     is_correct = (true_comb == pred_comb)
@@ -223,14 +251,15 @@ class ConformerEvaluator:
 
             if debug and not debug_done:
                 print(f"\n{'='*60}")
-                print(f"[DEBUG] batch_size={time_signals.shape[0]}")
-                for i in range(min(3, time_signals.shape[0])):
+                print(f"[DEBUG] batch_size={batch_size}")
+                for i in range(min(3, batch_size)):
                     true_idx = torch.where(labels[i] == 1)[0].tolist()
                     pred_idx = torch.where(preds[i] == 1)[0].tolist()
-                    top3_vals, top3_idx = torch.topk(probs[i], k=3)
+                    top3_vals, top3_idx = torch.topk(single_probs[i], k=3)
                     print(f"  [{i}] True={[self.class_names[j] for j in true_idx]} "
                           f"Pred={[self.class_names[j] for j in pred_idx]}")
-                    print(f"       Top-3: {[(self.class_names[j.item()], f'{v:.3f}') for v, j in zip(top3_vals, top3_idx)]}")
+                    print(f"       Combo pred: {pred_names_list[i]}")
+                    print(f"       Top-3 single: {[(self.class_names[j.item()], f'{v:.3f}') for v, j in zip(top3_vals, top3_idx)]}")
                 debug_done = True
 
         all_labels_np = torch.cat(all_labels).numpy()
@@ -272,11 +301,15 @@ class ConformerEvaluator:
 
     @torch.no_grad()
     def evaluate_by_combination(self, data_loader, debug: bool = False, output_dir: str = None):
-        """Evaluate breaking down results by seen vs unseen combinations."""
+        """Evaluate breaking down results by seen, unseen, and other combinations.
+
+        Uses single-class softmax + topk(3) + threshold (matching multi's by_combination).
+        """
         self.model.eval()
         all_labels, all_preds, all_probs = [], [], []
         seen_correct, seen_total = 0, 0
         unseen_correct, unseen_total = 0, 0
+        other_correct, other_total = 0, 0
 
         debug_done = False
         for batch in tqdm(data_loader, desc="Combination eval"):
@@ -300,6 +333,10 @@ class ConformerEvaluator:
                     unseen_total += 1
                     if is_correct:
                         unseen_correct += 1
+                else:
+                    other_total += 1
+                    if is_correct:
+                        other_correct += 1
 
             if debug and not debug_done:
                 print(f"\n[DEBUG] Seen set size: {len(self.seen_set)}, Unseen set size: {len(self.unseen_set)}")
@@ -317,6 +354,9 @@ class ConformerEvaluator:
         metrics['seen_samples'] = seen_total
         metrics['unseen_accuracy'] = unseen_correct / unseen_total if unseen_total > 0 else 0
         metrics['unseen_samples'] = unseen_total
+        if other_total > 0:
+            metrics['other_accuracy'] = other_correct / other_total
+            metrics['other_samples'] = other_total
         metrics['harmonic_mean'] = (
             2 * metrics['seen_accuracy'] * metrics['unseen_accuracy'] /
             (metrics['seen_accuracy'] + metrics['unseen_accuracy'])

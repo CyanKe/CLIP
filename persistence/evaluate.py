@@ -439,23 +439,43 @@ class PersistenceEvaluator:
     def evaluate_zero_shot(
         self,
         dataloader,
-        threshold: float = None,
+        threshold: float = None,  # kept for backward compatibility; unused
     ) -> dict:
         """Run zero-shot evaluation on a dataloader.
 
-        Returns dict with keys:
-            metrics, labels, predictions, probabilities, features
-        """
-        if threshold is None:
-            threshold = self.eval_config.get('threshold', 0.5)
+        Uses combo-space prediction (topk=1) matching multi/evaluate_czsl.py zero_shot.
+        Groups results by seen / unseen / other combinations for CZSL evaluation.
 
+        Returns dict with keys:
+            metrics (global + per-group with harmonic_mean),
+            labels, predictions, probabilities, features
+        """
         self.model.eval()
 
-        all_preds = []
-        all_labels = []
-        all_probs = []
-        all_features = []
-        all_metas = []
+        # --- Read seen/unseen from CZSL config for per-group reporting ---
+        seen_combos_raw = _unwrap_combinations(
+            self.czsl_config.get('seen_combinations', []), 'seen_combinations')
+        unseen_combos_raw = _unwrap_combinations(
+            self.czsl_config.get('unseen_combinations', []), 'unseen_combinations')
+
+        def _combo_key(combo):
+            return tuple(sorted(combo))
+
+        seen_keys = set()
+        for sc in seen_combos_raw:
+            seen_keys.add(_combo_key(sc))
+        unseen_keys = set()
+        for uc in unseen_combos_raw:
+            unseen_keys.add(_combo_key(uc))
+
+        all_preds_list = []
+        all_labels_list = []
+        all_probs_list = []
+        all_features_list = []
+
+        seen_preds, seen_labels = [], []
+        unseen_preds, unseen_labels = [], []
+        other_preds, other_labels = [], []
 
         for batch_data in tqdm(dataloader, desc="Zero-shot eval"):
             if len(batch_data) >= 6:
@@ -464,35 +484,81 @@ class PersistenceEvaluator:
                 images, text_tokens, labels, texts, metas = batch_data
 
             images = images.to(self.device)
-            labels = labels.to(self.device)
+            labels_np = labels.cpu().numpy()
 
-            # Single-class probabilities + image features
+            # Single-class probabilities + image features (kept for ROC/PR curves)
             probs_single, img_feats = self._compute_single_class_probs(images)
-            all_probs.append(probs_single)
-            all_features.append(img_feats)
+            all_probs_list.append(probs_single)
+            all_features_list.append(img_feats)
 
-            # Zero-shot prediction (combination-based)
-            predictions = self.model.zero_shot_predict(images, threshold=threshold)
+            # Zero-shot prediction — combo space, topk=1 (matching multi's zero_shot)
+            predictions = self.model.zero_shot_predict(images, top_k=1)
 
-            for pred_names in predictions:
+            for i, pred_names in enumerate(predictions):
+                # Parse combo name (e.g. "BJ+NAMJ") → multi-label vector
                 pred_vec = np.zeros(self.num_classes, dtype=np.float32)
                 for name in pred_names:
                     for part in name.split('+'):
                         part = part.strip()
                         if part in self.class_names:
                             pred_vec[self.class_names.index(part)] = 1.0
-                all_preds.append(pred_vec)
+                all_preds_list.append(pred_vec)
+                all_labels_list.append(labels_np[i])
 
-            all_labels.append(labels.cpu().numpy())
-            all_metas.extend(metas)
+                true_classes = tuple(sorted([
+                    self.class_names[j] for j in range(self.num_classes)
+                    if labels_np[i, j] > 0
+                ]))
 
-        all_preds = np.array(all_preds)
-        all_labels = np.concatenate(all_labels, axis=0)
-        all_probs = np.concatenate(all_probs, axis=0)
-        all_features = np.concatenate(all_features, axis=0)
+                # Group by seen / unseen / other (single classes → seen)
+                if true_classes in seen_keys or len(true_classes) <= 1:
+                    seen_preds.append(pred_vec)
+                    seen_labels.append(labels_np[i])
+                elif true_classes in unseen_keys:
+                    unseen_preds.append(pred_vec)
+                    unseen_labels.append(labels_np[i])
+                else:
+                    other_preds.append(pred_vec)
+                    other_labels.append(labels_np[i])
 
+        all_preds = np.array(all_preds_list)
+        all_labels = np.array(all_labels_list)
+        all_probs = np.concatenate(all_probs_list, axis=0)
+        all_features = np.concatenate(all_features_list, axis=0)
+
+        # --- Global metrics ---
         metrics = self._compute_multilabel_metrics(all_labels, all_preds)
         metrics['num_samples'] = len(all_preds)
+
+        # --- Per-group metrics (seen / unseen / other with F1) ---
+        if seen_preds:
+            seen_arr = np.array(seen_preds)
+            seen_lbl = np.array(seen_labels)
+            metrics['seen_metrics'] = self._compute_multilabel_metrics(seen_lbl, seen_arr)
+            metrics['seen_count'] = len(seen_preds)
+            metrics['seen_accuracy'] = metrics['seen_metrics']['subset_accuracy']
+
+        if unseen_preds:
+            unseen_arr = np.array(unseen_preds)
+            unseen_lbl = np.array(unseen_labels)
+            metrics['unseen_metrics'] = self._compute_multilabel_metrics(unseen_lbl, unseen_arr)
+            metrics['unseen_count'] = len(unseen_preds)
+            metrics['unseen_accuracy'] = metrics['unseen_metrics']['subset_accuracy']
+
+        if other_preds:
+            other_arr = np.array(other_preds)
+            other_lbl = np.array(other_labels)
+            metrics['other_metrics'] = self._compute_multilabel_metrics(other_lbl, other_arr)
+            metrics['other_count'] = len(other_preds)
+            metrics['other_accuracy'] = metrics['other_metrics']['subset_accuracy']
+
+        # --- Harmonic mean (CZSL core metric) ---
+        s_acc = metrics.get('seen_accuracy', 0.0)
+        u_acc = metrics.get('unseen_accuracy', 0.0)
+        if s_acc + u_acc > 0:
+            metrics['harmonic_mean'] = 2 * s_acc * u_acc / (s_acc + u_acc)
+        else:
+            metrics['harmonic_mean'] = 0.0
 
         return {
             "metrics": metrics,
@@ -549,39 +615,43 @@ class PersistenceEvaluator:
     def evaluate_by_combination(
         self,
         dataloader,
-        threshold: float = None,
+        threshold: float = None,  # kept for backward compatibility; unused
     ) -> dict:
-        """Evaluate broken down by seen and unseen combinations.
+        """Evaluate broken down by seen, unseen, and other combinations.
 
-        Returns dict with:
-            metrics (contains 'seen' and 'unseen' sub-dicts),
-            labels, predictions, probabilities, features
+        Uses single-class softmax + topk(3) + threshold (1/num_classes)
+        matching multi/evaluate_czsl.py by_combination_type.
+
+        Returns dict with keys:
+            seen / unseen / other (per-group F1 metrics),
+            seen_accuracy / unseen_accuracy / other_accuracy,
+            harmonic_mean,
+            _labels, _predictions, _probabilities, _features
         """
-        if threshold is None:
-            threshold = self.czsl_config.get('zero_shot', {}).get('threshold', 0.14)
-
         seen_combos_raw = _unwrap_combinations(
             self.czsl_config.get('seen_combinations', []), 'seen_combinations')
         unseen_combos_raw = _unwrap_combinations(
             self.czsl_config.get('unseen_combinations', []), 'unseen_combinations')
 
-        def combo_key(combo):
+        def _combo_key(combo):
             return tuple(sorted(combo))
 
         seen_keys = set()
         for sc in seen_combos_raw:
-            seen_keys.add(combo_key(sc))
-
+            seen_keys.add(_combo_key(sc))
         unseen_keys = set()
         for uc in unseen_combos_raw:
-            unseen_keys.add(combo_key(uc))
+            unseen_keys.add(_combo_key(uc))
 
         self.model.eval()
 
         seen_preds, seen_labels = [], []
         unseen_preds, unseen_labels = [], []
+        other_preds, other_labels = [], []
         all_preds_list, all_labels_list = [], []
         all_probs_list, all_features_list = [], []
+
+        single_class_threshold = 1.0 / self.num_classes
 
         for batch_data in tqdm(dataloader, desc="By-combination eval"):
             if len(batch_data) >= 6:
@@ -592,22 +662,35 @@ class PersistenceEvaluator:
             images = images.to(self.device)
             labels_np = labels.cpu().numpy()
 
-            # Single-class probabilities + image features
+            # Single-class probabilities + image features (for ROC/PR curves)
             probs_single, img_feats = self._compute_single_class_probs(images)
             all_probs_list.append(probs_single)
             all_features_list.append(img_feats)
 
-            # Zero-shot prediction
-            predictions = self.model.zero_shot_predict(images, threshold=threshold)
+            # --- Single-class prediction (matching multi's by_combination) ---
+            # Use only single-class text features (first N entries in cache)
+            single_text_features = self.model._text_features_cache[:self.num_classes]
+            single_text_features = F.normalize(single_text_features, dim=-1)
 
-            for i, pred_names in enumerate(predictions):
-                pred_vec = np.zeros(self.num_classes, dtype=np.float32)
-                for name in pred_names:
-                    for part in name.split('+'):
-                        part = part.strip()
-                        if part in self.class_names:
-                            pred_vec[self.class_names.index(part)] = 1.0
+            image_features = self.model.encode_image(images)
+            image_features = F.normalize(image_features, dim=-1)
 
+            logit_scale = self.model.logit_scale.exp()
+            logits = logit_scale * (image_features @ single_text_features.T)
+
+            probs = torch.softmax(logits, dim=-1)
+            batch_size = images.shape[0]
+            top_k = 3
+            topk_values, topk_indices = torch.topk(probs, k=top_k, dim=-1)
+
+            preds = torch.zeros(batch_size, self.num_classes, device=self.device)
+            for b in range(batch_size):
+                for j, idx in enumerate(topk_indices[b]):
+                    if topk_values[b, j] > single_class_threshold:
+                        preds[b, idx] = 1.0
+
+            for i in range(batch_size):
+                pred_vec = preds[i].cpu().numpy()
                 all_preds_list.append(pred_vec)
                 all_labels_list.append(labels_np[i])
 
@@ -616,12 +699,16 @@ class PersistenceEvaluator:
                     if labels_np[i, j] > 0
                 ]))
 
+                # Group by seen / unseen / other
                 if true_classes in seen_keys or len(true_classes) <= 1:
                     seen_preds.append(pred_vec)
                     seen_labels.append(labels_np[i])
                 elif true_classes in unseen_keys:
                     unseen_preds.append(pred_vec)
                     unseen_labels.append(labels_np[i])
+                else:
+                    other_preds.append(pred_vec)
+                    other_labels.append(labels_np[i])
 
         all_preds = np.array(all_preds_list)
         all_labels = np.array(all_labels_list)
@@ -629,28 +716,55 @@ class PersistenceEvaluator:
         all_features = np.concatenate(all_features_list, axis=0)
 
         results = {}
-        if seen_preds:
-            seen_preds = np.array(seen_preds)
-            seen_labels = np.array(seen_labels)
-            results['seen'] = self._compute_multilabel_metrics(seen_labels, seen_preds)
-            results['seen']['count'] = len(seen_preds)
-            print(f"\nSeen combinations ({len(seen_preds)} samples):")
-            print(f"  F1_macro: {results['seen']['f1_macro']:.4f}")
-            print(f"  F1_micro: {results['seen']['f1_micro']:.4f}")
-
-        if unseen_preds:
-            unseen_preds = np.array(unseen_preds)
-            unseen_labels = np.array(unseen_labels)
-            results['unseen'] = self._compute_multilabel_metrics(unseen_labels, unseen_preds)
-            results['unseen']['count'] = len(unseen_preds)
-            print(f"\nUnseen combinations ({len(unseen_preds)} samples):")
-            print(f"  F1_macro: {results['unseen']['f1_macro']:.4f}")
-            print(f"  F1_micro: {results['unseen']['f1_micro']:.4f}")
-
         results['_labels'] = all_labels
         results['_predictions'] = all_preds
         results['_probabilities'] = all_probs
         results['_features'] = all_features
+
+        if seen_preds:
+            seen_arr = np.array(seen_preds)
+            seen_lbl = np.array(seen_labels)
+            results['seen'] = self._compute_multilabel_metrics(seen_lbl, seen_arr)
+            results['seen']['count'] = len(seen_preds)
+            results['seen_accuracy'] = results['seen']['subset_accuracy']
+            results['seen_count'] = len(seen_preds)
+            print(f"\nSeen combinations ({len(seen_preds)} samples):")
+            print(f"  F1_macro: {results['seen']['f1_macro']:.4f}")
+            print(f"  F1_micro: {results['seen']['f1_micro']:.4f}")
+            print(f"  Subset accuracy: {results['seen']['subset_accuracy']:.4f}")
+
+        if unseen_preds:
+            unseen_arr = np.array(unseen_preds)
+            unseen_lbl = np.array(unseen_labels)
+            results['unseen'] = self._compute_multilabel_metrics(unseen_lbl, unseen_arr)
+            results['unseen']['count'] = len(unseen_preds)
+            results['unseen_accuracy'] = results['unseen']['subset_accuracy']
+            results['unseen_count'] = len(unseen_preds)
+            print(f"\nUnseen combinations ({len(unseen_preds)} samples):")
+            print(f"  F1_macro: {results['unseen']['f1_macro']:.4f}")
+            print(f"  F1_micro: {results['unseen']['f1_micro']:.4f}")
+            print(f"  Subset accuracy: {results['unseen']['subset_accuracy']:.4f}")
+
+        if other_preds:
+            other_arr = np.array(other_preds)
+            other_lbl = np.array(other_labels)
+            results['other'] = self._compute_multilabel_metrics(other_lbl, other_arr)
+            results['other']['count'] = len(other_preds)
+            results['other_accuracy'] = results['other']['subset_accuracy']
+            results['other_count'] = len(other_preds)
+            print(f"\nOther combinations ({len(other_preds)} samples):")
+            print(f"  F1_macro: {results['other']['f1_macro']:.4f}")
+            print(f"  F1_micro: {results['other']['f1_micro']:.4f}")
+            print(f"  Subset accuracy: {results['other']['subset_accuracy']:.4f}")
+
+        # --- Harmonic mean (CZSL核心指标) ---
+        s_acc = results.get('seen_accuracy', 0.0)
+        u_acc = results.get('unseen_accuracy', 0.0)
+        if s_acc + u_acc > 0:
+            results['harmonic_mean'] = 2 * s_acc * u_acc / (s_acc + u_acc)
+        else:
+            results['harmonic_mean'] = 0.0
+        print(f"\nHarmonic mean: {results['harmonic_mean']:.4f}")
 
         return results
 
