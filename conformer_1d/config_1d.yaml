@@ -5,7 +5,7 @@
 
 # 通用模型配置
 model:
-  backbone: "resnet1d"              # "conformer" | "resnet1d" | "cnn1d"
+  backbone: "conformer"              # "conformer" | "resnet1d" | "cnn1d"
   clip_model: "ViT-B/32"            # 仅用于文本编码器 (不加载 ViT)
   freeze_text: true
   embed_dim: 512
@@ -49,10 +49,10 @@ loss:
 
 # 数据配置
 data:
-  base_path: "C:\\output\\output\\fine_more"
+  base_path: "C:\\output\\output\\know_more"
   jnr_start: 0
   jnr_end: 20
-  jnr_step: 1                      # JNR_+0, JNR_+1, ..., JNR_+20
+  jnr_step: 5                      # JNR_+0, JNR_+1, ..., JNR_+20
   num_workers: 0
   pin_memory: true
   time_seq_len: 8000

@@ -135,16 +135,33 @@ class Base1DCZSLModel(nn.Module):
         """Alias for encode_signal — compatibility with CZSLEvaluator API."""
         return self.encode_signal(time_signal)
 
-    def encode_signal(self, time_signal: torch.Tensor) -> torch.Tensor:
+    def encode_signal(self, time_signal: torch.Tensor, return_attn: bool = False):
         """Encode I/Q time-domain signal.
 
         Args:
             time_signal: (B, 2, T) — I/Q channels
+            return_attn: if True, also return attention weights from each Conformer block.
+                Only supported when backbone='conformer'.
 
         Returns:
             (B, embed_dim) — L2-normalized features
+            If return_attn=True, returns (features, attn_list).
+
+        Raises:
+            RuntimeError: if return_attn=True but backbone does not support it.
         """
-        return self.signal_encoder(time_signal.to(device=self.device, dtype=self.dtype))
+        sig = time_signal.to(device=self.device, dtype=self.dtype)
+        if return_attn:
+            try:
+                return self.signal_encoder(sig, return_attn=True)
+            except TypeError:
+                raise RuntimeError(
+                    f"Attention extraction (return_attn=True) is only supported "
+                    f"with the Conformer backbone. Current encoder: "
+                    f"{type(self.signal_encoder).__name__}. "
+                    f"Use --backbone conformer or a conformer checkpoint."
+                )
+        return self.signal_encoder(sig)
 
     # ------------------------------------------------------------------
     # Text encoding

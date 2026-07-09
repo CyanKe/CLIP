@@ -92,6 +92,9 @@ class MHSA(nn.Module):
         self.out_proj = nn.Linear(dim, dim)
         self.out_drop = nn.Dropout(dropout)
 
+        # Store last computed attention weights for visualization
+        self.attn_weights = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, D) → (B, T, D)"""
         residual = x
@@ -105,6 +108,7 @@ class MHSA(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
+        self.attn_weights = attn.detach()  # (B, nh, T, T) — for visualization
 
         x = (attn @ v).transpose(1, 2).reshape(B, T, D)
         x = self.out_proj(x)
@@ -293,13 +297,16 @@ class ConformerEncoder(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_attn: bool = False):
         """
         Args:
             x: (B, 2, 8000) — I/Q time-domain signal
+            return_attn: if True, also return attention weights from each block
 
         Returns:
             (B, embed_dim) — feature vector
+            If return_attn=True, returns (features, attn_list) where
+            attn_list is a list of (B, num_heads, T', T') tensors, one per block.
         """
         # Sub-sampling: (B, 2, 8000) → (B, hidden_dim, T')
         x = self.subsampling(x)
@@ -319,8 +326,11 @@ class ConformerEncoder(nn.Module):
             x = x + self.pos_encoding[:, :T, :]  # pos_encoding was made for max_seq_len=1024 ≥ 667
 
         # Conformer blocks
+        attn_list = []
         for block in self.blocks:
             x = block(x)
+            if return_attn:
+                attn_list.append(block.mhsa.attn_weights)
 
         # Output norm + global mean pooling
         x = self.output_norm(x)
@@ -328,6 +338,9 @@ class ConformerEncoder(nn.Module):
 
         # Project to embed_dim
         x = self.output_proj(x)  # (B, embed_dim)
+
+        if return_attn:
+            return x, attn_list
         return x
 
 
