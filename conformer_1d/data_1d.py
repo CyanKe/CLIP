@@ -215,6 +215,15 @@ class TimeSignalDataset(Dataset):
         return features_dict if features_dict else None
 
 
+_COLLATE_USE_TRANSLATION = False
+
+
+def set_collate_use_translation(use_translation: bool) -> None:
+    """Set whether collate feeds translated (full) class names into CLIP text."""
+    global _COLLATE_USE_TRANSLATION
+    _COLLATE_USE_TRANSLATION = bool(use_translation)
+
+
 # ---------------------------------------------------------------------------
 # Collate function
 # ---------------------------------------------------------------------------
@@ -241,7 +250,7 @@ def collate_fn_conformer(batch, tokenizer_fn, model_type="clip", processor=None)
     labels_batch = torch.stack(labels, dim=0)      # (B, num_classes)
 
     # Generate text descriptions from metadata
-    texts = [generate_text_descriptions(meta, style='class_only') for meta in metas]
+    texts = [generate_text_descriptions(meta, style='class_only', use_translation=_COLLATE_USE_TRANSLATION) for meta in metas]
 
     # Tokenize
     if model_type == "siglip":
@@ -306,6 +315,9 @@ def create_1d_dataloaders(config: dict):
     data_config = config['data']
     model_config = config['model']
     base_path = data_config['base_path']
+
+    # Whether CLIP text comparison uses translated (full) class names.
+    set_collate_use_translation(config.get('use_translation', False))
     jnr_start = data_config.get('jnr_start', 0)
     jnr_end = data_config.get('jnr_end', 20)
     jnr_step = data_config.get('jnr_step', 1)

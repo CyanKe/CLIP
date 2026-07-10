@@ -14,10 +14,10 @@ model:
 train:
   batch_size: 32
   epochs: 20
-  lr: 0.00001                     # 1e-5
+  lr: 0.0001                     # 1e-5
   weight_decay: 0.01
   warmup_epochs: 2
-  threshold: 0.07                  # 多标签预测阈值
+  threshold: 0.14                  # 多标签预测阈值
 
   scheduler:
     type: "cosine"
@@ -35,17 +35,32 @@ loss:
   handle_zero_sum: "self_only"
   similarity_metric: "iou"
 
+# ============================================================================
+# 消融实验配置 — 控制数据加载模式
+# ============================================================================
+ablation:
+  mode: "stft"           # "persistence" | "stft" | "fusion"
+                                # persistence = only echo_persistences.mat (baseline)
+                                # stft        = only echo_stfts.mat (3× magnitude)
+                                # fusion      = both files → [persistence, stft_mag, stft_phase]
+
 # 数据配置
 data:
-  base_path: "C:\\output\\output\\know_more"
+  base_path: "E:\\912_cyan\\Jamming_signal_simulation\\output\\2D_8X7"
   jnr_start: 0
   jnr_end: 20
-  jnr_step: 5
-  num_workers: 4
+  jnr_step: 1
+  num_workers: 0
   pin_memory: true
   image_size: 224
   persistence_var_name: "all_persistences"
   persistence_suffix: "echo_persistences"
+  # STFT 数据配置 (仅 stft / fusion 模式使用)
+  stft_suffix: "echo_stfts"
+  stft_var_name: "all_stfts"
+  # STFT 归一化 (仅 stft / fusion 模式使用)
+  normalize_mode: "per_sample"    # per_sample | global
+  normalize_method: "p99"         # p99 | p95 | max
 
 # 特征条件上下文 (CoOp-style, 可选)
 use_feature_context: false
@@ -62,7 +77,7 @@ prompt_lr: 0.002
 
 # 日志配置
 logging:
-  type: "console"                # wandb | console | tensorboard
+  type: "wandb"                # wandb | console | tensorboard
   name: "CLIP_Persistence_CZSL"
 
   wandb:
@@ -109,20 +124,23 @@ jamming_classes:
 
 # 类别名称翻译字典
 label_translations:
-  DFTJ: "Dense False Target Jamming"
-  ISRJ: "Interrupted Sampling Repeater Jamming"
-  AJ: "Aim-point Jamming"
-  BJ: "Barrage Jamming"
-  SJ: "Sweep Jamming"
-  NCJ: "Noise FM Jamming"
-  NPJ: "Noise PM Jamming"
-  SMSPJ: "Smoothed Pseudo Wigner-Ville Jamming"
-  "C&IJ": "Chopping and Interleaved Jamming"
-  NFMJ: "Noise Frequency Modulation Jamming"
-  NPMJ: "Noise Phase Modulation Jamming"
-  NAMJ: "Noise Amplitude Modulation Jamming"
-  CSJ: "Comb Spectrum Jamming"
-  PJ: "Phase Jamming"
+  DFTJ: "DFTJ, Dense False Target Jamming"            # 密集假目标干扰
+  ISRJ: "ISRJ, Interrupted Sampling Repeater Jamming" # 中断采样转发干扰
+  MISRJ: "MISRJ, Modulated-Interrupted Sampling Repeater Jamming" # 调制-中断采样转发干扰
+  ISDJ: "ISDJ, Interrupted Sampling Direct Jamming"   # 中断采样直接干扰
+  ISCJ: "ISCJ, Interrupted Sampling Circular Jamming" # 中断采样循环干扰
+  AJ: "AJ, Aim-point Jamming"                         # 瞄准式干扰
+  BJ: "BJ, Barrage Jamming"                           # 阻塞式干扰
+  SJ: "SJ, Sweep Jamming"                             # 扫频干扰
+  NCJ: "NCJ, Noise Convolution Jamming"               # 噪声调频干扰
+  NPJ: "NPJ, Noise Product Jamming"                   # 噪声调相干扰
+  SMSPJ: "SMSPJ, Smeared Spectrum Jamming"            # 弥散谱干扰
+  "C&IJ": "C&IJ, Chopping and Interleaved Jamming"    # 交错干扰
+  NFMJ: "NFMJ, Noise Frequency Modulation Jamming"    # 噪声调频干扰
+  NPMJ: "NPMJ, Noise Phase Modulation Jamming"        # 噪声调相干扰
+  NAMJ: "NAMJ, Noise Amplitude Modulation Jamming"    # 噪声调幅干扰
+  CSJ: "CSJ, Comb Spectrum Jamming"                   # 梳状谱干扰
+  PJ: "PJ, Pulse Jamming"                             # 相位干扰
 
 # CZSL 配置 - Seen/Unseen 组合划分
 czsl:
@@ -143,12 +161,12 @@ czsl:
     - ["AJ"]
     - ["BJ"]
     - ["SJ"]
-    - ["NCJ"]
-    - ["NPJ"]
     - ["NAMJ"]
     - ["NPMJ"]
     - ["NFMJ"]
     - ["PJ"]
+    - ["NCJ"]
+    - ["NPJ"]
 
 
   unseen_combinations:

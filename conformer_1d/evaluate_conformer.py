@@ -34,7 +34,7 @@ _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _parent)
 
 from conformer_1d.model_1d import Base1DCZSLModel, create_1d_model
-from conformer_1d.data_1d import TimeSignalDataset, create_1d_dataloaders, collate_fn_conformer, TokenizerWrapper
+from conformer_1d.data_1d import TimeSignalDataset, create_1d_dataloaders, collate_fn_conformer, TokenizerWrapper, set_collate_use_translation
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +65,8 @@ def create_1d_jnr_dataloaders(
 
     clip_model_name = config.get('model', {}).get('clip_model', 'ViT-B/32')
     tokenizer = TokenizerWrapper(model_type="clip")
+
+    set_collate_use_translation(config.get('use_translation', False))
 
     jnr_loaders = {}
 
@@ -215,7 +217,8 @@ class ConformerEvaluator:
 
             # ── Combo-space prediction (matching multi's zero_shot) ──
             _, top_indices, all_names = self.model.zero_shot_predict(
-                time_signals, use_combinations=True, top_k=1
+                time_signals, use_combinations=True, top_k=1,
+                use_translation=self.config.get('use_translation', False)
             )
             preds = torch.zeros(batch_size, self.num_classes, device=self.device)
             pred_names_list = []
@@ -797,7 +800,8 @@ def main():
     czsl_config = config.get('czsl', {})
     seen_combos = czsl_config.get('seen_combinations', None)
     model.cache_text_features(max_combination_size=2, include_single=True,
-                               seen_combinations=seen_combos)
+                               seen_combinations=seen_combos,
+                               use_translation=config.get('use_translation', False))
     print(f"  Cached {len(model._combination_names)} text features")
 
     # Create evaluator

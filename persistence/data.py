@@ -251,7 +251,7 @@ def collate_fn(
 # DataLoader factory
 # ---------------------------------------------------------------------------
 
-def create_persistence_dataloaders(config: dict):
+def create_persistence_dataloaders(config: dict, load_test: bool = False):
     """Create train/val/test DataLoaders from config.
 
     Iterates over JNR levels, creates PersistenceDataset per split,
@@ -259,10 +259,11 @@ def create_persistence_dataloaders(config: dict):
 
     Args:
         config: full YAML config dict
+        load_test: whether to load test split (default False — skip during training)
 
     Returns:
-        (train_loader, val_loader, test_loader) — val_loader may be None
-        if no validation data is found.
+        (train_loader, val_loader, test_loader) — val_loader / test_loader may be None
+        if no data is found.
     """
     data_config = config.get('data', {})
     train_config = config.get('train', {})
@@ -315,6 +316,10 @@ def create_persistence_dataloaders(config: dict):
         for split, dataset_list in [('train', train_datasets),
                                      ('val', val_datasets),
                                      ('test', test_datasets)]:
+            # Skip test split during training to avoid unnecessary loading
+            if split == 'test' and not load_test:
+                continue
+
             persistence_file = os.path.join(data_folder, f'{split}_{persistence_suffix}.mat')
             metadata_file = os.path.join(data_folder, f'{split}_echo_metadata.json')
 
@@ -383,6 +388,446 @@ def create_persistence_dataloaders(config: dict):
             collate_fn=collate,
         )
         print(f"Test:  {len(test_dataset)} samples across {len(test_datasets)} JNR levels")
+
+    num_classes = len(class_names)
+    return train_loader, val_loader, test_loader, num_classes, jnr_levels
+
+
+# ===========================================================================
+# AblationDataset — multi-modal data loading for ablation study
+# ===========================================================================
+
+class AblationDataset(Dataset):
+    """Dataset supporting three ablation modes for persistence vs STFT comparison.
+
+    Modes:
+        "persistence"  — only *_echo_persistences.mat, 3× persistence
+                         (output identical to PersistenceDataset)
+        "stft"         — only *_echo_stfts.mat, 3× STFT magnitude
+        "fusion"       — both files, channels = [persistence, stft_mag, stft_phase]
+    """
+
+    def __init__(
+        self,
+        persistence_file: str = None,
+        metadata_file: str = None,
+        persistence_var_name: str = "all_persistences",
+        stft_file: str = None,
+        stft_var_name: str = "all_stfts",
+        class_names: list = None,
+        image_size: int = 224,
+        apply_clip_norm: bool = True,
+        augmentation=None,
+        ablation_mode: str = "persistence",
+        # STFT normalization
+        normalize_mode: str = "per_sample",
+        normalize_method: str = "p99",
+        # Global normalization stats (only used when normalize_mode="global")
+        normalization_stats: dict = None,
+    ):
+        super().__init__()
+
+        self.ablation_mode = ablation_mode
+        self.image_size = image_size
+        self.apply_clip_norm = apply_clip_norm
+        self.augmentation = augmentation
+        self.normalize_mode = normalize_mode
+        self.normalize_method = normalize_method
+
+        # ---- Validate mode ----
+        if ablation_mode not in ("persistence", "stft", "fusion"):
+            raise ValueError(f"Unknown ablation_mode: {ablation_mode}. "
+                             f"Must be 'persistence', 'stft', or 'fusion'.")
+
+        # ---- Load persistence data (needed for "persistence" and "fusion") ----
+        self._all_persistences = None
+        if ablation_mode in ("persistence", "fusion"):
+            if persistence_file is None or not os.path.exists(persistence_file):
+                raise ValueError(f"Persistence file required for mode '{ablation_mode}': "
+                                 f"{persistence_file}")
+            with h5py.File(persistence_file, 'r') as f:
+                raw = f[persistence_var_name][:]
+                # HDF5 stores MATLAB column-major: [power_bins, freq, samples]
+                # Transpose to [samples, freq, power_bins]
+                axes = tuple(range(raw.ndim - 1, -1, -1))
+                self._all_persistences = np.transpose(raw, axes=axes).astype(np.float32)
+            self.num_samples = self._all_persistences.shape[0]
+
+        # ---- Load STFT data (needed for "stft" and "fusion") ----
+        self._all_stfts = None
+        if ablation_mode in ("stft", "fusion"):
+            if stft_file is None or not os.path.exists(stft_file):
+                raise ValueError(f"STFT file required for mode '{ablation_mode}': "
+                                 f"{stft_file}")
+            with h5py.File(stft_file, 'r') as f:
+                self._all_stfts = f[stft_var_name][()]
+            num_stft = self._all_stfts.shape[2]
+            if ablation_mode == "stft":
+                self.num_samples = num_stft
+            elif self.num_samples != num_stft:
+                raise ValueError(
+                    f"Sample count mismatch: persistence={self.num_samples}, "
+                    f"stft={num_stft}. Both files must have the same number of samples."
+                )
+
+        # ---- STFT normalization stats (global mode only) ----
+        if normalization_stats is None:
+            normalization_stats = {
+                'real_max': 450.0, 'imag_max': 450.0, 'mag_max': 455.0,
+            }
+        self.norm_scale_real = normalization_stats.get('real_max', 450.0)
+        self.norm_scale_imag = normalization_stats.get('imag_max', 450.0)
+        self.norm_scale_mag = normalization_stats.get('mag_max', 455.0)
+
+        # ---- Load metadata ----
+        with open(metadata_file, 'r', encoding='utf-8') as f:
+            self._metadata = json.load(f)
+
+        # ---- Build labels ----
+        self.class_names = class_names or []
+        self.labels = self._build_labels_from_metadata()
+
+        # ---- CLIP norm ----
+        if apply_clip_norm:
+            from torchvision.transforms import Normalize
+            self.clip_norm = Normalize(mean=CLIP_MEAN, std=CLIP_STD)
+        else:
+            self.clip_norm = None
+
+    # ------------------------------------------------------------------
+    # Label building (identical to PersistenceDataset)
+    # ------------------------------------------------------------------
+
+    def _build_labels_from_metadata(self) -> np.ndarray:
+        num_classes = len(self.class_names)
+        labels = np.zeros((self.num_samples, num_classes), dtype=np.float32)
+        for i, meta in enumerate(self._metadata):
+            jam_types = meta.get('jam_types', [])
+            if isinstance(jam_types, str):
+                jam_types = [jam_types]
+            for jt in jam_types:
+                if jt in self.class_names:
+                    j = self.class_names.index(jt)
+                    labels[i, j] = 1.0
+        return labels
+
+    # ------------------------------------------------------------------
+
+    def __len__(self):
+        return self.num_samples
+
+    # ------------------------------------------------------------------
+    # Per-mode __getitem__
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, index):
+        if self.ablation_mode == "persistence":
+            tensor = self._get_persistence_item(index)
+        elif self.ablation_mode == "stft":
+            tensor = self._get_stft_item(index)
+        elif self.ablation_mode == "fusion":
+            tensor = self._get_fusion_item(index)
+        else:
+            raise ValueError(f"Unknown ablation_mode: {self.ablation_mode}")
+
+        # CLIP normalization
+        if self.clip_norm is not None:
+            tensor = self.clip_norm(tensor)
+
+        # Optional augmentation
+        if self.augmentation is not None:
+            tensor = self.augmentation(tensor, None)
+
+        # Label & metadata
+        label = torch.from_numpy(self.labels[index])
+        meta = self._metadata[index] if index < len(self._metadata) else {}
+
+        return tensor, label, meta
+
+    # ------------------------------------------------------------------
+    # Mode: persistence (identical to PersistenceDataset.__getitem__)
+    # ------------------------------------------------------------------
+
+    def _get_persistence_item(self, index: int) -> torch.Tensor:
+        persistence = self._all_persistences[index]  # (H, W)
+
+        tensor = torch.from_numpy(
+            np.stack([persistence, persistence, persistence], axis=0)
+        ).float()
+
+        if tensor.shape[1] != self.image_size or tensor.shape[2] != self.image_size:
+            tensor = torch.nn.functional.interpolate(
+                tensor.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(0)
+
+        return tensor
+
+    # ------------------------------------------------------------------
+    # Mode: stft (follows multi/data.py STFTDataset)
+    # ------------------------------------------------------------------
+
+    def _get_stft_item(self, index: int) -> torch.Tensor:
+        raw_stft = self._all_stfts[:, :, index]  # structured complex64
+        stft_complex = raw_stft['real'] + 1j * raw_stft['imag']
+
+        if self.normalize_mode == 'per_sample':
+            mag = np.abs(stft_complex)
+            if self.normalize_method == 'max':
+                ref = np.max(mag)
+            elif self.normalize_method == 'p95':
+                ref = np.percentile(mag, 95)
+            else:  # p99
+                ref = np.percentile(mag, 99)
+            if ref > 0:
+                stft_complex = stft_complex / ref
+            stft_mag = np.abs(stft_complex).T
+        else:
+            # Global normalization
+            stft_mag = np.abs(stft_complex).T
+            stft_mag = np.clip(stft_mag, 0, self.norm_scale_mag) / self.norm_scale_mag
+
+        # Stack 3× magnitude
+        tensor = torch.from_numpy(
+            np.stack([stft_mag, stft_mag, stft_mag], axis=0)
+        ).float()
+
+        if tensor.shape[1] != self.image_size or tensor.shape[2] != self.image_size:
+            tensor = torch.nn.functional.interpolate(
+                tensor.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(0)
+
+        return tensor
+
+    # ------------------------------------------------------------------
+    # Mode: fusion — [persistence, stft_mag, stft_phase]
+    # ------------------------------------------------------------------
+
+    def _get_fusion_item(self, index: int) -> torch.Tensor:
+        # Channel 1: Persistence spectrum (already [0,1])
+        persistence = self._all_persistences[index]  # (H, W)
+        ch_persistence = torch.from_numpy(persistence).float().unsqueeze(0)  # (1, H, W)
+
+        # Channel 2 & 3: STFT magnitude + phase
+        raw_stft = self._all_stfts[:, :, index]
+        stft_complex = raw_stft['real'] + 1j * raw_stft['imag']
+
+        # Per-sample normalize STFT magnitude
+        mag = np.abs(stft_complex)
+        if self.normalize_mode == 'per_sample':
+            if self.normalize_method == 'max':
+                ref = np.max(mag)
+            elif self.normalize_method == 'p95':
+                ref = np.percentile(mag, 95)
+            else:  # p99
+                ref = np.percentile(mag, 99)
+            if ref > 0:
+                stft_complex = stft_complex / ref
+            stft_mag = np.abs(stft_complex).T
+        else:
+            stft_mag = np.abs(stft_complex).T
+            stft_mag = np.clip(stft_mag, 0, self.norm_scale_mag) / self.norm_scale_mag
+
+        # Phase normalized to [0, 1]
+        phase = np.angle(stft_complex).T  # (H, W), range [-π, π]
+        phase_norm = (phase + np.pi) / (2.0 * np.pi)  # range [0, 1]
+
+        ch_stft_mag = torch.from_numpy(stft_mag).float().unsqueeze(0)      # (1, H, W)
+        ch_stft_phase = torch.from_numpy(phase_norm).float().unsqueeze(0)  # (1, H, W)
+
+        # Independently resize each channel to 224×224
+        channels = []
+        for ch in [ch_persistence, ch_stft_mag, ch_stft_phase]:
+            if ch.shape[1] != self.image_size or ch.shape[2] != self.image_size:
+                ch = torch.nn.functional.interpolate(
+                    ch.unsqueeze(0),
+                    size=(self.image_size, self.image_size),
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0)
+            channels.append(ch)
+
+        tensor = torch.cat(channels, dim=0)  # (3, H, W)
+        return tensor
+
+
+# ---------------------------------------------------------------------------
+# Ablation collate function
+# ---------------------------------------------------------------------------
+
+def collate_fn_ablation(
+    batch,
+    tokenizer_fn=None,
+):
+    """Collate ablation dataset samples. Same signature as persistence collate_fn."""
+    images, labels, metas = zip(*[
+        (item[0], item[1], item[2]) for item in batch
+    ])
+    images = torch.stack(images, dim=0)
+    labels = torch.stack(labels, dim=0)
+
+    texts = [generate_text_descriptions(meta, style='class_only') for meta in metas]
+
+    if tokenizer_fn is not None:
+        text_tokens = tokenizer_fn(texts)
+    else:
+        import clip
+        text_tokens = clip.tokenize(texts, truncate=True)
+
+    return images, None, text_tokens, labels, texts, list(metas)
+
+
+# ---------------------------------------------------------------------------
+# Ablation DataLoader factory
+# ---------------------------------------------------------------------------
+
+def create_ablation_dataloaders(config: dict, load_test: bool = False):
+    """Create train/val/test DataLoaders for ablation study.
+
+    Reads config.ablation.mode to determine data source:
+        "persistence" — only echo_persistences.mat
+        "stft"        — only echo_stfts.mat
+        "fusion"      — both files, 3 channels [persistence, stft_mag, stft_phase]
+
+    Args:
+        config: full YAML config dict
+        load_test: whether to load test split (default False — skip during training)
+
+    Returns:
+        (train_loader, val_loader, test_loader, num_classes, jnr_levels)
+    """
+    ablation_config = config.get('ablation', {})
+    ablation_mode = ablation_config.get('mode', 'persistence')
+
+    data_config = config.get('data', {})
+    train_config = config.get('train', {})
+
+    base_path = data_config.get('base_path')
+    jnr_start = data_config.get('jnr_start', 0)
+    jnr_end = data_config.get('jnr_end', 20)
+    jnr_step = data_config.get('jnr_step', 1)
+    num_workers = 0  # preloaded data — no worker benefit, avoids Windows pickle OOM
+    pin_memory = data_config.get('pin_memory', True)
+    image_size = data_config.get('image_size', 224)
+    batch_size = train_config.get('batch_size', 32)
+
+    # Persistence config
+    persistence_var_name = data_config.get('persistence_var_name', 'all_persistences')
+    persistence_suffix = data_config.get('persistence_suffix', 'echo_persistences')
+
+    # STFT config
+    stft_suffix = data_config.get('stft_suffix', 'echo_stfts')
+    stft_var_name = data_config.get('stft_var_name', 'all_stfts')
+
+    # Normalization config
+    normalize_mode = data_config.get('normalize_mode', 'per_sample')
+    normalize_method = data_config.get('normalize_method', 'p99')
+    normalization_stats = config.get('normalization_stats', None)
+
+    jamming_classes = config.get('jamming_classes', [])
+    class_names = [jc['name'] if isinstance(jc, dict) else jc for jc in jamming_classes]
+
+    # Optional augmentation
+    augmentation = None
+    aug_config = config.get('augmentation', {})
+    if aug_config.get('enabled', False):
+        from multi.augmentation import STFTAugmentation
+        augmentation = STFTAugmentation(aug_config)
+
+    jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
+
+    tokenizer = TokenizerWrapper(model_type="clip")
+    collate = partial(collate_fn_ablation, tokenizer_fn=tokenizer)
+
+    train_datasets = []
+    val_datasets = []
+    test_datasets = []
+
+    for jnr in jnr_levels:
+        data_folder = os.path.join(base_path, f'JNR_+{jnr}')
+
+        for split, dataset_list in [('train', train_datasets),
+                                     ('val', val_datasets),
+                                     ('test', test_datasets)]:
+            # Skip test split during training to avoid unnecessary loading
+            if split == 'test' and not load_test:
+                continue
+
+            metadata_file = os.path.join(data_folder, f'{split}_echo_metadata.json')
+            if not os.path.exists(metadata_file):
+                continue
+
+            # Persistence file (only for persistence and fusion modes)
+            persistence_file = None
+            if ablation_mode in ('persistence', 'fusion'):
+                pf = os.path.join(data_folder, f'{split}_{persistence_suffix}.mat')
+                if not os.path.exists(pf):
+                    continue
+                persistence_file = pf
+
+            # STFT file (only for stft and fusion modes)
+            stft_file = None
+            if ablation_mode in ('stft', 'fusion'):
+                sf = os.path.join(data_folder, f'{split}_{stft_suffix}.mat')
+                if not os.path.exists(sf):
+                    continue
+                stft_file = sf
+
+            ds = AblationDataset(
+                persistence_file=persistence_file,
+                metadata_file=metadata_file,
+                persistence_var_name=persistence_var_name,
+                stft_file=stft_file,
+                stft_var_name=stft_var_name,
+                class_names=class_names,
+                image_size=image_size,
+                apply_clip_norm=True,
+                augmentation=augmentation,
+                ablation_mode=ablation_mode,
+                normalize_mode=normalize_mode,
+                normalize_method=normalize_method,
+                normalization_stats=normalization_stats,
+            )
+            dataset_list.append(ds)
+
+    # Build concatenated datasets
+    train_dataset = ConcatDataset(train_datasets) if train_datasets else None
+    val_dataset = ConcatDataset(val_datasets) if val_datasets else None
+    test_dataset = ConcatDataset(test_datasets) if test_datasets else None
+
+    # Create DataLoaders
+    train_loader = None
+    val_loader = None
+    test_loader = None
+
+    if train_dataset is not None:
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate,
+        )
+        print(f"[Ablation/{ablation_mode}] Train: {len(train_dataset)} samples "
+              f"across {len(train_datasets)} JNR levels")
+
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate,
+        )
+        print(f"[Ablation/{ablation_mode}] Val:   {len(val_dataset)} samples "
+              f"across {len(val_datasets)} JNR levels")
+
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate,
+        )
+        print(f"[Ablation/{ablation_mode}] Test:  {len(test_dataset)} samples "
+              f"across {len(test_datasets)} JNR levels")
 
     num_classes = len(class_names)
     return train_loader, val_loader, test_loader, num_classes, jnr_levels

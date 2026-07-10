@@ -163,20 +163,23 @@ jamming_groups:
 # 用于生成更具语义的文本描述，提升 CLIP 的理解能力
 # ============================================================================
 label_translations:
-  DFTJ: "Dense False Target Jamming"           # 密集假目标干扰
-  ISRJ: "Interrupted Sampling Repeater Jamming" # 间歇采样转发干扰
-  AJ: "Aim-point Jamming"                       # 瞄准式干扰
-  BJ: "Barrage Jamming"                         # 阻塞式干扰
-  SJ: "Sweep Jamming"                           # 扫频干扰
-  NCJ: "Noise FM Jamming"                       # 噪声调频干扰
-  NPJ: "Noise PM Jamming"                       # 噪声调相干扰
-  SMSPJ: "Smoothed Pseudo Wigner-Ville Jamming" # 平滑伪Wigner-Ville干扰
-  "C&IJ": "Chopping and Interleaved Jamming"    # 切割交错干扰
-  NFMJ: "Noise Frequency Modulation Jamming"    # 噪声调频干扰
-  NPMJ: "Noise Phase Modulation Jamming"        # 噪声调相干扰
-  NAMJ: "Noise Amplitude Modulation Jamming"    # 噪声调幅干扰
-  CSJ: "Comb Spectrum Jamming"                  # 梳状谱干扰
-  PJ: "Phase Jamming"                           # 相位干扰
+  DFTJ: "DFTJ, Dense False Target Jamming"            # 密集假目标干扰
+  ISRJ: "ISRJ, Interrupted Sampling Repeater Jamming" # 中断采样转发干扰
+  MISRJ: "MISRJ, Modulated-Interrupted Sampling Repeater Jamming" # 调制-中断采样转发干扰
+  ISDJ: "ISDJ, Interrupted Sampling Direct Jamming"   # 中断采样直接干扰
+  ISCJ: "ISCJ, Interrupted Sampling Circular Jamming" # 中断采样循环干扰
+  AJ: "AJ, Aim-point Jamming"                         # 瞄准式干扰
+  BJ: "BJ, Barrage Jamming"                           # 阻塞式干扰
+  SJ: "SJ, Sweep Jamming"                             # 扫频干扰
+  NCJ: "NCJ, Noise Convolution Jamming"               # 噪声调频干扰
+  NPJ: "NPJ, Noise Product Jamming"                   # 噪声调相干扰
+  SMSPJ: "SMSPJ, Smeared Spectrum Jamming"            # 弥散谱干扰
+  "C&IJ": "C&IJ, Chopping and Interleaved Jamming"    # 交错干扰
+  NFMJ: "NFMJ, Noise Frequency Modulation Jamming"    # 噪声调频干扰
+  NPMJ: "NPMJ, Noise Phase Modulation Jamming"        # 噪声调相干扰
+  NAMJ: "NAMJ, Noise Amplitude Modulation Jamming"    # 噪声调幅干扰
+  CSJ: "CSJ, Comb Spectrum Jamming"                   # 梳状谱干扰
+  PJ: "PJ, Pulse Jamming"                             # 相位干扰
 
 # ============================================================================
 # CZSL 配置 - 组合零样本学习

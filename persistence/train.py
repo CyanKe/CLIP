@@ -32,7 +32,7 @@ _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _parent)
 
 from persistence.model import PersistenceCLIPForCZSL, create_persistence_model
-from persistence.data import create_persistence_dataloaders
+from persistence.data import create_persistence_dataloaders, create_ablation_dataloaders
 from multi.loss import create_loss_function, LabelAwareInfoNCELoss, MultiLabelSigmoidLoss
 
 
@@ -69,7 +69,13 @@ class PersistenceTrainer:
         self.grad_clip = self.train_config.get("grad_clip", 1.0)
 
         self.checkpoint_config = config.get("checkpoint", {})
-        self.save_dir = Path(self.checkpoint_config.get("save_dir", "checkpoints/persistence"))
+        # Mode-aware checkpoint directory
+        ablation_mode = config.get('ablation', {}).get('mode', 'persistence')
+        base_save_dir = self.checkpoint_config.get("save_dir", "checkpoints/persistence")
+        if ablation_mode != 'persistence':
+            # Append mode suffix to avoid overwriting baseline checkpoints
+            base_save_dir = f"{base_save_dir}_{ablation_mode}"
+        self.save_dir = Path(base_save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         # Loss function (reused from multi/loss.py)
@@ -154,11 +160,16 @@ class PersistenceTrainer:
             total_loss += loss.item() * batch_size
 
             with torch.no_grad():
-                targets = torch.arange(batch_size, device=self.device)
-                pred_i2t = logits_per_image.argmax(dim=1)
-                pred_t2i = logits_per_text.argmax(dim=1)
-                total_correct += (pred_i2t == targets).sum().item()
-                total_correct += (pred_t2i == targets).sum().item()
+                # Label-aware accuracy: matching any sample with identical labels counts as correct
+                # This avoids penalizing the model when batch contains multiple samples of the same class
+                pred_i2t = logits_per_image.argmax(dim=1)  # [B]
+                pred_t2i = logits_per_text.argmax(dim=1)   # [B]
+                # Build [B, B] boolean matrix: label_eq[i,j]==True if labels[i]==labels[j]
+                label_eq = (labels.unsqueeze(1) == labels.unsqueeze(0)).all(dim=2)  # [B, B]
+                # Count correct: predicted index falls in any position with identical labels
+                correct_i2t = label_eq[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
+                correct_t2i = label_eq[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
+                total_correct += correct_i2t + correct_t2i
                 total_samples += batch_size * 2
 
             train_bar.set_postfix(loss=f"{loss.item():.4f}")
@@ -231,11 +242,13 @@ class PersistenceTrainer:
             batch_size = images.size(0)
             total_loss += loss.item() * batch_size
 
-            targets = torch.arange(batch_size, device=self.device)
+            # Label-aware accuracy: matching any sample with identical labels counts as correct
             pred_i2t = logits_per_image.argmax(dim=1)
             pred_t2i = logits_per_text.argmax(dim=1)
-            total_correct += (pred_i2t == targets).sum().item()
-            total_correct += (pred_t2i == targets).sum().item()
+            label_eq = (labels.unsqueeze(1) == labels.unsqueeze(0)).all(dim=2)
+            correct_i2t = label_eq[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
+            correct_t2i = label_eq[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
+            total_correct += correct_i2t + correct_t2i
             total_samples += batch_size * 2
 
             val_bar.set_postfix(loss=f"{loss.item():.4f}")
@@ -250,6 +263,9 @@ class PersistenceTrainer:
     # ------------------------------------------------------------------
 
     def save_checkpoint(self, metrics: dict, is_best: bool = False):
+        ablation_mode = self.config.get('ablation', {}).get('mode', 'persistence')
+        prefix = f"persistence_{ablation_mode}" if ablation_mode != 'persistence' else "persistence"
+
         checkpoint = {
             "epoch": self.current_epoch,
             "model_state_dict": self.model.state_dict(),
@@ -259,11 +275,11 @@ class PersistenceTrainer:
             "config": self.config,
         }
 
-        latest_path = self.save_dir / "persistence_latest_checkpoint.pt"
+        latest_path = self.save_dir / f"{prefix}_latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
 
         if is_best:
-            best_path = self.save_dir / "persistence_best_model.pt"
+            best_path = self.save_dir / f"{prefix}_best_model.pt"
             torch.save(checkpoint, best_path)
             print(f"  ★ Saved best model with loss: {metrics['loss']:.4f}")
 
@@ -282,11 +298,13 @@ class PersistenceTrainer:
 
         if self.use_wandb:
             wandb_config = self.config.get("logging", {}).get("wandb", {})
+            ablation_mode = self.config.get('ablation', {}).get('mode', 'persistence')
+            run_name = f"Persistence_{ablation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             wandb.init(
                 project=wandb_config.get("project", "CLIP-CZSL-Jamming"),
                 entity=wandb_config.get("entity", None),
-                name=f"Persistence_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                tags=wandb_config.get("tags", []) + ["Persistence", "CZSL"],
+                name=run_name,
+                tags=wandb_config.get("tags", []) + ["Persistence", "CZSL", ablation_mode],
                 notes=wandb_config.get("notes", "Persistence spectrum CLIP CZSL training"),
                 config=self.config,
             )
@@ -411,10 +429,18 @@ def main():
     print("\nCreating Persistence CLIP CZSL model...")
     model = create_persistence_model(config, device=str(device))
 
-    # Create dataloaders
-    print("\nLoading persistence spectrum datasets...")
-    train_loader, val_loader, test_loader, num_classes, jnr_levels = \
-        create_persistence_dataloaders(config)
+    # Determine ablation mode from config
+    ablation_config = config.get('ablation', {})
+    ablation_mode = ablation_config.get('mode', 'persistence')
+
+    # Create dataloaders — use ablation-aware loader for stft/fusion, persistence for baseline
+    print(f"\nLoading datasets [ablation mode: {ablation_mode}]...")
+    if ablation_mode == 'persistence':
+        train_loader, val_loader, test_loader, num_classes, jnr_levels = \
+            create_persistence_dataloaders(config)
+    else:
+        train_loader, val_loader, test_loader, num_classes, jnr_levels = \
+            create_ablation_dataloaders(config)
 
     # Cache text features for zero-shot inference
     czsl_config = config.get("czsl", {})
@@ -436,6 +462,11 @@ def main():
     # Create optimizer & scheduler
     optimizer, scheduler = create_optimizer_and_scheduler(model, config)
 
+    # Determine whether to use wandb from config
+    logging_config = config.get("logging", {})
+    logging_type = logging_config.get("type", "console")
+    use_wandb = (logging_type == "wandb")
+
     # Create trainer
     trainer = PersistenceTrainer(
         model=model,
@@ -445,6 +476,7 @@ def main():
         scheduler=scheduler,
         device=device,
         config=config,
+        use_wandb=use_wandb,
     )
     trainer.current_epoch = start_epoch
 

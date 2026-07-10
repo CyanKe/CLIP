@@ -127,6 +127,22 @@ class Trainer1D:
         print(f"Loss function: {type(self.loss_fn).__name__}")
 
     # ------------------------------------------------------------------
+    # Classification accuracy (matched to evaluate's top-1 single-class口径)
+    # ------------------------------------------------------------------
+    def _batch_class_accuracy(self, signal_features, labels) -> int:
+        """算一个 batch 的分类正确数。信号与缓存的单类文本特征比相似度，argmax 当预测，
+        labels.argmax 当真值。克服同类型文本碰撞导致的对角线口径失真。"""
+        text_feats = self.model.get_cached_text_features()  # [num_classes, D] 已归一化
+        if text_feats is None or text_feats.shape[0] != labels.shape[1]:
+            return 0
+        sig = F.normalize(signal_features, dim=-1)
+        logit_scale = self.model.model.logit_scale.exp()
+        logits = logit_scale * (sig @ text_feats.T)  # [B, num_classes]
+        pred = logits.argmax(dim=1)
+        target = labels.argmax(dim=1)
+        return (pred == target).sum().item()
+
+    # ------------------------------------------------------------------
     # Training epoch
     # ------------------------------------------------------------------
 
@@ -200,12 +216,8 @@ class Trainer1D:
             total_loss += loss.item() * batch_size
 
             with torch.no_grad():
-                targets = torch.arange(batch_size, device=self.device)
-                pred_i2t = logits_per_image.argmax(dim=1)
-                pred_t2i = logits_per_text.argmax(dim=1)
-                total_correct += (pred_i2t == targets).sum().item()
-                total_correct += (pred_t2i == targets).sum().item()
-                total_samples += batch_size * 2
+                total_correct += self._batch_class_accuracy(signal_features, labels)
+                total_samples += batch_size
 
             train_bar.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -276,12 +288,8 @@ class Trainer1D:
             batch_size = time_signals.size(0)
             total_loss += loss.item() * batch_size
 
-            targets = torch.arange(batch_size, device=self.device)
-            pred_i2t = logits_per_image.argmax(dim=1)
-            pred_t2i = logits_per_text.argmax(dim=1)
-            total_correct += (pred_i2t == targets).sum().item()
-            total_correct += (pred_t2i == targets).sum().item()
-            total_samples += batch_size * 2
+            total_correct += self._batch_class_accuracy(signal_features, labels)
+            total_samples += batch_size
 
             val_bar.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -465,6 +473,7 @@ def main():
         max_combination_size=2,
         include_single=True,
         seen_combinations=seen_combos,
+        use_translation=config.get('use_translation', False),
     )
 
     # Resume if needed

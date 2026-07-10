@@ -49,9 +49,9 @@ loss:
 
 # 数据配置
 data:
-  base_path: "C:\\output\\output\\know_more"
-  jnr_start: 0
-  jnr_end: 20
+  base_path: "D:\\VScode\\Jamming_signal_simulation\\output\\8x9"
+  jnr_start: 5
+  jnr_end: 5
   jnr_step: 5                      # JNR_+0, JNR_+1, ..., JNR_+20
   num_workers: 0
   pin_memory: true
@@ -91,7 +91,7 @@ evaluation:
 
 # 保存配置
 checkpoint:
-  save_dir: "checkpoints"            # 自动加 backbone 前缀 (e.g. checkpoints/conformer_best_model.pt)
+  save_dir: "checkpoints\\1d"            # 自动加 backbone 前缀 (e.g. checkpoints/conformer_best_model.pt)
   save_best_only: true
   monitor: "val_loss"
   mode: "min"
@@ -116,22 +116,29 @@ jamming_classes:
   - name: "CSJ"
   - name: "PJ"
 
+# 是否在 CLIP 文本-信号相似度计算中使用全称翻译（true=全称，false=简称）。
+# 仅影响喂给文本编码器的文本，类别统计/可视化始终用简称。消融对比在此切换。
+use_translation: false
+
 # 类别名称翻译
 label_translations:
-  DFTJ: "Dense False Target Jamming"
-  ISRJ: "Interrupted Sampling Repeater Jamming"
-  AJ: "Aim-point Jamming"
-  BJ: "Barrage Jamming"
-  SJ: "Sweep Jamming"
-  NCJ: "Noise FM Jamming"
-  NPJ: "Noise PM Jamming"
-  SMSPJ: "Smoothed Pseudo Wigner-Ville Jamming"
-  "C&IJ": "Chopping and Interleaved Jamming"
-  NFMJ: "Noise Frequency Modulation Jamming"
-  NPMJ: "Noise Phase Modulation Jamming"
-  NAMJ: "Noise Amplitude Modulation Jamming"
-  CSJ: "Comb Spectrum Jamming"
-  PJ: "Phase Jamming"
+  DFTJ: "DFTJ, Dense False Target Jamming"            # 密集假目标干扰
+  ISRJ: "ISRJ, Interrupted Sampling Repeater Jamming" # 中断采样转发干扰
+  MISRJ: "MISRJ, Modulated-Interrupted Sampling Repeater Jamming" # 调制-中断采样转发干扰
+  ISDJ: "ISDJ, Interrupted Sampling Direct Jamming"   # 中断采样直接干扰
+  ISCJ: "ISCJ, Interrupted Sampling Circular Jamming" # 中断采样循环干扰
+  AJ: "AJ, Aim-point Jamming"                         # 瞄准式干扰
+  BJ: "BJ, Barrage Jamming"                           # 阻塞式干扰
+  SJ: "SJ, Sweep Jamming"                             # 扫频干扰
+  NCJ: "NCJ, Noise Convolution Jamming"               # 噪声调频干扰
+  NPJ: "NPJ, Noise Product Jamming"                   # 噪声调相干扰
+  SMSPJ: "SMSPJ, Smeared Spectrum Jamming"            # 弥散谱干扰
+  "C&IJ": "C&IJ, Chopping and Interleaved Jamming"    # 交错干扰
+  NFMJ: "NFMJ, Noise Frequency Modulation Jamming"    # 噪声调频干扰
+  NPMJ: "NPMJ, Noise Phase Modulation Jamming"        # 噪声调相干扰
+  NAMJ: "NAMJ, Noise Amplitude Modulation Jamming"    # 噪声调幅干扰
+  CSJ: "CSJ, Comb Spectrum Jamming"                   # 梳状谱干扰
+  PJ: "PJ, Pulse Jamming"                             # 相位干扰
 
 # CZSL 配置 - Seen/Unseen 组合划分
 czsl:
@@ -149,12 +156,12 @@ czsl:
     - ["AJ"]
     - ["BJ"]
     - ["SJ"]
-    - ["NCJ"]
-    - ["NPJ"]
     - ["NAMJ"]
     - ["NPMJ"]
     - ["NFMJ"]
     - ["PJ"]
+    - ["NCJ"]
+    - ["NPJ"]
 
   unseen_combinations:
     - ["DFTJ", "AJ"]
@@ -164,6 +171,8 @@ czsl:
     - ["DFTJ", "NPMJ"]
     - ["DFTJ", "NFMJ"]
     - ["DFTJ", "PJ"]
+    - ["DFTJ", "NCJ"]
+    - ["DFTJ", "NPJ"]
 
     - ["SMSPJ", "AJ"]
     - ["SMSPJ", "BJ"]
@@ -172,6 +181,8 @@ czsl:
     - ["SMSPJ", "NPMJ"]
     - ["SMSPJ", "NFMJ"]
     - ["SMSPJ", "PJ"]
+    - ["SMSPJ", "NCJ"]
+    - ["SMSPJ", "NPJ"]
 
     - ["CSJ", "AJ"]
     - ["CSJ", "BJ"]
@@ -180,6 +191,8 @@ czsl:
     - ["CSJ", "NPMJ"]
     - ["CSJ", "NFMJ"]
     - ["CSJ", "PJ"]
+    - ["CSJ", "NCJ"]
+    - ["CSJ", "NPJ"]
 
     - ["ISCJ", "AJ"]
     - ["ISCJ", "BJ"]
@@ -188,6 +201,8 @@ czsl:
     - ["ISCJ", "NPMJ"]
     - ["ISCJ", "NFMJ"]
     - ["ISCJ", "PJ"]
+    - ["ISCJ", "NCJ"]
+    - ["ISCJ", "NPJ"]
 
     - ["ISDJ", "AJ"]
     - ["ISDJ", "BJ"]
@@ -196,6 +211,8 @@ czsl:
     - ["ISDJ", "NPMJ"]
     - ["ISDJ", "NFMJ"]
     - ["ISDJ", "PJ"]
+    - ["ISDJ", "NCJ"]
+    - ["ISDJ", "NPJ"]
 
     - ["ISRJ", "AJ"]
     - ["ISRJ", "BJ"]
@@ -204,6 +221,8 @@ czsl:
     - ["ISRJ", "NPMJ"]
     - ["ISRJ", "NFMJ"]
     - ["ISRJ", "PJ"]
+    - ["ISRJ", "NCJ"]
+    - ["ISRJ", "NPJ"]
 
     - ["MISRJ", "AJ"]
     - ["MISRJ", "BJ"]
@@ -212,6 +231,8 @@ czsl:
     - ["MISRJ", "NPMJ"]
     - ["MISRJ", "NFMJ"]
     - ["MISRJ", "PJ"]
+    - ["MISRJ", "NCJ"]
+    - ["MISRJ", "NPJ"]
     
     - ["C&IJ", "AJ"]
     - ["C&IJ", "BJ"]
@@ -220,6 +241,8 @@ czsl:
     - ["C&IJ", "NPMJ"]
     - ["C&IJ", "NFMJ"]
     - ["C&IJ", "PJ"]
+    - ["C&IJ", "NCJ"]
+    - ["C&IJ", "NPJ"]
 
   unseen_ratio: 0
   split_seed: 42
