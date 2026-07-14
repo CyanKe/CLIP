@@ -8,11 +8,11 @@ model:
 
   freeze_vision: false         # 设为 false 以启用部分解冻
   vision_layers_unfreeze: 2    # 只解冻视觉编码器最后2层
-  freeze_text: true            # 冻结文本编码器
+  freeze_text: false            # 冻结文本编码器
 
 # 训练配置
 train:
-  batch_size: 32
+  batch_size: 64
   epochs: 20
   lr: 0.0001                     # 1e-5
   weight_decay: 0.01
@@ -39,14 +39,14 @@ loss:
 # 消融实验配置 — 控制数据加载模式
 # ============================================================================
 ablation:
-  mode: "stft"           # "persistence" | "stft" | "fusion"
+  mode: "persistence"           # "persistence" | "stft" | "fusion"
                                 # persistence = only echo_persistences.mat (baseline)
                                 # stft        = only echo_stfts.mat (3× magnitude)
                                 # fusion      = both files → [persistence, stft_mag, stft_phase]
 
 # 数据配置
 data:
-  base_path: "E:\\912_cyan\\Jamming_signal_simulation\\output\\2D_8X7"
+  base_path: "E:\\912_cyan\\Jamming_signal_simulation\\output\\2D_8X9"
   jnr_start: 0
   jnr_end: 20
   jnr_step: 1
@@ -91,9 +91,18 @@ logging:
 
 # 评估配置
 evaluation:
-  threshold: 0.5
-  save_predictions: true
-  visualize_embeddings: true
+  checkpoint: "checkpoints\\persistence_step\\persistence_best.pt"
+  mode: "all"                      # all | zero_shot | by_combination | by_jnr
+  split: "train"                    # train | val | test
+  # threshold: 0.5
+  zero_shot_threshold: 0.5        # zero_shot 专用（组合空间匹配）
+  by_combination_threshold: 0.5  # by_combination 专用（单类 softmax）
+  output_dir: "results/persistence8x9"
+  visualize: false                  # 生成所有可视化
+  tsne: false                      # 仅 t-SNE
+  umap: false                      # 仅 UMAP
+  roc: true                       # 仅 ROC 曲线
+  pr: true                        # 仅 PR 曲线
 
 # 保存配置
 checkpoint:
@@ -105,42 +114,40 @@ checkpoint:
 # 干扰类型定义 (与 STFT 相同)
 jamming_classes:
   - name: "DFTJ"
-  - name: "ISRJ"
-  - name: "ISDJ"
+  - name: "SMSPJ"
+  - name: "CSJ"
   - name: "ISCJ"
+  - name: "ISRJ"
   - name: "MISRJ"
+  - name: "ISDJ"
+  - name: "C&IJ"
+  
   - name: "AJ"
   - name: "BJ"
   - name: "SJ"
-  - name: "NCJ"
-  - name: "NPJ"
-  - name: "SMSPJ"
-  - name: "C&IJ"
-  - name: "NFMJ"
-  - name: "NPMJ"
   - name: "NAMJ"
-  - name: "CSJ"
+  - name: "NPMJ"
+  - name: "NFMJ"
   - name: "PJ"
+  - name: "NCJ"
+  - name: "NPJ"  
 
 # 类别名称翻译字典
 label_translations:
-  DFTJ: "DFTJ, Dense False Target Jamming"            # 密集假目标干扰
-  ISRJ: "ISRJ, Interrupted Sampling Repeater Jamming" # 中断采样转发干扰
-  MISRJ: "MISRJ, Modulated-Interrupted Sampling Repeater Jamming" # 调制-中断采样转发干扰
-  ISDJ: "ISDJ, Interrupted Sampling Direct Jamming"   # 中断采样直接干扰
-  ISCJ: "ISCJ, Interrupted Sampling Circular Jamming" # 中断采样循环干扰
-  AJ: "AJ, Aim-point Jamming"                         # 瞄准式干扰
-  BJ: "BJ, Barrage Jamming"                           # 阻塞式干扰
-  SJ: "SJ, Sweep Jamming"                             # 扫频干扰
-  NCJ: "NCJ, Noise Convolution Jamming"               # 噪声调频干扰
-  NPJ: "NPJ, Noise Product Jamming"                   # 噪声调相干扰
-  SMSPJ: "SMSPJ, Smeared Spectrum Jamming"            # 弥散谱干扰
-  "C&IJ": "C&IJ, Chopping and Interleaved Jamming"    # 交错干扰
-  NFMJ: "NFMJ, Noise Frequency Modulation Jamming"    # 噪声调频干扰
-  NPMJ: "NPMJ, Noise Phase Modulation Jamming"        # 噪声调相干扰
-  NAMJ: "NAMJ, Noise Amplitude Modulation Jamming"    # 噪声调幅干扰
-  CSJ: "CSJ, Comb Spectrum Jamming"                   # 梳状谱干扰
-  PJ: "PJ, Pulse Jamming"                             # 相位干扰
+  DFTJ: "Dense False Target Jamming"
+  ISRJ: "Interrupted Sampling Repeater Jamming"
+  AJ: "Aim-point Jamming"
+  BJ: "Barrage Jamming"
+  SJ: "Sweep Jamming"
+  NCJ: "Noise FM Jamming"
+  NPJ: "Noise PM Jamming"
+  SMSPJ: "Smoothed Pseudo Wigner-Ville Jamming"
+  "C&IJ": "Chopping and Interleaved Jamming"
+  NFMJ: "Noise Frequency Modulation Jamming"
+  NPMJ: "Noise Phase Modulation Jamming"
+  NAMJ: "Noise Amplitude Modulation Jamming"
+  CSJ: "Comb Spectrum Jamming"
+  PJ: "Phase Jamming"
 
 # CZSL 配置 - Seen/Unseen 组合划分
 czsl:
@@ -180,6 +187,8 @@ czsl:
     - ["DFTJ", "NPMJ"]
     - ["DFTJ", "NFMJ"]
     - ["DFTJ", "PJ"]
+    - ["DFTJ", "NCJ"]
+    - ["DFTJ", "NPJ"]
 
     - ["SMSPJ", "AJ"]
     - ["SMSPJ", "BJ"]
@@ -188,6 +197,8 @@ czsl:
     - ["SMSPJ", "NPMJ"]
     - ["SMSPJ", "NFMJ"]
     - ["SMSPJ", "PJ"]
+    - ["SMSPJ", "NCJ"]
+    - ["SMSPJ", "NPJ"]
 
     - ["CSJ", "AJ"]
     - ["CSJ", "BJ"]
@@ -196,6 +207,8 @@ czsl:
     - ["CSJ", "NPMJ"]
     - ["CSJ", "NFMJ"]
     - ["CSJ", "PJ"]
+    - ["CSJ", "NCJ"]
+    - ["CSJ", "NPJ"]
 
     - ["ISCJ", "AJ"]
     - ["ISCJ", "BJ"]
@@ -204,6 +217,8 @@ czsl:
     - ["ISCJ", "NPMJ"]
     - ["ISCJ", "NFMJ"]
     - ["ISCJ", "PJ"]
+    - ["ISCJ", "NCJ"]
+    - ["ISCJ", "NPJ"]
 
     - ["ISDJ", "AJ"]
     - ["ISDJ", "BJ"]
@@ -212,6 +227,8 @@ czsl:
     - ["ISDJ", "NPMJ"]
     - ["ISDJ", "NFMJ"]
     - ["ISDJ", "PJ"]
+    - ["ISDJ", "NCJ"]
+    - ["ISDJ", "NPJ"]
 
     - ["ISRJ", "AJ"]
     - ["ISRJ", "BJ"]
@@ -220,6 +237,8 @@ czsl:
     - ["ISRJ", "NPMJ"]
     - ["ISRJ", "NFMJ"]
     - ["ISRJ", "PJ"]
+    - ["ISRJ", "NCJ"]
+    - ["ISRJ", "NPJ"]
 
     - ["MISRJ", "AJ"]
     - ["MISRJ", "BJ"]
@@ -228,6 +247,8 @@ czsl:
     - ["MISRJ", "NPMJ"]
     - ["MISRJ", "NFMJ"]
     - ["MISRJ", "PJ"]
+    - ["MISRJ", "NCJ"]
+    - ["MISRJ", "NPJ"]
 
     - ["C&IJ", "AJ"]
     - ["C&IJ", "BJ"]
@@ -236,10 +257,7 @@ czsl:
     - ["C&IJ", "NPMJ"]
     - ["C&IJ", "NFMJ"]
     - ["C&IJ", "PJ"]
+    - ["C&IJ", "NCJ"]
+    - ["C&IJ", "NPJ"]
   unseen_ratio: 0
   split_seed: 42
-
-  zero_shot:
-    use_combinations: true
-    max_combination_size: 2
-    threshold: 0.14

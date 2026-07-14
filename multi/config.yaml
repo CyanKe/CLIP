@@ -6,18 +6,27 @@
 model:
   # CLIP 模型选项 (OpenAI):
   # - "ViT-B/32", "ViT-B/16", "ViT-L/14", "RN50", "RN101", "resnet18"
-  clip_model: "ViT-B/32"
+  clip_model: "RN50"
 
+  patch_pooling: "cls"    # 视觉特征池化方式: "cls" (默认, 仅用[CLS] token) | "mean" (patch 均值池化)
   freeze_vision: false         # 设为 false 以启用部分解冻
-  vision_layers_unfreeze: 2    # 只解冻视觉编码器最后2层
-  freeze_text: true            # 冻结文本编码器
-  backbone: "multishape_vit"     # "vit" | "multishape_vit" | "resnet18"
+  vision_layers_unfreeze: 2    # 只解冻最后N层, 0=完全解冻所有层
+  freeze_text: false            # 冻结文本编码器
+  backbone: "vit"     # "vit" | "multishape_vit" | "resnet18"
   dual_branch: false             # 是否开启双分支
-  patch_sizes: [[8, 32], [32, 8], [16, 16]]
+  patch_sizes: [[32,32]] # [8, 32], [8, 32], [16, 16]
   embed_dim: 512
   depth: 6
   num_heads: 8
   fusion_mode: "early_fusion"
+
+# 保存配置
+checkpoint:
+  save_dir: "checkpoints"
+  save_best_only: false  # 保存所有epoch的检查点，便于调试
+  monitor: "val_f1"             # 监控指标
+  mode: "max"                    # max or min
+  model_name: "RN50_both_8x9"
 
 # 训练配置
 train:
@@ -53,11 +62,11 @@ loss:
 
 # 数据配置
 data:
-  base_path: "D:\\VScode\\Jamming_signal_simulation\\output\\fine"
+  base_path: "E:\\912_cyan\\Jamming_signal_simulation\\output\\2D_8X9"
   jnr_start: 0
   jnr_end: 20
-  jnr_step: 1
-  num_workers: 4
+  jnr_step: 5
+  num_workers: 0
   pin_memory: true
 
   # 图像预处理
@@ -121,17 +130,13 @@ evaluation:
   save_predictions: true
   visualize_embeddings: true
 
-# 保存配置
-checkpoint:
-  save_dir: "checkpoints"
-  save_best_only: false  # 保存所有epoch的检查点，便于调试
-  monitor: "val_f1"             # 监控指标
-  mode: "max"                    # max or min
-
 # 干扰类型定义
 jamming_classes:
   - name: "DFTJ"
   - name: "ISRJ"
+  - name: "ISDJ"
+  - name: "ISCJ"
+  - name: "MISRJ"
   - name: "AJ"
   - name: "BJ"
   - name: "SJ"
@@ -151,7 +156,7 @@ jamming_classes:
 jamming_groups:
   deception:
     name: "欺骗干扰"
-    classes: ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"]
+    classes: ["DFTJ", "ISRJ", "MISRJ", "ISCJ", "ISDJ", "SMSPJ", "C&IJ", "CSJ"]
     none_class: "无欺骗干扰"
   suppression:
     name: "压制干扰"
@@ -163,23 +168,20 @@ jamming_groups:
 # 用于生成更具语义的文本描述，提升 CLIP 的理解能力
 # ============================================================================
 label_translations:
-  DFTJ: "DFTJ, Dense False Target Jamming"            # 密集假目标干扰
-  ISRJ: "ISRJ, Interrupted Sampling Repeater Jamming" # 中断采样转发干扰
-  MISRJ: "MISRJ, Modulated-Interrupted Sampling Repeater Jamming" # 调制-中断采样转发干扰
-  ISDJ: "ISDJ, Interrupted Sampling Direct Jamming"   # 中断采样直接干扰
-  ISCJ: "ISCJ, Interrupted Sampling Circular Jamming" # 中断采样循环干扰
-  AJ: "AJ, Aim-point Jamming"                         # 瞄准式干扰
-  BJ: "BJ, Barrage Jamming"                           # 阻塞式干扰
-  SJ: "SJ, Sweep Jamming"                             # 扫频干扰
-  NCJ: "NCJ, Noise Convolution Jamming"               # 噪声调频干扰
-  NPJ: "NPJ, Noise Product Jamming"                   # 噪声调相干扰
-  SMSPJ: "SMSPJ, Smeared Spectrum Jamming"            # 弥散谱干扰
-  "C&IJ": "C&IJ, Chopping and Interleaved Jamming"    # 交错干扰
-  NFMJ: "NFMJ, Noise Frequency Modulation Jamming"    # 噪声调频干扰
-  NPMJ: "NPMJ, Noise Phase Modulation Jamming"        # 噪声调相干扰
-  NAMJ: "NAMJ, Noise Amplitude Modulation Jamming"    # 噪声调幅干扰
-  CSJ: "CSJ, Comb Spectrum Jamming"                   # 梳状谱干扰
-  PJ: "PJ, Pulse Jamming"                             # 相位干扰
+  DFTJ: "Dense False Target Jamming"           # 密集假目标干扰
+  ISRJ: "Interrupted Sampling Repeater Jamming" # 间歇采样转发干扰
+  AJ: "Aim-point Jamming"                       # 瞄准式干扰
+  BJ: "Barrage Jamming"                         # 阻塞式干扰
+  SJ: "Sweep Jamming"                           # 扫频干扰
+  NCJ: "Noise FM Jamming"                       # 噪声调频干扰
+  NPJ: "Noise PM Jamming"                       # 噪声调相干扰
+  SMSPJ: "Smoothed Pseudo Wigner-Ville Jamming" # 平滑伪Wigner-Ville干扰
+  "C&IJ": "Chopping and Interleaved Jamming"    # 切割交错干扰
+  NFMJ: "Noise Frequency Modulation Jamming"    # 噪声调频干扰
+  NPMJ: "Noise Phase Modulation Jamming"        # 噪声调相干扰
+  NAMJ: "Noise Amplitude Modulation Jamming"    # 噪声调幅干扰
+  CSJ: "Comb Spectrum Jamming"                  # 梳状谱干扰
+  PJ: "Phase Jamming"                           # 相位干扰
 
 # ============================================================================
 # CZSL 配置 - 组合零样本学习
@@ -187,34 +189,37 @@ label_translations:
 # czsl.unseen_combinations: 仅测试时评估的零样本组合
 # loss.type: "czsl_contrastive": 使用对比损失
 # ============================================================================
+# 文本描述风格
+  # "class_only": "a radar signal with single jamming: DFTJ" (原有)
+  # "simple_clip": "a photo of DFTJ" (论文复现, 简洁)
+  text_style: "class_only"
 czsl:
-  # Seen/Unseen 组合划分
-  # 格式: [类别名] 或 [类别名1, 类别名2] 表示组合
-
-  # 已见组合（用于训练）
-  # 默认：所有单干扰类型都是seen
-  # 可以添加部分两两组合作为seen
+# 文本描述风格
+  # "class_only": "a radar signal with single jamming: DFTJ" (原有)
+  # "simple_clip": "a photo of DFTJ" (论文复现, 简洁)
+  text_style: "class_only"
   seen_combinations:
     # 单干扰类型（全部为seen）
     # 欺骗干扰
     - ["DFTJ"]
     - ["SMSPJ"]
     - ["CSJ"]
+    - ["ISCJ"]
+    - ["ISDJ"]
     - ["ISRJ"]
+    - ["MISRJ"]
     - ["C&IJ"]
 
     # 压制干扰
     - ["AJ"]
     - ["BJ"]
     - ["SJ"]
-    - ["NCJ"]
-    - ["NPJ"]
     - ["NAMJ"]
     - ["NPMJ"]
     - ["NFMJ"]
     - ["PJ"]
-
-  # 合作为seen（训练时可见）
+    - ["NCJ"]
+    - ["NPJ"]
 
 
   unseen_combinations:
@@ -224,62 +229,84 @@ czsl:
     - ["DFTJ", "AJ"]
     - ["DFTJ", "BJ"]
     - ["DFTJ", "SJ"]
-    - ["DFTJ", "NCJ"]
-    - ["DFTJ", "NPJ"]
     - ["DFTJ", "NAMJ"]
     - ["DFTJ", "NPMJ"]
     - ["DFTJ", "NFMJ"]
     - ["DFTJ", "PJ"]
-
-    - ["ISRJ", "AJ"]
-    - ["ISRJ", "BJ"]
-    - ["ISRJ", "SJ"]
-    - ["ISRJ", "NCJ"]
-    - ["ISRJ", "NPJ"]
-    - ["ISRJ", "NAMJ"]
-    - ["ISRJ", "NPMJ"]
-    - ["ISRJ", "NFMJ"]
-    - ["ISRJ", "PJ"]
+    - ["DFTJ", "NCJ"]
+    - ["DFTJ", "NPJ"]
 
     - ["SMSPJ", "AJ"]
     - ["SMSPJ", "BJ"]
     - ["SMSPJ", "SJ"]
-    - ["SMSPJ", "NCJ"]
-    - ["SMSPJ", "NPJ"]
     - ["SMSPJ", "NAMJ"]
     - ["SMSPJ", "NPMJ"]
     - ["SMSPJ", "NFMJ"]
     - ["SMSPJ", "PJ"]
-
-    - ["C&IJ", "AJ"]
-    - ["C&IJ", "BJ"]
-    - ["C&IJ", "SJ"]
-    - ["C&IJ", "NCJ"]
-    - ["C&IJ", "NPJ"]
-    - ["C&IJ", "NAMJ"]
-    - ["C&IJ", "NPMJ"]
-    - ["C&IJ", "NFMJ"]
-    - ["C&IJ", "PJ"]
+    - ["SMSPJ", "NCJ"]
+    - ["SMSPJ", "NPJ"]
 
     - ["CSJ", "AJ"]
     - ["CSJ", "BJ"]
     - ["CSJ", "SJ"]
-    - ["CSJ", "NCJ"]
-    - ["CSJ", "NPJ"]
     - ["CSJ", "NAMJ"]
     - ["CSJ", "NPMJ"]
     - ["CSJ", "NFMJ"]
     - ["CSJ", "PJ"]
+    - ["CSJ", "NCJ"]
+    - ["CSJ", "NPJ"]
 
-  # 数据划分参数
-  unseen_ratio: 0          # 自动划分时unseen比例
-  split_seed: 42             # 划分随机种子
+    - ["ISCJ", "AJ"]
+    - ["ISCJ", "BJ"]
+    - ["ISCJ", "SJ"]
+    - ["ISCJ", "NAMJ"]
+    - ["ISCJ", "NPMJ"]
+    - ["ISCJ", "NFMJ"]
+    - ["ISCJ", "PJ"]
+    - ["ISCJ", "NCJ"]
+    - ["ISCJ", "NPJ"]
 
-  # 零样本推理配置
-  zero_shot:
-    use_combinations: true   # 是否使用组合特征
-    max_combination_size: 2  # 最大组合大小
-    threshold: 0.14      # 多标签预测阈值
+    - ["ISDJ", "AJ"]
+    - ["ISDJ", "BJ"]
+    - ["ISDJ", "SJ"]
+    - ["ISDJ", "NAMJ"]
+    - ["ISDJ", "NPMJ"]
+    - ["ISDJ", "NFMJ"]
+    - ["ISDJ", "PJ"]
+    - ["ISDJ", "NCJ"]
+    - ["ISDJ", "NPJ"]
+
+    - ["ISRJ", "AJ"]
+    - ["ISRJ", "BJ"]
+    - ["ISRJ", "SJ"]
+    - ["ISRJ", "NAMJ"]
+    - ["ISRJ", "NPMJ"]
+    - ["ISRJ", "NFMJ"]
+    - ["ISRJ", "PJ"]
+    - ["ISRJ", "NCJ"]
+    - ["ISRJ", "NPJ"]
+
+    - ["MISRJ", "AJ"]
+    - ["MISRJ", "BJ"]
+    - ["MISRJ", "SJ"]
+    - ["MISRJ", "NAMJ"]
+    - ["MISRJ", "NPMJ"]
+    - ["MISRJ", "NFMJ"]
+    - ["MISRJ", "PJ"]
+    - ["MISRJ", "NCJ"]
+    - ["MISRJ", "NPJ"]
+
+    - ["C&IJ", "AJ"]
+    - ["C&IJ", "BJ"]
+    - ["C&IJ", "SJ"]
+    - ["C&IJ", "NAMJ"]
+    - ["C&IJ", "NPMJ"]
+    - ["C&IJ", "NFMJ"]
+    - ["C&IJ", "PJ"]
+    - ["C&IJ", "NCJ"]
+    - ["C&IJ", "NPJ"]
+  unseen_ratio: 0
+  split_seed: 42
 
 # ============================================================================
 # STFT 数据增强配置 — 用于抑制 shortcut learning
@@ -293,8 +320,8 @@ augmentation:
   # 1. SpecAugment — 时频带掩码 (最稳定, 物理意义最明确)
   specaugment:
     enabled: false
-    time_mask_param: 0.2          # 时间掩码最大宽度 (占 H 的比例)
-    freq_mask_param: 0.2          # 频率掩码最大宽度 (占 W 的比例)
+    time_mask_param: 0.1          # 时间掩码最大宽度 (占 H 的比例)
+    freq_mask_param: 0.1          # 频率掩码最大宽度 (占 W 的比例)
     num_time_masks: 2             # 时间掩码条数
     num_freq_masks: 2             # 频率掩码条数
     mask_value: 0.0               # 填充值 (0 = CLIP 归一化后的均值)
@@ -308,7 +335,7 @@ augmentation:
     mask_value: 0.0
     p: 1.0
 
-  # 3. Energy-Aware Masking — 针对高能量欺骗前景的概率掩码
+  # 3. Energy-Aware Masking — 针对高能量欺骗前景的概率掩码 这个一点用都没有，严重影响性能
   energy_mask:
     enabled: false
     top_percentile: 20.0          # 高能量百分位阈值 (如前 20% = 80th percentile 以上)

@@ -51,6 +51,7 @@ class ResNet18Trainer:
         self.checkpoint_config = config.get("checkpoint", {})
         self.save_dir = Path(self.checkpoint_config.get("save_dir", "checkpoints"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.model_name = self.checkpoint_config.get("model_name", "resnet18_dual_branch")
 
         # 损失函数
         self.criterion_deception = nn.CrossEntropyLoss()
@@ -195,11 +196,11 @@ class ResNet18Trainer:
             "config": self.config
         }
 
-        latest_path = self.save_dir / "resnet18_dual_branch_latest.pt"
+        latest_path = self.save_dir / f"{self.model_name}_latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
 
         if is_best:
-            best_path = self.save_dir / "resnet18_dual_branch_best.pt"
+            best_path = self.save_dir / f"{self.model_name}_best_model.pt"
             torch.save(checkpoint, best_path)
             print(f"  ★ Saved best model with loss: {metrics['loss']:.4f}")
 

@@ -11,9 +11,12 @@ python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode
 
 import os
 import sys
+import json
+import h5py
 import yaml
 import argparse
 from pathlib import Path
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -23,15 +26,99 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score, roc_curve, auc
+from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score, roc_curve, auc, precision_recall_curve, average_precision_score
 from sklearn.manifold import TSNE
 
 # 添加路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from multi.model import create_czsl_model, CLIPForCZSL
-from multi.data import create_czsl_dataloaders, STFTDataset, collate_fn
+from multi.data import STFTDataset
+from multi.metrics_czsl import (
+    compute_metrics_bundle,
+    compute_subset_bundles,
+    print_metrics_report,
+    print_jnr_metrics_table,
+    save_metrics_json,
+)
 import clip
+
+
+class ChainedLoaderIterable:
+    """将多个 JNR 的 DataLoader 串成一个可迭代对象。
+
+    与预先创建所有 DataLoader 不同，此实现按需创建：
+    - 迭代到某个 JNR 时才创建其 STFTDataset（触发 HDD 顺序读取）
+    - 切换到下一个 JNR 时释放上一个 JNR 的内存
+    - 同一时刻只有一个 JNR 的 STFT 数据驻留内存
+
+    用法:
+        configs = [dict(stft_file=..., metadata_file=..., ...), ...]
+        chain = ChainedLoaderIterable(configs, batch_size=32, collate_fn=...)
+        for batch in chain:
+            ...
+    """
+    def __init__(self, jnr_dataset_configs: list, batch_size: int = 32,
+                 num_workers: int = 0, pin_memory: bool = False,
+                 collate_fn=None, normalization_stats: dict = None):
+        self._configs = jnr_dataset_configs  # list of dicts with STFTDataset kwargs
+        self._batch_size = batch_size
+        self._num_workers = num_workers
+        self._pin_memory = pin_memory
+        self._collate_fn = collate_fn
+        self._norm_stats = normalization_stats
+        self._total_batches = 0
+        self._samples_per_jnr = []
+
+        # 预计算总 batch 数（轻量，只读 HDF5 shape）
+        for cfg in self._configs:
+            try:
+                with h5py.File(cfg['stft_file'], 'r') as f:
+                    n = f[cfg.get('stft_var_name', 'all_stfts')].shape[2]
+            except Exception:
+                n = 0
+            self._samples_per_jnr.append(n)
+            self._total_batches += (n + batch_size - 1) // batch_size if n > 0 else 0
+
+    def __iter__(self):
+        for i, cfg in enumerate(self._configs):
+            if self._samples_per_jnr[i] == 0:
+                continue
+
+            # ── 按需创建当前 JNR 的 STFTDataset ──
+            # 这一步触发 HDF5 顺序读取，将整个 JNR 的 STFT 加载到内存
+            dataset = STFTDataset(
+                stft_file=cfg['stft_file'],
+                metadata_file=cfg['metadata_file'],
+                stft_var_name=cfg.get('stft_var_name', 'all_stfts'),
+                normalization_stats=self._norm_stats,
+                class_names=cfg.get('class_names', []),
+                normalize_mode=cfg.get('normalize_mode', 'per_sample'),
+                normalize_method=cfg.get('normalize_method', 'p99'),
+                image_size=cfg.get('image_size', 224),
+                apply_clip_norm=cfg.get('apply_clip_norm', True),
+            )
+
+            loader = DataLoader(
+                dataset,
+                batch_size=self._batch_size,
+                shuffle=False,
+                num_workers=self._num_workers,
+                pin_memory=self._pin_memory,
+                collate_fn=self._collate_fn,
+            )
+
+            label = cfg.get('label', f'JNR_{i}')
+            print(f"  [{label}] {len(dataset)} samples loaded into memory")
+
+            yield from loader
+
+            # ── 释放当前 JNR 的数据，为下一个 JNR 腾内存 ──
+            del loader
+            del dataset
+
+    def __len__(self):
+        return self._total_batches
 
 
 def create_jnr_dataloaders(
@@ -41,6 +128,7 @@ def create_jnr_dataloaders(
     batch_size: int = 16,
     num_workers: int = 4,
     pin_memory: bool = True,
+    text_style: str = "class_only",
 ) -> dict:
     """
     为每个JNR级别创建独立的数据加载器
@@ -52,10 +140,12 @@ def create_jnr_dataloaders(
         batch_size: 批次大小
         num_workers: worker数量
         pin_memory: 是否pin memory
+        text_style: 文本描述风格
 
     Returns:
         字典 {jnr_level: DataLoader}
     """
+    from functools import partial
     data_config = config.get('data', {})
     base_path = data_config.get('base_path')
     jnr_start = data_config.get('jnr_start', 0)
@@ -64,6 +154,9 @@ def create_jnr_dataloaders(
 
     class_names = [cls['name'] for cls in config.get('jamming_classes', [])]
     jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
+
+    # 使用指定 text_style 的 collate
+    _jnr_collate = partial(_collate_fn_with_style, text_style=text_style)
 
     jnr_loaders = {}
 
@@ -92,13 +185,43 @@ def create_jnr_dataloaders(
             shuffle=False,  # 评估时不打乱
             num_workers=num_workers,
             pin_memory=pin_memory,
-            collate_fn=collate_fn,
+            collate_fn=_jnr_collate,
         )
 
         jnr_loaders[jnr] = loader
         print(f"Loaded {split} data from {jnr_folder}: {len(dataset)} samples")
 
     return jnr_loaders
+
+
+def _collate_fn_with_style(batch, text_style="class_only"):
+    """带 text_style 的 collate 函数（模块级，支持 pickle）"""
+    from multi.text_templates import generate_text_descriptions
+    import clip
+
+    sample = batch[0]
+    has_features = isinstance(sample[-1], dict) and len(sample) == 4
+
+    if has_features:
+        stft_images, labels, metadata_list, features_list = zip(*batch)
+        features_batched = {}
+        for domain in features_list[0].keys():
+            features_batched[domain] = torch.stack([f[domain] for f in features_list], dim=0)
+    else:
+        stft_images, labels, metadata_list = zip(*batch)
+        features_batched = None
+
+    stft_images = torch.stack(stft_images, dim=0)
+    labels = torch.stack(labels, dim=0)
+
+    texts = []
+    for meta in metadata_list:
+        text = generate_text_descriptions(meta, style=text_style)
+        texts.append(text)
+
+    text_tokens = clip.tokenize(texts, truncate=True)
+
+    return stft_images, None, text_tokens, labels, texts, metadata_list, features_batched
 
 
 def plot_roc_curves(
@@ -211,6 +334,128 @@ def plot_roc_curves(
     plt.close()
 
 
+def plot_pr_curves(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    class_names: list,
+    save_dir: str = None,
+    prefix: str = "pr",
+    mode_title: str = ""
+):
+    """
+    绘制 Precision-Recall 曲线（独立函数，解耦于评估器）
+
+    生成两张图:
+      1. {prefix}_pr_per_class.png — 每个类别不同颜色的 PR 曲线
+      2. {prefix}_pr_average.png  — Micro/Macro 平均 PR 曲线
+
+    Args:
+        labels: one-hot 标签 [n_samples, n_classes]
+        probabilities: softmax 概率 [n_samples, n_classes]
+        class_names: 类别名称列表
+        save_dir: 保存目录（None 则显示）
+        prefix: 文件名前缀
+        mode_title: 标题后缀（如 "by_combination" 或 "JNR=+10"）
+    """
+    n_classes = labels.shape[1]
+
+    # 计算每个类别的 PR 和 AP
+    precision_dict, recall_dict, ap_dict = {}, {}, {}
+    for i in range(n_classes):
+        if np.sum(labels[:, i]) == 0:
+            continue
+        precision_dict[i], recall_dict[i], _ = precision_recall_curve(
+            labels[:, i], probabilities[:, i]
+        )
+        ap_dict[i] = average_precision_score(labels[:, i], probabilities[:, i])
+
+    # Micro-average: ravel all labels & probs
+    precision_micro, recall_micro, _ = precision_recall_curve(
+        labels.ravel(), probabilities.ravel()
+    )
+    ap_micro = average_precision_score(labels.ravel(), probabilities.ravel())
+
+    # Macro-average: interpolate precision on common recall grid
+    all_recall = np.unique(np.concatenate([recall_dict[i] for i in recall_dict]))
+    mean_precision = np.zeros_like(all_recall)
+    for i in precision_dict:
+        mean_precision += np.interp(all_recall, recall_dict[i][::-1], precision_dict[i][::-1])
+    mean_precision /= len(precision_dict)
+    ap_macro = np.trapezoid(mean_precision, all_recall)
+
+    # No-skill baseline: overall positive ratio
+    baseline = labels.sum() / labels.size
+
+    title_suffix = f" ({mode_title})" if mode_title else ""
+
+    # === 图1: 每个类别的 PR 曲线（不同颜色） ===
+    colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    for idx, i in enumerate(precision_dict):
+        color = colors[idx % 10]
+        ax.plot(
+            recall_dict[i], precision_dict[i],
+            color=color, linewidth=1.2,
+            label=f'{class_names[i]} (AP={ap_dict[i]:.3f})'
+        )
+
+    # No-skill baseline
+    ax.axhline(y=baseline, color='navy', linewidth=1.0, linestyle=':', alpha=0.7,
+               label=f'Baseline ({baseline:.3f})')
+
+    ax.set_xlim([-0.02, 1.02])
+    ax.set_ylim([-0.02, 1.02])
+    ax.set_xlabel('Recall', fontsize=12)
+    ax.set_ylabel('Precision', fontsize=12)
+    ax.set_title(f'Per-class Precision-Recall Curves{title_suffix}', fontsize=14)
+    ax.legend(loc='lower left', fontsize=7, ncol=1)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if save_dir:
+        path = os.path.join(save_dir, f"{prefix}_pr_per_class.png")
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        print(f"Per-class PR saved to {path}")
+    else:
+        plt.show()
+    plt.close()
+
+    # === 图2: Micro / Macro 平均 PR 曲线 ===
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    ax.plot(
+        recall_micro, precision_micro,
+        color='darkorange', linewidth=2.5,
+        label=f'Micro-average (AP={ap_micro:.3f})'
+    )
+    ax.plot(
+        all_recall, mean_precision,
+        color='darkgreen', linewidth=2.5, linestyle='--',
+        label=f'Macro-average (AP={ap_macro:.3f})'
+    )
+
+    ax.axhline(y=baseline, color='navy', linewidth=1.0, linestyle=':', alpha=0.7,
+               label=f'Baseline ({baseline:.3f})')
+
+    ax.set_xlim([-0.02, 1.02])
+    ax.set_ylim([-0.02, 1.02])
+    ax.set_xlabel('Recall', fontsize=12)
+    ax.set_ylabel('Precision', fontsize=12)
+    ax.set_title(f'Average Precision-Recall Curves{title_suffix}', fontsize=14)
+    ax.legend(loc='lower left', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if save_dir:
+        path = os.path.join(save_dir, f"{prefix}_pr_average.png")
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        print(f"Average PR saved to {path}")
+    else:
+        plt.show()
+    plt.close()
+
+
 class CZSLEvaluator:
     """
     CZSL评估器
@@ -240,6 +485,8 @@ class CZSLEvaluator:
         self,
         data_loader: DataLoader,
         use_combinations: bool = True,
+        seen_combinations: list = None,
+        unseen_combinations: list = None,
         debug: bool = False
     ) -> dict:
         """
@@ -248,6 +495,8 @@ class CZSLEvaluator:
         Args:
             data_loader: 数据加载器
             use_combinations: 是否使用组合特征
+            seen_combinations: 已见组合索引列表（用于 seen/unseen 准确率统计）
+            unseen_combinations: 未见组合索引列表
 
         Returns:
             评估结果字典
@@ -256,10 +505,20 @@ class CZSLEvaluator:
 
         all_labels = []
         all_preds = []
-        all_features = []  # 添加特征收集
+        all_features = []
+        all_probs = []      # 单类 softmax 概率 (用于 ROC/PR)
         all_combination_correct = 0
         all_multilabel_correct = 0
         total_samples = 0
+
+        # 构建 seen/unseen 集合
+        seen_set = set(tuple(sorted(c)) for c in (seen_combinations or []))
+        unseen_set = set(tuple(sorted(c)) for c in (unseen_combinations or []))
+        has_seen_unseen = bool(seen_set or unseen_set)
+
+        seen_results = {"correct": 0, "total": 0}
+        unseen_results = {"correct": 0, "total": 0}
+        other_results = {"correct": 0, "total": 0}
 
         eval_bar = tqdm(data_loader, desc="Zero-Shot Evaluation")
 
@@ -290,6 +549,13 @@ class CZSLEvaluator:
             image_features = self.model.encode_image(images)
             image_features = F.normalize(image_features, dim=-1)
             all_features.append(image_features.cpu().numpy())
+
+            # 单类 softmax 概率 (用于 ROC/PR 曲线)
+            text_features_single = self.model.get_cached_text_features()
+            logit_scale = self.model.model.logit_scale.exp()
+            logits_single = logit_scale * (image_features @ text_features_single.T)
+            probs_single = torch.softmax(logits_single, dim=-1)
+            all_probs.append(probs_single.cpu())
 
             # 零样本预测
             if use_combinations:
@@ -371,45 +637,57 @@ class CZSLEvaluator:
                 true_set = set(torch.where(labels[i] == 1)[0].tolist())
                 pred_set = set(torch.where(preds[i] == 1)[0].tolist())
 
-                if true_set == pred_set:
+                is_correct = (true_set == pred_set)
+
+                if is_correct:
                     all_combination_correct += 1
 
                 # 多标签子集准确率
                 if true_set.issubset(pred_set) or pred_set.issubset(true_set):
                     all_multilabel_correct += 1
 
+                # 按 seen/unseen/other 分类统计
+                if has_seen_unseen:
+                    true_comb = tuple(sorted(true_set))
+                    if true_comb in seen_set:
+                        seen_results["total"] += 1
+                        if is_correct:
+                            seen_results["correct"] += 1
+                    elif true_comb in unseen_set:
+                        unseen_results["total"] += 1
+                        if is_correct:
+                            unseen_results["correct"] += 1
+                    else:
+                        other_results["total"] += 1
+                        if is_correct:
+                            other_results["correct"] += 1
+
             total_samples += batch_size
 
         # 合并结果
         all_labels = torch.cat(all_labels).numpy()
         all_preds = torch.cat(all_preds).numpy()
-
-        # 计算指标
-        metrics = {
-            "combination_accuracy": all_combination_correct / total_samples,
-            "partial_match_accuracy": all_multilabel_correct / total_samples,
-            "f1_macro": f1_score(all_labels, all_preds, average='macro', zero_division=0),
-            "f1_micro": f1_score(all_labels, all_preds, average='micro', zero_division=0),
-            "precision_macro": precision_score(all_labels, all_preds, average='macro', zero_division=0),
-            "recall_macro": recall_score(all_labels, all_preds, average='macro', zero_division=0),
-        }
-
-        # 每个类别的指标
-        per_class_f1 = f1_score(all_labels, all_preds, average=None, zero_division=0)
-        metrics["per_class"] = {
-            "f1": per_class_f1,
-            "precision": precision_score(all_labels, all_preds, average=None, zero_division=0),
-            "recall": recall_score(all_labels, all_preds, average=None, zero_division=0)
-        }
-
-        # 合并特征
         all_features = np.concatenate(all_features, axis=0)
+        all_probs_np = torch.cat(all_probs).numpy()
+
+        # 统一 MetricsBundle（subset_accuracy 主字段；combination_accuracy 双写）
+        seen_set = set(tuple(sorted(c)) for c in (seen_combinations or []))
+        unseen_set = set(tuple(sorted(c)) for c in (unseen_combinations or []))
+        metrics = compute_metrics_bundle(
+            all_labels, all_preds, self.class_names,
+            y_prob=all_probs_np,
+            seen_set=seen_set, unseen_set=unseen_set,
+            dual_write=True,
+        )
+        # 保留循环内统计作为校验用（与 bundle 应一致）
+        _ = (all_combination_correct, all_multilabel_correct, has_seen_unseen, seen_results, unseen_results, other_results)
 
         return {
             "metrics": metrics,
             "labels": all_labels,
             "predictions": all_preds,
-            "features": all_features
+            "probabilities": all_probs_np,
+            "features": all_features,
         }
 
     @torch.no_grad()
@@ -550,50 +828,46 @@ class CZSLEvaluator:
                     if is_correct:
                         other_results["correct"] += 1
 
-        metrics = {
-            "seen_accuracy": seen_results["correct"] / seen_results["total"] if seen_results["total"] > 0 else 0,
-            "seen_samples": seen_results["total"],
-            "unseen_accuracy": unseen_results["correct"] / unseen_results["total"] if unseen_results["total"] > 0 else 0,
-            "unseen_samples": unseen_results["total"],
-            "other_accuracy": other_results["correct"] / other_results["total"] if other_results["total"] > 0 else 0,
-            "other_samples": other_results["total"]
-        }
-
         # 合并所有结果
         all_labels = torch.cat(all_labels).numpy()
         all_preds = torch.cat(all_preds).numpy()
         all_probs = torch.cat(all_probs).numpy()
         all_features = np.concatenate(all_features, axis=0)
 
+        # 全局 + seen/unseen 两子集 MetricsBundle
+        seen_set = set(tuple(sorted(c)) for c in (seen_combinations or []))
+        unseen_set = set(tuple(sorted(c)) for c in (unseen_combinations or []))
+        bundles = compute_subset_bundles(
+            all_labels, all_preds, self.class_names,
+            seen_set=seen_set, unseen_set=unseen_set,
+            y_prob=all_probs, dual_write=True,
+        )
+        # Flat metrics = global (backward compat) + nested subsets
+        metrics = dict(bundles["global"])
+        metrics["global"] = bundles["global"]
+        metrics["seen"] = bundles["seen"]
+        metrics["unseen"] = bundles["unseen"]
+        _ = (seen_results, unseen_results, other_results)
+
         return {
             "metrics": metrics,
             "labels": all_labels,
             "predictions": all_preds,
             "probabilities": all_probs,
-            "features": all_features
+            "features": all_features,
         }
 
-    def print_metrics(self, metrics: dict):
-        """打印评估指标"""
-        print("\n" + "=" * 60)
-        print("Zero-Shot Evaluation Results")
-        print("=" * 60)
-        print(f"Combination Accuracy:     {metrics['combination_accuracy']:.4f}")
-        print(f"Partial Match Accuracy:   {metrics['partial_match_accuracy']:.4f}")
-        print(f"Macro F1 Score:           {metrics['f1_macro']:.4f}")
-        print(f"Micro F1 Score:           {metrics['f1_micro']:.4f}")
-        print(f"Macro Precision:          {metrics['precision_macro']:.4f}")
-        print(f"Macro Recall:             {metrics['recall_macro']:.4f}")
-
-        # 每个类别的指标
-        print("\nPer-class Metrics:")
-        print("-" * 60)
-        print(f"{'Class':<10} {'F1':>8} {'Precision':>12} {'Recall':>10}")
-        print("-" * 60)
-        for i, name in enumerate(self.class_names[:len(metrics['per_class']['f1'])]):
-            print(f"{name:<10} {metrics['per_class']['f1'][i]:>8.4f} "
-                  f"{metrics['per_class']['precision'][i]:>12.4f} "
-                  f"{metrics['per_class']['recall'][i]:>10.4f}")
+    def print_metrics(self, metrics: dict, title: str = "Evaluation Results"):
+        """打印评估指标（统一 MetricsBundle 报表）"""
+        # Nested by_combination report
+        if isinstance(metrics.get("global"), dict) and "subset_accuracy" in metrics.get("global", {}):
+            print_metrics_report(metrics["global"], title=f"{title} — global")
+            if metrics.get("seen", {}).get("num_samples", 0):
+                print_metrics_report(metrics["seen"], title=f"{title} — seen subset")
+            if metrics.get("unseen", {}).get("num_samples", 0):
+                print_metrics_report(metrics["unseen"], title=f"{title} — unseen subset")
+            return
+        print_metrics_report(metrics, title=title)
 
     def plot_confusion_by_combination(
         self,
@@ -1051,21 +1325,16 @@ class CZSLEvaluator:
                         per_class_precision[c] + per_class_recall[c]
                     )
 
+            bundle = compute_metrics_bundle(
+                all_labels_np, all_preds_np, self.class_names,
+                y_prob=all_probs_np,
+                seen_set=seen_set, unseen_set=unseen_set,
+                dual_write=True,
+            )
+            # Keep arrays for optional plotting; not written into metrics JSON core
             results[jnr] = {
-                "combination_accuracy": seen_correct + unseen_correct,
-                "total_samples": seen_total + unseen_total,
-                "seen_accuracy": seen_correct / seen_total if seen_total > 0 else 0,
-                "seen_samples": seen_total,
-                "unseen_accuracy": unseen_correct / unseen_total if unseen_total > 0 else 0,
-                "unseen_samples": unseen_total,
-                "f1_macro": f1_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
-                "f1_micro": f1_score(all_labels_np, all_preds_np, average='micro', zero_division=0),
-                "precision_macro": precision_score(
-                    all_labels_np, all_preds_np, average='macro', zero_division=0
-                ),
-                "recall_macro": recall_score(
-                    all_labels_np, all_preds_np, average='macro', zero_division=0
-                ),
+                **bundle,
+                "total_samples": bundle["num_samples"],  # dual-write legacy key
                 "labels": all_labels_np,
                 "probabilities": all_probs_np,
                 "per_class_recall": per_class_recall,
@@ -1076,35 +1345,28 @@ class CZSLEvaluator:
         return results
 
     def print_jnr_results(self, results: dict, save_path: str = None):
-        """打印并保存JNR评估结果"""
-        # 打印总体结果
-        print("\n" + "=" * 80)
-        print("Evaluation Results by JNR Level")
-        print("=" * 80)
-        print(f"{'JNR':>6} | {'Accuracy':>10} | {'F1_Macro':>10} | "
-              f"{'Seen_Acc':>10} | {'Unseen_Acc':>10} | {'Samples':>8}")
-        print("-" * 80)
+        """打印并保存JNR评估结果（subset_accuracy 为比率）"""
+        print_jnr_metrics_table(results)
 
         lines = []
         for jnr, metrics in sorted(results.items()):
-            acc = (metrics["combination_accuracy"] / metrics["total_samples"]
-                   if metrics["total_samples"] > 0 else 0)
-            print(f"{jnr:>6} | {acc:>10.4f} | {metrics['f1_macro']:>10.4f} | "
-                  f"{metrics['seen_accuracy']:>10.4f} | "
-                  f"{metrics['unseen_accuracy']:>10.4f} | "
-                  f"{metrics['total_samples']:>8}")
-            lines.append(f"{jnr},{acc:.4f},{metrics['f1_macro']:.4f},"
-                        f"{metrics['seen_accuracy']:.4f},"
-                        f"{metrics['unseen_accuracy']:.4f},"
-                        f"{metrics['total_samples']}")
+            acc = metrics.get("subset_accuracy", metrics.get("combination_accuracy", 0.0))
+            n = metrics.get("num_samples", metrics.get("total_samples", 0))
+            lines.append(
+                f"{jnr},{acc:.4f},{metrics.get('f1_macro', 0):.4f},"
+                f"{metrics.get('seen_accuracy', 0):.4f},"
+                f"{metrics.get('unseen_accuracy', 0):.4f},"
+                f"{metrics.get('harmonic_mean', 0):.4f},"
+                f"{n}"
+            )
 
         if save_path:
             with open(save_path, 'w', encoding='utf-8') as f:
-                f.write("JNR,Accuracy,F1_Macro,Seen_Acc,Unseen_Acc,Samples\n")
+                f.write("JNR,SubsetAcc,F1_Macro,Seen_Acc,Unseen_Acc,HM,Samples\n")
                 f.write("\n".join(lines))
             print(f"\nResults saved to {save_path}")
 
-        # 打印每个类别的指标 (Recall, Precision, F1)
+        # 打印每个类别的指标 (Recall, Precision, F1) — 使用 bundle.per_class 或 legacy 数组
         print("\n" + "=" * 80)
         print("Per-Class Recall by JNR Level")
         print("=" * 80)
@@ -1114,7 +1376,10 @@ class CZSLEvaluator:
 
         per_class_recall_lines = []
         for jnr, metrics in sorted(results.items()):
-            recalls = metrics.get("per_class_recall", [])
+            recalls = metrics.get("per_class_recall")
+            if recalls is None and isinstance(metrics.get("per_class"), dict):
+                recalls = [metrics["per_class"].get(n, {}).get("recall", 0.0) for n in self.class_names]
+            recalls = list(recalls) if recalls is not None else [0.0] * len(self.class_names)
             row = f"{jnr:>6} | " + " | ".join(f"{r:>8.4f}" for r in recalls)
             print(row)
             per_class_recall_lines.append(
@@ -1184,8 +1449,11 @@ class CZSLEvaluator:
 
         for jnr in jnrs:
             m = results[jnr]
-            acc = (m["combination_accuracy"] / m["total_samples"]
-                   if m["total_samples"] > 0 else 0)
+            acc = m.get("subset_accuracy", m.get("combination_accuracy", 0.0))
+            n = m.get("num_samples", m.get("total_samples", 0))
+            # legacy: combination_accuracy stored as count
+            if isinstance(acc, (int, float)) and acc > 1.0 and n:
+                acc = acc / n
             accuracies.append(acc)
             f1_macros.append(m["f1_macro"])
             seen_accs.append(m["seen_accuracy"])
@@ -1260,7 +1528,7 @@ class CZSLEvaluator:
             data_loader: 数据加载器
             output_dir: 输出目录
             max_samples: 最大保存样本数（None表示全部保存）
-            use_combinations: 是否使用组合特征预测
+            use_combinations: 是否使用组合特征预测（与 evaluate_zero_shot 一致）
         """
         import cv2
 
@@ -1290,25 +1558,40 @@ class CZSLEvaluator:
 
             batch_size = images.shape[0]
 
-            # 零样本预测 - 使用单类别特征
-            text_features = self.model.get_cached_text_features()
-            image_features = self.model.encode_image(images)
-            image_features = F.normalize(image_features, dim=-1)
-            logit_scale = self.model.model.logit_scale.exp()
-            logits = logit_scale * (image_features @ text_features.T)
+            # 零样本预测 — 与 evaluate_zero_shot 使用相同的预测逻辑
+            if use_combinations:
+                # 使用组合特征进行精确匹配
+                _, _, pred_names = self.model.zero_shot_predict(
+                    images, use_combinations=True, top_k=1
+                )
+                # 解析预测的组合名称
+                preds = torch.zeros(batch_size, len(self.class_names), device=self.device)
+                for i, name in enumerate(pred_names):
+                    if name and len(name) > 0:
+                        comb_name = name[0]
+                        parts = comb_name.split('+')
+                        for part in parts:
+                            if part in self.class_names:
+                                preds[i, self.class_names.index(part)] = 1
+            else:
+                # 使用单类别特征进行多标签预测
+                text_features = self.model.get_cached_text_features()
+                image_features = self.model.encode_image(images)
+                image_features = F.normalize(image_features, dim=-1)
+                logit_scale = self.model.model.logit_scale.exp()
+                logits = logit_scale * (image_features @ text_features.T)
 
-            # 多标签预测策略：softmax + top-k > threshold
-            probs = torch.softmax(logits, dim=-1)
-            num_classes = len(self.class_names)
-            threshold = 1.0 / num_classes
-            top_k = 3
-            topk_values, topk_indices = torch.topk(probs, k=top_k, dim=-1)
+                probs = torch.softmax(logits, dim=-1)
+                num_classes = len(self.class_names)
+                threshold = 1.0 / num_classes
+                top_k = 3
+                topk_values, topk_indices = torch.topk(probs, k=top_k, dim=-1)
 
-            preds = torch.zeros(batch_size, num_classes, device=self.device)
-            for b in range(batch_size):
-                for j, idx in enumerate(topk_indices[b]):
-                    if topk_values[b, j] > threshold:
-                        preds[b, idx] = 1.0
+                preds = torch.zeros(batch_size, num_classes, device=self.device)
+                for b in range(batch_size):
+                    for j, idx in enumerate(topk_indices[b]):
+                        if topk_values[b, j] > threshold:
+                            preds[b, idx] = 1.0
 
             # 保存每张图像
             for i in range(batch_size):
@@ -1411,16 +1694,24 @@ def main():
                         help="Path to config file")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint")
-    parser.add_argument("--mode", type=str, default="by_combination",
-                        choices=["zero_shot", "by_combination", "by_jnr"],
-                        help="Evaluation mode")
+    parser.add_argument("--mode", type=str, default="all",
+                        choices=["all", "by_jnr"],
+                        help="Evaluation mode: 'all' runs zero-shot + by-combination, 'by_jnr' runs per-JNR")
     parser.add_argument("--split", type=str, default="test",
                         choices=["train", "val", "test"],
                         help="Data split to evaluate")
     parser.add_argument("--output_dir", type=str, default="results",
                         help="Output directory for results")
     parser.add_argument("--visualize", action="store_true",
-                        help="Generate visualizations (t-SNE, confusion matrix, etc.)")
+                        help="Generate all visualizations (confusion matrix, ROC, PR, t-SNE, UMAP)")
+    parser.add_argument("--tsne", action="store_true",
+                        help="Generate t-SNE visualization only")
+    parser.add_argument("--umap", action="store_true",
+                        help="Generate UMAP visualization only")
+    parser.add_argument("--roc", action="store_true",
+                        help="Generate ROC curves only")
+    parser.add_argument("--pr", action="store_true",
+                        help="Generate PR curves only")
     parser.add_argument("--save_stft", action="store_true",
                         help="Save STFT images with predictions")
     parser.add_argument("--max_stft_samples", type=int, default=None,
@@ -1438,8 +1729,9 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 类别名称
+    # 类别名称和文本风格
     class_names = [cls["name"] for cls in config.get("jamming_classes", [])]
+    text_style = config.get("czsl", {}).get("text_style", "class_only")
 
     # 创建模型
     model = create_czsl_model(config, device=str(device))
@@ -1474,19 +1766,31 @@ def main():
 
     print(f"Loaded checkpoint from {args.checkpoint}")
 
-    # 缓存文本特征
-    model.cache_text_features(max_combination_size=2, include_single=True)
+    # 从配置加载所有需要缓存的组合（seen + unseen），避免生成全部 C(17,2)=136 种
+    czsl_config = config.get("czsl", {})
+    seen_comb_names = czsl_config.get("seen_combinations", [])
+    unseen_comb_names = czsl_config.get("unseen_combinations", [])
+    all_comb_names = seen_comb_names + unseen_comb_names
+    # 去重（保持顺序）
+    seen_set = set()
+    unique_combos = []
+    for c in all_comb_names:
+        key = tuple(sorted(c))
+        if key not in seen_set:
+            seen_set.add(key)
+            unique_combos.append(c)
 
-    # 创建数据加载器
-    train_loader, val_loader, test_loader, num_classes = create_czsl_dataloaders(config)
+    # 缓存文本特征（仅缓存 config 中定义的 seen+unseen 组合）
+    model.cache_text_features(max_combination_size=2, include_single=True,
+                              seen_combinations=unique_combos, text_style=text_style)
 
     # 选择数据集
     if args.split == "train":
-        data_loader = train_loader
+        split_name = "train"
     elif args.split == "val":
-        data_loader = val_loader
+        split_name = "val"
     else:
-        data_loader = test_loader
+        split_name = "test"
 
     # 创建评估器
     evaluator = CZSLEvaluator(
@@ -1496,142 +1800,174 @@ def main():
     )
 
     # 评估
-    if args.mode == "zero_shot":
-        print(f"\nEvaluating on {args.split} set with zero-shot mode...")
-        results = evaluator.evaluate_zero_shot(data_loader, use_combinations=True, debug=True)
-        evaluator.print_metrics(results["metrics"])
+    if args.mode == "all":
+        # ── 逐 JNR 按需加载：同一时刻只有一个 JNR 的 STFT 在内存中 ──
+        # ChainedLoaderIterable 迭代到每个 JNR 时才创建 STFTDataset
+        # （触发 HDD 顺序读取），切换 JNR 时释放上一个。
 
-        # 从配置获取seen/unseen组合
+        # 加载归一化统计量
+        stats_file = os.path.join(os.path.dirname(args.config), 'normalization_stats.json')
+        if os.path.exists(stats_file):
+            with open(stats_file, 'r') as f:
+                normalization_stats = json.load(f)
+        else:
+            normalization_stats = None
+
+        # 构建每个 JNR 的数据集配置（不实际加载数据）
+        data_config = config.get('data', {})
+        base_path = data_config.get('base_path')
+        jnr_start = data_config.get('jnr_start', 10)
+        jnr_end = data_config.get('jnr_end', 10)
+        jnr_step = data_config.get('jnr_step', 1)
+        stft_suffix = data_config.get('stft_suffix', 'echo_stfts')
+        class_names = [cls['name'] for cls in config.get('jamming_classes', [])]
+
+        jnr_configs = []
+        for jnr in range(jnr_start, jnr_end + 1, jnr_step):
+            jnr_folder = f"JNR_{'+' if jnr >= 0 else ''}{jnr}"
+            data_folder = os.path.join(base_path, jnr_folder)
+            stft_file = os.path.join(data_folder, f'{split_name}_{stft_suffix}.mat')
+            metadata_file = os.path.join(data_folder, f'{split_name}_echo_metadata.json')
+            if os.path.exists(stft_file) and os.path.exists(metadata_file):
+                jnr_configs.append({
+                    'stft_file': stft_file,
+                    'metadata_file': metadata_file,
+                    'class_names': class_names,
+                    'label': jnr_folder,
+                })
+
+        if not jnr_configs:
+            print(f"Error: No data found for {split_name} split!")
+            return
+
+        print(f"\nCreating on-demand per-JNR loader chain for {split_name} split "
+              f"({len(jnr_configs)} JNR levels)")
+
+        # 链式迭代器：按需创建 → 迭代 → 释放 → 下一个
+        data_loader = ChainedLoaderIterable(
+            jnr_configs,
+            batch_size=config.get('train', {}).get('batch_size', 32),
+            num_workers=config.get('data', {}).get('num_workers', 0),
+            pin_memory=config.get('data', {}).get('pin_memory', False) if sys.platform == 'win32' else False,
+            collate_fn=partial(_collate_fn_with_style, text_style=text_style),
+            normalization_stats=normalization_stats,
+        )
+
+        print(f"Total batches: {len(data_loader)}")
+
+        # 公共: 加载 seen/unseen 组合
         czsl_config = config.get("czsl", {})
         seen_comb_names = czsl_config.get("seen_combinations", [])
         unseen_comb_names = czsl_config.get("unseen_combinations", [])
-
-        # 将类别名称转换为索引
         seen_combinations = convert_combination_names_to_indices(seen_comb_names, class_names)
         unseen_combinations = convert_combination_names_to_indices(unseen_comb_names, class_names)
 
-        # 保存结果
-        np.savez(
-            str(output_dir / f"czsl_results_{args.split}.npz"),
-            labels=results["labels"],
-            predictions=results["predictions"],
-            features=results["features"]
-        )
-
-        # 绘制混淆矩阵
-        evaluator.plot_confusion_by_combination(
-            results["labels"],
-            results["predictions"],
-            save_path=str(output_dir / f"czsl_confusion_{args.split}.png"),
+        # ── 1) Zero-Shot (组合特征匹配) ──
+        print(f"\n{'='*60}")
+        print(f"  [1/2] Zero-Shot Evaluation (combination matching)")
+        print(f"{'='*60}")
+        results_zs = evaluator.evaluate_zero_shot(
+            data_loader, use_combinations=True, debug=True,
             seen_combinations=seen_combinations,
-            unseen_combinations=unseen_combinations
+            unseen_combinations=unseen_combinations,
+        )
+        evaluator.print_metrics(results_zs["metrics"], title="Zero-Shot Evaluation Results")
+        save_metrics_json(
+            results_zs["metrics"], output_dir,
+            filename=f"metrics_zero_shot_{args.split}.json",
+            mode="zero_shot", split=args.split,
+            extra_meta={"checkpoint": args.checkpoint},
         )
 
-        # 可视化
+        np.savez(str(output_dir / f"czsl_zeroshot_{args.split}.npz"),
+                 labels=results_zs["labels"], predictions=results_zs["predictions"],
+                 features=results_zs["features"])
+
         if args.visualize:
-            print("\nGenerating visualizations...")
-
-            # t-SNE可视化
+            evaluator.plot_confusion_by_combination(
+                results_zs["labels"], results_zs["predictions"],
+                save_path=str(output_dir / f"czsl_confusion_zs_{args.split}.png"),
+                seen_combinations=seen_combinations, unseen_combinations=unseen_combinations,
+            )
+        if args.visualize or args.roc:
+            plot_roc_curves(
+                results_zs["labels"], results_zs["probabilities"], class_names,
+                save_dir=str(output_dir), prefix=f"czsl_{args.split}_zs",
+                mode_title=f"zero_shot ({args.split})",
+            )
+        if args.visualize or args.pr:
+            plot_pr_curves(
+                results_zs["labels"], results_zs["probabilities"], class_names,
+                save_dir=str(output_dir), prefix=f"czsl_{args.split}_zs",
+                mode_title=f"zero_shot ({args.split})",
+            )
+        if args.tsne:
+            print("\nGenerating t-SNE (zero-shot)...")
             evaluator.plot_feature_tsne(
-                results["features"],
-                results["labels"],
+                results_zs["features"], results_zs["labels"],
                 save_path=str(output_dir / f"czsl_tsne_{args.split}.png"),
-                seen_combinations=seen_combinations,
-                unseen_combinations=unseen_combinations
+                seen_combinations=seen_combinations, unseen_combinations=unseen_combinations,
             )
-
-            # UMAP可视化
+        if args.umap:
+            print("\nGenerating UMAP (zero-shot)...")
             evaluator.plot_feature_umap(
-                results["features"],
-                results["labels"],
+                results_zs["features"], results_zs["labels"],
                 save_path=str(output_dir / f"czsl_umap_{args.split}.png"),
-                seen_combinations=seen_combinations,
-                unseen_combinations=unseen_combinations
+                seen_combinations=seen_combinations, unseen_combinations=unseen_combinations,
             )
-
-            # 标签共现矩阵
+        if args.visualize:
             evaluator.plot_label_cooccurrence(
-                results["labels"],
-                results["predictions"],
-                save_path=str(output_dir / f"czsl_cooccurrence_{args.split}.png")
+                results_zs["labels"], results_zs["predictions"],
+                save_path=str(output_dir / f"czsl_cooccurrence_{args.split}.png"),
             )
-
-        # 保存STFT图像和预测结果
         if args.save_stft:
             print("\nSaving STFT images with predictions...")
-            stft_dir = output_dir / "stft"
             evaluator.save_stft_predictions(
-                data_loader=data_loader,
-                output_dir=str(stft_dir),
-                max_samples=args.max_stft_samples,
-                use_combinations=True
+                data_loader=data_loader, output_dir=str(output_dir / "stft"),
+                max_samples=args.max_stft_samples, use_combinations=True,
             )
 
-    elif args.mode == "by_combination":
-        # 从配置获取seen/unseen组合
-        czsl_config = config.get("czsl", {})
-        seen_comb_names = czsl_config.get("seen_combinations", [])
-        unseen_comb_names = czsl_config.get("unseen_combinations", [])
-
-        # 将类别名称转换为索引
-        seen_combinations = convert_combination_names_to_indices(seen_comb_names, class_names)
-        unseen_combinations = convert_combination_names_to_indices(unseen_comb_names, class_names)
-
-        print(f"\nEvaluating by combination type on {args.split} set...")
-        print(f"Seen combinations: {len(seen_combinations)}")
-        print(f"Unseen combinations: {len(unseen_combinations)}")
-
-        results = evaluator.evaluate_by_combination_type(
+        # ── 2) By-Combination (单类特征 + softmax) ──
+        print(f"\n{'='*60}")
+        print(f"  [2/2] By-Combination Evaluation (single-class + softmax)")
+        print(f"{'='*60}")
+        results_bc = evaluator.evaluate_by_combination_type(
             data_loader,
             seen_combinations=seen_combinations,
             unseen_combinations=unseen_combinations,
-            debug=True
+            debug=True,
+        )
+        metrics_bc = results_bc["metrics"]
+        evaluator.print_metrics(metrics_bc, title="By-Combination Evaluation Results")
+        save_metrics_json(
+            metrics_bc, output_dir,
+            filename=f"metrics_by_combination_{args.split}.json",
+            mode="by_combination", split=args.split,
+            extra_meta={"checkpoint": args.checkpoint},
         )
 
-        metrics = results["metrics"]
+        np.savez(str(output_dir / f"czsl_bycombo_{args.split}.npz"),
+                 labels=results_bc["labels"], predictions=results_bc["predictions"],
+                 features=results_bc["features"])
 
-        print("\n" + "=" * 60)
-        print("Evaluation by Combination Type")
-        print("=" * 60)
-        print(f"Seen Accuracy:    {metrics['seen_accuracy']:.4f} ({metrics['seen_samples']} samples)")
-        print(f"Unseen Accuracy:  {metrics['unseen_accuracy']:.4f} ({metrics['unseen_samples']} samples)")
-        print(f"Other Accuracy:   {metrics['other_accuracy']:.4f} ({metrics['other_samples']} samples)")
-
-        # 保存结果
-        np.savez(
-            str(output_dir / f"czsl_results_{args.split}.npz"),
-            labels=results["labels"],
-            predictions=results["predictions"],
-            features=results["features"]
-        )
-
-        # 绘制混淆矩阵
-        evaluator.plot_confusion_by_combination(
-            results["labels"],
-            results["predictions"],
-            save_path=str(output_dir / f"czsl_confusion_{args.split}.png"),
-            seen_combinations=seen_combinations,
-            unseen_combinations=unseen_combinations
-        )
-
-        # ROC曲线
-        plot_roc_curves(
-            results["labels"],
-            results["probabilities"],
-            class_names,
-            save_dir=str(output_dir),
-            prefix="czsl",
-            mode_title="by_combination"
-        )
-
-        # 保存文本结果
-        with open(output_dir / "combination_results.txt", 'w') as f:
-            f.write("Evaluation by Combination Type\n")
-            f.write("=" * 40 + "\n")
-            f.write(f"Seen Accuracy:    {metrics['seen_accuracy']:.4f} ({metrics['seen_samples']} samples)\n")
-            f.write(f"Unseen Accuracy:  {metrics['unseen_accuracy']:.4f} ({metrics['unseen_samples']} samples)\n")
-            f.write(f"Other Accuracy:   {metrics['other_accuracy']:.4f} ({metrics['other_samples']} samples)\n")
-
+        if args.visualize:
+            evaluator.plot_confusion_by_combination(
+                results_bc["labels"], results_bc["predictions"],
+                save_path=str(output_dir / f"czsl_confusion_bc_{args.split}.png"),
+                seen_combinations=seen_combinations, unseen_combinations=unseen_combinations,
+            )
+        if args.visualize or args.roc:
+            plot_roc_curves(
+                results_bc["labels"], results_bc["probabilities"], class_names,
+                save_dir=str(output_dir), prefix=f"czsl_{args.split}_byc",
+                mode_title=f"by_combination ({args.split})",
+            )
+        if args.visualize or args.pr:
+            plot_pr_curves(
+                results_bc["labels"], results_bc["probabilities"], class_names,
+                save_dir=str(output_dir), prefix=f"czsl_{args.split}_byc",
+                mode_title=f"by_combination ({args.split})",
+            )
     elif args.mode == "by_jnr":
         # 从配置获取seen/unseen组合
         czsl_config = config.get("czsl", {})
@@ -1646,7 +1982,6 @@ def main():
         stats_file = os.path.join(os.path.dirname(args.config), 'normalization_stats.json')
         if os.path.exists(stats_file):
             with open(stats_file, 'r') as f:
-                import json
                 normalization_stats = json.load(f)
         else:
             normalization_stats = None
@@ -1658,6 +1993,7 @@ def main():
             normalization_stats=normalization_stats,
             batch_size=config.get('train', {}).get('batch_size', 32),
             num_workers=config.get('data', {}).get('num_workers', 4),
+            text_style=text_style,
         )
 
         # 按JNR评估
@@ -1667,10 +2003,24 @@ def main():
             unseen_combinations=unseen_combinations,
         )
 
-        # 打印和保存结果
+        # 打印和保存结果（仅 per-JNR，不拼 global / 不与 zero_shot 合并）
         evaluator.print_jnr_results(
             results,
             save_path=str(output_dir / f"jnr_results_{args.split}.csv")
+        )
+        # JSON: strip heavy arrays
+        jnr_json = {}
+        for jnr, m in results.items():
+            jnr_json[str(jnr)] = {
+                k: v for k, v in m.items()
+                if k not in ("labels", "probabilities", "features",
+                             "per_class_recall", "per_class_precision", "per_class_f1")
+            }
+        save_metrics_json(
+            {"per_jnr": jnr_json}, output_dir,
+            filename=f"metrics_by_jnr_{args.split}.json",
+            mode="by_jnr", split=args.split,
+            extra_meta={"checkpoint": args.checkpoint},
         )
 
         # 绘制JNR指标曲线
@@ -1679,18 +2029,30 @@ def main():
             save_path=str(output_dir / f"jnr_metrics_{args.split}.png")
         )
 
-        # 每个JNR等级的ROC曲线
-        for jnr_val, jnr_results in sorted(results.items()):
-            if "probabilities" in jnr_results and jnr_results["probabilities"].size > 0:
-                prefix = f"jnr_{jnr_val:+.0f}"
-                plot_roc_curves(
-                    jnr_results["labels"],
-                    jnr_results["probabilities"],
-                    class_names,
-                    save_dir=str(output_dir),
-                    prefix=prefix,
-                    mode_title=f"JNR={jnr_val:+d}"
-                )
+        # 每个JNR等级的ROC曲线和PR曲线
+        do_jnr_curves = args.visualize or args.roc or args.pr
+        if do_jnr_curves:
+            for jnr_val, jnr_results in sorted(results.items()):
+                if "probabilities" in jnr_results and jnr_results["probabilities"].size > 0:
+                    prefix = f"jnr_{jnr_val:+.0f}_{args.split}"
+                    if args.visualize or args.roc:
+                        plot_roc_curves(
+                            jnr_results["labels"],
+                            jnr_results["probabilities"],
+                            class_names,
+                            save_dir=str(output_dir),
+                            prefix=prefix,
+                            mode_title=f"JNR={jnr_val:+d}"
+                        )
+                    if args.visualize or args.pr:
+                        plot_pr_curves(
+                            jnr_results["labels"],
+                            jnr_results["probabilities"],
+                            class_names,
+                            save_dir=str(output_dir),
+                            prefix=prefix,
+                            mode_title=f"JNR={jnr_val:+d}"
+                        )
 
 
 if __name__ == "__main__":

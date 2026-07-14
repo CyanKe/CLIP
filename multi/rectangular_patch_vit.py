@@ -1,7 +1,7 @@
 """
 条形 Patch ViT 视觉编码器
 
-支持非正方形的 patch，适合 STFT 时频图的特征提取：
+支持非正方形的 patch,适合 STFT 时频图的特征提取：
 - 横向条形 (如 8x32): 覆盖较长时间段、较窄频段
 - 纵向条形 (如 32x8): 覆盖较宽频段、较短时间
 
@@ -20,6 +20,10 @@ class PatchEmbed(nn.Module):
 
     将图像分割为非正方形的 patch 并投影到嵌入空间
     支持任意 patch size，不要求整除图像尺寸
+    不能整除时使用补零（Padding）而非裁切（Cropping）:
+    - 时间轴 (Width): 仅右侧补零（原点 t=0 在左侧）
+    - 频率轴 (Height): 上下对称补零（原点 f=0 在顶部）
+    以保护 STFT 时频图的绝对坐标映射。
     """
 
     def __init__(
@@ -46,30 +50,32 @@ class PatchEmbed(nn.Module):
         self.strict_mode = strict_mode
 
         # 计算每个维度上的 patch 数量
-        # 使用 floor，丢弃无法完整覆盖的边缘
-        self.num_patches_h = img_size // self.patch_height
-        self.num_patches_w = img_size // self.patch_width
+        # 使用 ceil，不足部分通过 padding 补齐（而非裁切）
+        self.num_patches_h = math.ceil(img_size / self.patch_height)
+        self.num_patches_w = math.ceil(img_size / self.patch_width)
         self.num_patches = self.num_patches_h * self.num_patches_w
 
-        # 计算有效覆盖区域和丢弃的边缘像素
-        self.covered_h = self.num_patches_h * self.patch_height
-        self.covered_w = self.num_patches_w * self.patch_width
-        self.dropped_h = img_size - self.covered_h
-        self.dropped_w = img_size - self.covered_w
+        # 计算 padding 后的有效尺寸
+        self.padded_h = self.num_patches_h * self.patch_height
+        self.padded_w = self.num_patches_w * self.patch_width
 
         # 检查是否能整除
-        self.is_perfect_fit = (self.dropped_h == 0) and (self.dropped_w == 0)
+        self.is_perfect_fit = (img_size % self.patch_height == 0) and (img_size % self.patch_width == 0)
 
         if not self.is_perfect_fit:
+            pad_h = self.padded_h - img_size
+            pad_w = self.padded_w - img_size
             if strict_mode:
                 raise ValueError(
                     f"patch_size {patch_size} cannot evenly divide img_size {img_size}. "
-                    f"Dropped pixels: {self.dropped_h}x{self.dropped_w}. "
+                    f"Would pad: {pad_h}x{pad_w}. "
                     f"Set strict_mode=False to allow this."
                 )
             else:
+                pad_top = pad_h // 2
+                pad_bottom = pad_h - pad_top
                 print(f"  Warning: patch_size {patch_size} doesn't evenly divide {img_size}. "
-                      f"Dropping {self.dropped_h}x{self.dropped_w} edge pixels. "
+                      f"Padding: top={pad_top} bottom={pad_bottom} right={pad_w}. "
                       f"Effective grid: {self.num_patches_h}x{self.num_patches_w} = {self.num_patches} patches")
 
         # 使用 Conv2d 实现 patch embedding
@@ -94,10 +100,20 @@ class PatchEmbed(nn.Module):
         assert H == self.img_size and W == self.img_size, \
             f"Input image size ({H}x{W}) doesn't match expected ({self.img_size}x{self.img_size})"
 
-        # 如果不能完美覆盖，裁剪中心区域或丢弃边缘
+        # 如果不能完美覆盖，补齐像素
+        # F.pad format: (left, right, top, bottom) — last dimension (width) first!
+        #
+        # STFT 时频图坐标约定（原点在左上角: t=0, f=0）:
+        #   - 时间轴 (Width, dim=-1): 原点在左侧 → 仅右侧补零 (left=0, right=pad_w)
+        #   - 频率轴 (Height, dim=-2): 原点在顶部 → 上下对称补零 (top=pad_top, bottom=pad_bottom)
+        #     对称补零保持频率中心不变，避免频域坐标偏移
         if not self.is_perfect_fit:
-            # 裁剪：从左上角开始，保留能被完整覆盖的区域
-            x = x[:, :, :self.covered_h, :self.covered_w]
+            pad_w = self.padded_w - W
+            pad_h = self.padded_h - H
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top  # 奇数像素余量分配给底部
+            if pad_w > 0 or pad_h > 0:
+                x = F.pad(x, (0, pad_w, pad_top, pad_bottom))
 
         # Conv2d: [B, C, H, W] -> [B, embed_dim, num_patches_h, num_patches_w]
         x = self.proj(x)
@@ -491,7 +507,65 @@ def create_square_patch_vit(
 # 与现有 CLIPForCZSL 兼容的包装类
 # ============================================================================
 
-class RectangularPatchViTForCZSL(nn.Module):
+class _BaseCLIPWrapper(nn.Module):
+    """
+    CLIP CZSL 包装器基类
+
+    统一管理 CLIP ViT-B/32 文本编码器的加载、冻结和推理，
+    消除子类中的重复代码。子类只需实例化 self.visual。
+    """
+
+    def __init__(self, device: str = "cuda", embed_dim: int = 512):
+        super().__init__()
+        self.device = device
+        self.embed_dim = embed_dim
+
+        # 加载 CLIP 文本编码器
+        import clip
+        base_model, self.preprocess = clip.load("ViT-B/32", device=device)
+        base_model = base_model.float()
+
+        self.transformer = base_model.transformer
+        self.token_embedding = base_model.token_embedding
+        self.positional_embedding = base_model.positional_embedding
+        self.ln_final = base_model.ln_final
+        self.text_projection = base_model.text_projection
+        self.context_length = base_model.context_length
+
+        # 冻结文本编码器
+        for param in self.transformer.parameters():
+            param.requires_grad = False
+        self.token_embedding.weight.requires_grad = False
+        self.positional_embedding.requires_grad = False
+        self.text_projection.requires_grad = False
+
+        # 继承预训练 CLIP 的温度参数 (不要重新初始化！
+        # 重置 logit_scale 会改变绝对相似度尺度，破坏 zero-shot softmax 分布)
+        import copy
+        self.logit_scale = nn.Parameter(copy.deepcopy(base_model.logit_scale.data))
+
+    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
+        """编码图像 — 委托给 self.visual"""
+        return self.visual(image)
+
+    def encode_text(self, text: torch.Tensor) -> torch.Tensor:
+        """编码文本 (与 CLIP 相同)"""
+        dtype = self._get_visual_dtype()
+        x = self.token_embedding(text).type(dtype)
+        x = x + self.positional_embedding.type(dtype)
+        x = x.permute(1, 0, 2)
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.ln_final(x).type(dtype)
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        return x
+
+    def _get_visual_dtype(self):
+        """获取视觉组件的 dtype 以保持一致性"""
+        return next(self.visual.parameters()).dtype
+
+
+class RectangularPatchViTForCZSL(_BaseCLIPWrapper):
     """
     条形 Patch ViT 用于 CZSL 任务
 
@@ -518,36 +592,25 @@ class RectangularPatchViTForCZSL(nn.Module):
             num_classes: 类别数
             class_names: 类别名称列表
         """
-        super().__init__()
-        self.device = device
+        super().__init__(device=device, embed_dim=embed_dim)
         self.num_classes = num_classes
         self.class_names = class_names or [f"Class_{i}" for i in range(num_classes)]
 
-        # 创建模型
-        self.model = RectangularPatchViTForCLIP(
+        # 直接创建视觉编码器（不再通过 RectangularPatchViTForCLIP 中转，避免双重文本编码器）
+        self.visual = RectangularPatchViT(
             img_size=224,
             patch_size=patch_size,
+            in_chans=3,
             embed_dim=embed_dim,
             depth=depth,
             num_heads=num_heads,
-            device=device,
-        )
-
-        self.embed_dim = embed_dim
-        self.preprocess = self.model.preprocess
+            output_dim=embed_dim,
+        ).to(device)
 
         # 文本特征缓存
         self._text_features_cache = None
         self._combination_features_cache = None
         self._combination_names = None
-
-    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        """编码图像"""
-        return self.model.encode_image(image)
-
-    def encode_text(self, text: torch.Tensor) -> torch.Tensor:
-        """编码文本"""
-        return self.model.encode_text(text)
 
     def forward_contrastive(
         self,
@@ -666,7 +729,7 @@ class RectangularPatchViTForCZSL(nn.Module):
             text_features = self.get_cached_text_features()
             names = self.class_names
 
-        logit_scale = self.model.logit_scale.exp()
+        logit_scale = self.logit_scale.exp()
         similarities = logit_scale * (image_features @ text_features.T)
 
         top_k = min(top_k, text_features.shape[0])
@@ -728,147 +791,6 @@ def create_rectangular_patch_model(
 # ============================================================================
 # 多形状 Patch ViT - 综合三种patch形状
 # ============================================================================
-
-class MultiShapePatchEmbed(nn.Module):
-    """
-    多形状 Patch Embedding
-
-    并行处理三种形状的patch，然后融合:
-    - 横向条形 (horizontal): 捕捉时间维度特征
-    - 纵向条形 (vertical): 捕捉频率维度特征
-    - 正方形 (square): 捕捉局部空间特征
-    """
-
-    def __init__(
-        self,
-        img_size: int = 224,
-        patch_sizes: list = None,  # [(h1,w1), (h2,w2), (h3,w3)]
-        in_chans: int = 3,
-        embed_dim: int = 512,
-        fusion: str = "concat",  # "concat", "attention", "mean"
-    ):
-        """
-        Args:
-            img_size: 输入图像尺寸
-            patch_sizes: patch尺寸列表，默认 [(8,32), (32,8), (16,16)]
-            in_chans: 输入通道数
-            embed_dim: 每个分支的嵌入维度
-            fusion: 融合方式
-                - "concat": 拼接后线性投影 (embed_dim * num_branches -> embed_dim)
-                - "attention": 可学习注意力加权融合
-                - "mean": 简单平均
-        """
-        super().__init__()
-        self.img_size = img_size
-        self.embed_dim = embed_dim
-        self.fusion = fusion
-
-        # 默认三种patch形状
-        if patch_sizes is None:
-            patch_sizes = [(8, 32), (32, 8), (16, 16)]  # horizontal, vertical, square
-
-        self.patch_sizes = patch_sizes
-        self.num_branches = len(patch_sizes)
-
-        # 为每种形状创建独立的 patch embedding
-        self.patch_embeds = nn.ModuleList([
-            PatchEmbed(img_size, ps, in_chans, embed_dim)
-            for ps in patch_sizes
-        ])
-
-        # 记录每个分支的 patch 数量
-        self.num_patches_per_branch = [pe.num_patches for pe in self.patch_embeds]
-        self.total_num_patches = sum(self.num_patches_per_branch)
-
-        # 打印配置
-        print(f"\nMultiShapePatchEmbed Configuration:")
-        for i, (ps, np) in enumerate(zip(patch_sizes, self.num_patches_per_branch)):
-            shape_type = "horizontal" if ps[1] > ps[0] else "vertical" if ps[0] > ps[1] else "square"
-            print(f"  Branch {i+1}: {ps[0]}x{ps[1]} ({shape_type}), {np} patches")
-        print(f"  Total patches: {self.total_num_patches}")
-        print(f"  Fusion: {fusion}")
-
-        # 融合层
-        if fusion == "concat":
-            # 拼接后投影
-            self.fusion_proj = nn.Linear(embed_dim * self.num_branches, embed_dim)
-        elif fusion == "attention":
-            # 可学习的注意力权重
-            self.branch_attn = nn.Parameter(torch.ones(self.num_branches) / self.num_branches)
-        # "mean" 不需要额外参数
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, C, H, W] 输入图像
-
-        Returns:
-            [B, total_num_patches, embed_dim] patch embeddings
-        """
-        B = x.shape[0]
-        branch_outputs = []
-
-        for i, patch_embed in enumerate(self.patch_embeds):
-            # 每个分支独立提取 patch 特征
-            patches = patch_embed(x)  # [B, num_patches_i, embed_dim]
-            branch_outputs.append(patches)
-
-        if self.fusion == "concat":
-            # 逐patch拼接（需要对齐patch数量）
-            # 由于不同形状的patch数量不同，我们采用跨分支特征聚合
-            # 对每个分支进行全局池化，然后融合
-            pooled = []
-            for patches in branch_outputs:
-                # [B, num_patches, embed_dim] -> [B, embed_dim]
-                p = patches.mean(dim=1)
-                pooled.append(p)
-
-            # [B, embed_dim * num_branches]
-            concat = torch.cat(pooled, dim=-1)
-
-            # [B, embed_dim]
-            fused = self.fusion_proj(concat)
-
-            # 扩展回序列形式（使用融合后的特征作为全局token）
-            # 这里返回融合后的特征，后续可以加上位置编码
-            return fused.unsqueeze(1)  # [B, 1, embed_dim]
-
-        elif self.fusion == "attention":
-            # 注意力加权融合
-            attn_weights = F.softmax(self.branch_attn, dim=0)
-
-            pooled = []
-            for patches in branch_outputs:
-                p = patches.mean(dim=1)  # [B, embed_dim]
-                pooled.append(p)
-
-            # [num_branches, B, embed_dim]
-            stacked = torch.stack(pooled, dim=0)
-
-            # [num_branches, 1, 1]
-            attn_weights = attn_weights.view(-1, 1, 1)
-
-            # [B, embed_dim]
-            fused = (stacked * attn_weights).sum(dim=0)
-
-            return fused.unsqueeze(1)  # [B, 1, embed_dim]
-
-        elif self.fusion == "mean":
-            # 简单平均
-            pooled = []
-            for patches in branch_outputs:
-                p = patches.mean(dim=1)
-                pooled.append(p)
-
-            # [B, embed_dim]
-            fused = torch.stack(pooled, dim=0).mean(dim=0)
-
-            return fused.unsqueeze(1)  # [B, 1, embed_dim]
-
-        else:
-            # 默认：直接拼接所有patch
-            return torch.cat(branch_outputs, dim=1)
-
 
 class MultiShapePatchViT(nn.Module):
     """
@@ -932,6 +854,13 @@ class MultiShapePatchViT(nn.Module):
             self.pos_embed = nn.Parameter(torch.zeros(1, total_patches, embed_dim))
             self.pos_drop = nn.Dropout(drop_rate)
 
+            # 形状/类型编码 (类似BERT的segment embeddings)
+            # 让Transformer能够区分token来自哪个patch分支
+            self.shape_embeds = nn.ParameterList([
+                nn.Parameter(torch.zeros(1, 1, embed_dim))
+                for _ in patch_sizes
+            ])
+
             # 共享的 Transformer blocks
             self.blocks = nn.ModuleList([
                 Block(embed_dim, num_heads, mlp_ratio, drop=drop_rate, attn_drop=attn_drop_rate)
@@ -944,6 +873,15 @@ class MultiShapePatchViT(nn.Module):
             self.patch_embeds = nn.ModuleList([
                 PatchEmbed(img_size, ps, in_chans, embed_dim)
                 for ps in patch_sizes
+            ])
+
+            # 每个分支独立的位置编码 (修复致命Bug: 之前缺少位置编码)
+            self.branch_pos_embeds = nn.ParameterList([
+                nn.Parameter(torch.zeros(1, pe.num_patches, embed_dim))
+                for pe in self.patch_embeds
+            ])
+            self.branch_pos_drops = nn.ModuleList([
+                nn.Dropout(drop_rate) for _ in range(self.num_branches)
             ])
 
             # 每个分支独立的 Transformer
@@ -981,6 +919,11 @@ class MultiShapePatchViT(nn.Module):
     def _init_weights(self):
         if self.fusion_mode == "early_fusion":
             nn.init.trunc_normal_(self.pos_embed, std=0.02)
+            for se in self.shape_embeds:
+                nn.init.trunc_normal_(se, std=0.02)
+        elif self.fusion_mode == "late_fusion":
+            for pe in self.branch_pos_embeds:
+                nn.init.trunc_normal_(pe, std=0.02)
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -1004,8 +947,9 @@ class MultiShapePatchViT(nn.Module):
         if self.fusion_mode == "early_fusion":
             # 早期融合
             all_patches = []
-            for patch_embed in self.patch_embeds:
+            for i, patch_embed in enumerate(self.patch_embeds):
                 patches = patch_embed(x)  # [B, num_patches, embed_dim]
+                patches = patches + self.shape_embeds[i]  # 添加形状标识
                 all_patches.append(patches)
 
             # 拼接所有patch
@@ -1032,6 +976,10 @@ class MultiShapePatchViT(nn.Module):
                 # 提取 patch
                 patches = patch_embed(x)  # [B, num_patches_i, embed_dim]
 
+                # 添加位置编码 (修复致命Bug: 之前缺失)
+                patches = patches + self.branch_pos_embeds[i]
+                patches = self.branch_pos_drops[i](patches)
+
                 # Transformer 处理
                 for block in self.branch_transformers[i]:
                     patches = block(patches)
@@ -1055,7 +1003,7 @@ class MultiShapePatchViT(nn.Module):
         return x
 
 
-class MultiShapePatchViTForCZSL(nn.Module):
+class MultiShapePatchViTForCZSL(_BaseCLIPWrapper):
     """
     多形状 Patch ViT 用于 CZSL 任务
 
@@ -1073,32 +1021,12 @@ class MultiShapePatchViTForCZSL(nn.Module):
         num_classes: int = 14,
         class_names: list = None,
     ):
-        super().__init__()
-        self.device = device
+        super().__init__(device=device, embed_dim=embed_dim)
         self.num_classes = num_classes
         self.class_names = class_names or [f"Class_{i}" for i in range(num_classes)]
 
         if patch_sizes is None:
             patch_sizes = [(8, 32), (32, 8), (16, 16)]
-
-        # 加载 CLIP 文本编码器
-        import clip
-        base_model, self.preprocess = clip.load("ViT-B/32", device=device)
-        base_model = base_model.float()
-
-        self.transformer = base_model.transformer
-        self.token_embedding = base_model.token_embedding
-        self.positional_embedding = base_model.positional_embedding
-        self.ln_final = base_model.ln_final
-        self.text_projection = base_model.text_projection
-        self.context_length = base_model.context_length
-
-        # 冻结文本编码器
-        for param in self.transformer.parameters():
-            param.requires_grad = False
-        self.token_embedding.weight.requires_grad = False
-        self.positional_embedding.requires_grad = False
-        self.text_projection.requires_grad = False
 
         # 多形状视觉编码器
         self.visual = MultiShapePatchViT(
@@ -1112,26 +1040,10 @@ class MultiShapePatchViTForCZSL(nn.Module):
             output_dim=embed_dim,
         ).to(device)
 
-        self.embed_dim = embed_dim
-        self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
-
         # 缓存
         self._text_features_cache = None
         self._combination_features_cache = None
         self._combination_names = None
-
-    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        return self.visual(image)
-
-    def encode_text(self, text: torch.Tensor) -> torch.Tensor:
-        x = self.token_embedding(text).type(self.visual.proj.weight.dtype)
-        x = x + self.positional_embedding.type(self.visual.proj.weight.dtype)
-        x = x.permute(1, 0, 2)
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)
-        x = self.ln_final(x).type(self.visual.proj.weight.dtype)
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
-        return x
 
     def forward_contrastive(
         self,
@@ -1284,11 +1196,12 @@ def create_multi_shape_patch_model(config: dict, device: str = "cuda") -> MultiS
 # 双分支多形状 Patch ViT - 用于欺骗/压制干扰分类
 # ============================================================================
 
-class MultiShapePatchViTForDualBranch(nn.Module):
+class MultiShapePatchViTForDualBranch(_BaseCLIPWrapper):
     """
     多形状 Patch ViT 双分支版本
 
     用于欺骗/压制干扰分类，与 DualBranchCLIPForCZSL 接口兼容
+    使用双投影头解耦两个语义维度的特征子空间
     """
 
     def __init__(
@@ -1302,8 +1215,7 @@ class MultiShapePatchViTForDualBranch(nn.Module):
         deception_classes: list = None,
         suppression_classes: list = None,
     ):
-        super().__init__()
-        self.device = device
+        super().__init__(device=device, embed_dim=embed_dim)
 
         # 干扰类型分组
         self.deception_classes = deception_classes or ["DFTJ", "ISRJ", "SMSPJ", "C&IJ", "CSJ"]
@@ -1319,26 +1231,8 @@ class MultiShapePatchViTForDualBranch(nn.Module):
         if patch_sizes is None:
             patch_sizes = [(8, 32), (32, 8), (16, 16)]
 
-        # 加载 CLIP 文本编码器
-        import clip
-        base_model, self.preprocess = clip.load("ViT-B/32", device=device)
-        base_model = base_model.float()
-
-        self.transformer = base_model.transformer
-        self.token_embedding = base_model.token_embedding
-        self.positional_embedding = base_model.positional_embedding
-        self.ln_final = base_model.ln_final
-        self.text_projection = base_model.text_projection
-        self.context_length = base_model.context_length
-
-        # 冻结文本编码器
-        for param in self.transformer.parameters():
-            param.requires_grad = False
-        self.token_embedding.weight.requires_grad = False
-        self.positional_embedding.requires_grad = False
-        self.text_projection.requires_grad = False
-
-        # 多形状视觉编码器
+        # 多形状视觉编码器 (共享主干)
+        # output_dim=embed_dim: 内部proj退化为恒等映射，由外部task heads做真正的投影
         self.visual = MultiShapePatchViT(
             img_size=224,
             patch_sizes=patch_sizes,
@@ -1347,11 +1241,12 @@ class MultiShapePatchViTForDualBranch(nn.Module):
             depth=depth,
             num_heads=num_heads,
             fusion_mode=fusion_mode,
-            output_dim=embed_dim,
+            output_dim=embed_dim,  # 恒等 — 避免双重线性投影
         ).to(device)
 
-        self.embed_dim = embed_dim
-        self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
+        # 任务特定的投影头 (解决共享投影头无法解耦两个语义维度的问题)
+        self.proj_deception = nn.Linear(embed_dim, embed_dim).to(device)
+        self.proj_suppression = nn.Linear(embed_dim, embed_dim).to(device)
 
         # 缓存
         self._deception_text_features = None
@@ -1365,19 +1260,6 @@ class MultiShapePatchViTForDualBranch(nn.Module):
         print(f"  Deception classes: {self.num_deception_classes}")
         print(f"  Suppression classes: {self.num_suppression_classes}")
 
-    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        return self.visual(image)
-
-    def encode_text(self, text: torch.Tensor) -> torch.Tensor:
-        x = self.token_embedding(text).type(self.visual.proj.weight.dtype)
-        x = x + self.positional_embedding.type(self.visual.proj.weight.dtype)
-        x = x.permute(1, 0, 2)
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)
-        x = self.ln_final(x).type(self.visual.proj.weight.dtype)
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
-        return x
-
     def forward_dual(
         self,
         image: torch.Tensor,
@@ -1385,20 +1267,33 @@ class MultiShapePatchViTForDualBranch(nn.Module):
         text_tokens_suppression: torch.Tensor,
         time_signal: torch.Tensor = None,
         features_dict: dict = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """双分支前向传播 (features_dict 用于与 DualBranchCLIPForCZSL 接口兼容)"""
-        image_features = self.encode_image(image)
-        text_features_deception = self.encode_text(text_tokens_deception)
-        text_features_suppression = self.encode_text(text_tokens_suppression)
+    ) -> dict:
+        """双分支前向传播
 
-        image_features = F.normalize(image_features, dim=-1)
-        text_features_deception = F.normalize(text_features_deception, dim=-1)
-        text_features_suppression = F.normalize(text_features_suppression, dim=-1)
+        返回字典格式以保持向后兼容：其他模型（如 DualBranchCLIPForCZSL）
+        仍返回 3-tuple，调用方通过 isinstance 判断或直接解析 dict。
+        """
+        shared = self.encode_image(image)  # 共享主干输出
 
-        return image_features, text_features_deception, text_features_suppression
+        # 任务特定投影
+        img_feat_d = self.proj_deception(shared)
+        img_feat_s = self.proj_suppression(shared)
 
-    def forward(self, image, text_tokens_deception=None, text_tokens_suppression=None, time_signal=None, features_dict=None):
-        return self.forward_dual(image, text_tokens_deception, text_tokens_suppression, time_signal, features_dict)
+        img_feat_d = F.normalize(img_feat_d, dim=-1)
+        img_feat_s = F.normalize(img_feat_s, dim=-1)
+
+        txt_feat_d = F.normalize(self.encode_text(text_tokens_deception), dim=-1)
+        txt_feat_s = F.normalize(self.encode_text(text_tokens_suppression), dim=-1)
+
+        return {
+            "deception": (img_feat_d, txt_feat_d),
+            "suppression": (img_feat_s, txt_feat_s),
+        }
+
+    def forward(self, image, text_tokens_deception=None, text_tokens_suppression=None,
+                time_signal=None, features_dict=None):
+        return self.forward_dual(image, text_tokens_deception, text_tokens_suppression,
+                                 time_signal, features_dict)
 
     @torch.no_grad()
     def cache_text_features_dual(self, use_translation: bool = False):
@@ -1443,17 +1338,20 @@ class MultiShapePatchViTForDualBranch(nn.Module):
 
     @torch.no_grad()
     def zero_shot_predict_dual(self, image, time_signal=None, top_k=1):
-        """双分支零样本预测"""
+        """双分支零样本预测 — 使用任务特定投影头"""
         self.eval()
 
-        image_features = self.encode_image(image)
-        image_features = F.normalize(image_features, dim=-1)
+        shared = self.encode_image(image)
+
+        # 使用任务特定投影头
+        img_feat_d = F.normalize(self.proj_deception(shared), dim=-1)
+        img_feat_s = F.normalize(self.proj_suppression(shared), dim=-1)
 
         logit_scale = self.logit_scale.exp()
 
         # 欺骗分支预测
         deception_features = self.get_deception_text_features()
-        deception_similarities = logit_scale * (image_features @ deception_features.T)
+        deception_similarities = logit_scale * (img_feat_d @ deception_features.T)
         top_k_deception = min(top_k, deception_features.shape[0])
         deception_values, deception_indices = torch.topk(deception_similarities, k=top_k_deception, dim=-1)
         deception_names = [[self._deception_names[idx.item()] for idx in batch_indices]
@@ -1467,7 +1365,7 @@ class MultiShapePatchViTForDualBranch(nn.Module):
 
         # 压制分支预测
         suppression_features = self.get_suppression_text_features()
-        suppression_similarities = logit_scale * (image_features @ suppression_features.T)
+        suppression_similarities = logit_scale * (img_feat_s @ suppression_features.T)
         top_k_suppression = min(top_k, suppression_features.shape[0])
         suppression_values, suppression_indices = torch.topk(suppression_similarities, k=top_k_suppression, dim=-1)
         suppression_names = [[self._suppression_names[idx.item()] for idx in batch_indices]

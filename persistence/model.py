@@ -341,66 +341,92 @@ class PersistenceCLIPForCZSL(nn.Module):
                 all_names.append(combo_name)
 
         if all_features:
-            self._text_features_cache = torch.cat(all_features, dim=0)
+            # Align multi/model.py: full combo cache + singles slice
+            self._combination_features_cache = torch.cat(all_features, dim=0)
             self._combination_names = all_names
-            print(f"Cached {len(all_names)} text features for zero-shot inference")
+            n_single = len(self.class_names) if include_single else 0
+            self._text_features_cache = (
+                self._combination_features_cache[:n_single]
+                if n_single > 0
+                else self._combination_features_cache
+            )
+            print(f"Cached {len(all_names)} text features for zero-shot inference "
+                  f"({n_single} singles + {len(all_names) - n_single} combos)")
         else:
             self._text_features_cache = None
+            self._combination_features_cache = None
             self._combination_names = None
 
+    def get_cached_text_features(self) -> torch.Tensor:
+        """Single-class text features (first N entries)."""
+        if self._text_features_cache is None:
+            self.cache_text_features()
+        return self._text_features_cache
+
+    def get_cached_combination_features(self) -> torch.Tensor:
+        """Full single + combination text features."""
+        if getattr(self, "_combination_features_cache", None) is None:
+            self.cache_text_features()
+        return self._combination_features_cache
+
     # ------------------------------------------------------------------
-    # Zero-shot prediction
+    # Zero-shot prediction (aligned with multi/model.py: combo-space top-k)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def zero_shot_predict(
         self,
         image: torch.Tensor,
-        threshold: float = 0.5,
-        top_k: int = None,
-    ) -> List[List[str]]:
-        """Zero-shot prediction using cached text features.
+        use_combinations: bool = True,
+        top_k: int = 1,
+        threshold: float = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[List[str]]]:
+        """Zero-shot prediction via similarity to cached text features.
+
+        Matches multi/CLIPForCZSL.zero_shot_predict:
+          - default: combination space, hard top-1
+          - decode ``"A+B"`` names into multi-hot outside this method
 
         Args:
             image: (B, 3, H, W)
-            threshold: multi-label confidence threshold
-            top_k: if set, return top-k predictions regardless of threshold
+            use_combinations: if True use singles+combos; else singles only
+            top_k: number of top text candidates (default 1)
+            threshold: unused (kept for API compat); multi-style is hard top-k
 
         Returns:
-            List of lists of predicted class/combination names
+            similarities: (B, num_candidates)
+            indices: (B, top_k)
+            pred_names: list of length B, each a list of top-k name strings
         """
         self.eval()
 
-        if self._text_features_cache is None:
+        combo_cache = getattr(self, "_combination_features_cache", None)
+        single_cache = self._text_features_cache
+        if combo_cache is None and single_cache is None:
             raise RuntimeError("Text features not cached. Call cache_text_features() first.")
 
         image_features = self.encode_image(image)
         image_features = F.normalize(image_features, dim=-1)
 
-        text_features = F.normalize(self._text_features_cache, dim=-1)
+        if use_combinations and combo_cache is not None:
+            text_features = F.normalize(combo_cache, dim=-1)
+            names = self._combination_names
+        else:
+            text_features = F.normalize(single_cache, dim=-1)
+            names = self.class_names
 
         logit_scale = self.logit_scale.exp()
-        logits = logit_scale * (image_features @ text_features.T)  # (B, num_texts)
+        similarities = logit_scale * (image_features @ text_features.T)  # (B, K)
 
-        probs = F.softmax(logits, dim=-1)
+        k = min(top_k, similarities.shape[-1])
+        values, indices = torch.topk(similarities, k=k, dim=-1)
 
-        predictions = []
-        for i in range(image.size(0)):
-            if top_k is not None:
-                top_indices = probs[i].topk(top_k).indices.cpu().tolist()
-                preds = [self._combination_names[idx] for idx in top_indices]
-            else:
-                preds = [
-                    self._combination_names[j]
-                    for j in range(len(self._combination_names))
-                    if probs[i, j].item() > threshold
-                ]
-                if not preds:
-                    best = probs[i].argmax().item()
-                    preds = [self._combination_names[best]]
-            predictions.append(preds)
+        pred_names = [
+            [names[idx.item()] for idx in batch_indices]
+            for batch_indices in indices
+        ]
 
-        return predictions
+        return similarities, indices, pred_names
 
 
 # ---------------------------------------------------------------------------

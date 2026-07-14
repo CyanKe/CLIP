@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from multi.rectangular_patch_vit import MultiShapePatchViTForCZSL, create_multi_shape_patch_model
 from multi.data import create_czsl_dataloaders
 from multi.evaluate_czsl import (
-    plot_roc_curves, create_jnr_dataloaders, convert_combination_names_to_indices
+    plot_roc_curves, plot_pr_curves, create_jnr_dataloaders, convert_combination_names_to_indices
 )
 
 
@@ -69,6 +69,14 @@ class MultiShapeViTEvaluator:
         all_combination_correct = 0
         all_multilabel_correct = 0
         total_samples = 0
+
+        # Seen / Unseen 统计
+        seen_set = set(tuple(sorted(c)) for c in self.seen_combinations)
+        unseen_set = set(tuple(sorted(c)) for c in self.unseen_combinations)
+        has_seen_unseen = bool(seen_set or unseen_set)
+        seen_correct, seen_total = 0, 0
+        unseen_correct, unseen_total = 0, 0
+        other_correct, other_total = 0, 0
 
         eval_bar = tqdm(data_loader, desc="Zero-Shot Evaluation")
 
@@ -143,6 +151,23 @@ class MultiShapeViTEvaluator:
                     all_combination_correct += 1
                 if true_set.issubset(pred_set) or pred_set.issubset(true_set):
                     all_multilabel_correct += 1
+
+                # 按 seen/unseen/other 分类统计
+                if has_seen_unseen:
+                    true_comb = tuple(sorted(true_set))
+                    is_correct = (true_set == pred_set)
+                    if true_comb in seen_set:
+                        seen_total += 1
+                        if is_correct:
+                            seen_correct += 1
+                    elif true_comb in unseen_set:
+                        unseen_total += 1
+                        if is_correct:
+                            unseen_correct += 1
+                    else:
+                        other_total += 1
+                        if is_correct:
+                            other_correct += 1
             total_samples += batch_size
 
         all_labels_np = torch.cat(all_labels).numpy()
@@ -157,6 +182,21 @@ class MultiShapeViTEvaluator:
             "precision_macro": precision_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
             "recall_macro": recall_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
         }
+        # 添加 seen/unseen 准确率
+        if has_seen_unseen:
+            metrics["seen_accuracy"] = seen_correct / seen_total if seen_total > 0 else 0.0
+            metrics["seen_samples"] = seen_total
+            metrics["unseen_accuracy"] = unseen_correct / unseen_total if unseen_total > 0 else 0.0
+            metrics["unseen_samples"] = unseen_total
+            if other_total > 0:
+                metrics["other_accuracy"] = other_correct / other_total
+                metrics["other_samples"] = other_total
+            if metrics["seen_accuracy"] + metrics["unseen_accuracy"] > 0:
+                metrics["harmonic_mean"] = (2 * metrics["seen_accuracy"] * metrics["unseen_accuracy"]
+                                            / (metrics["seen_accuracy"] + metrics["unseen_accuracy"]))
+            else:
+                metrics["harmonic_mean"] = 0.0
+
         per_class_f1 = f1_score(all_labels_np, all_preds_np, average=None, zero_division=0)
         metrics["per_class"] = {
             "f1": per_class_f1,
@@ -354,6 +394,17 @@ class MultiShapeViTEvaluator:
         print("\n" + "=" * 60)
         print("Zero-Shot Evaluation Results")
         print("=" * 60)
+
+        # Seen / Unseen accuracy (CZSL 核心指标)
+        if 'seen_accuracy' in metrics:
+            print(f"  Seen Accuracy:           {metrics['seen_accuracy']:.4f}  ({metrics.get('seen_samples', 0)} samples)")
+            print(f"  Unseen Accuracy:         {metrics['unseen_accuracy']:.4f}  ({metrics.get('unseen_samples', 0)} samples)")
+            if 'other_accuracy' in metrics:
+                print(f"  Other Accuracy:          {metrics['other_accuracy']:.4f}  ({metrics.get('other_samples', 0)} samples)")
+            if 'harmonic_mean' in metrics:
+                print(f"  Harmonic Mean:           {metrics['harmonic_mean']:.4f}")
+            print(f"  {'-'*50}")
+
         print(f"Combination Accuracy:     {metrics['combination_accuracy']:.4f}")
         print(f"Partial Match Accuracy:   {metrics['partial_match_accuracy']:.4f}")
         print(f"Macro F1 Score:           {metrics['f1_macro']:.4f}")
@@ -668,11 +719,21 @@ def main():
     parser = argparse.ArgumentParser(description="Multi-Shape Patch ViT Evaluation")
     parser.add_argument("--config", type=str, default="multi/config.yaml")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--mode", type=str, default="zero_shot",
-                        choices=["zero_shot", "by_combination", "by_jnr"])
+    parser.add_argument("--mode", type=str, default="all",
+                        choices=["all", "by_jnr"],
+                        help="Evaluation mode: 'all' runs zero-shot + by-combination, 'by_jnr' runs per-JNR")
     parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
     parser.add_argument("--output_dir", type=str, default="results/multishape_vit")
-    parser.add_argument("--visualize", action="store_true")
+    parser.add_argument("--visualize", action="store_true",
+                        help="Generate all visualizations (confusion matrix, ROC, PR, t-SNE, UMAP)")
+    parser.add_argument("--tsne", action="store_true",
+                        help="Generate t-SNE visualization only")
+    parser.add_argument("--umap", action="store_true",
+                        help="Generate UMAP visualization only")
+    parser.add_argument("--roc", action="store_true",
+                        help="Generate ROC curves only")
+    parser.add_argument("--pr", action="store_true",
+                        help="Generate PR curves only")
     parser.add_argument("--threshold", type=float, default=0.5)
     args = parser.parse_args()
 
@@ -686,13 +747,20 @@ def main():
     print(f"\nLoading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
+    # 模型架构配置: 使用 checkpoint 中保存的配置（保证结构匹配）
     if "config" in checkpoint:
         config = checkpoint["config"]
-        print("  Using config from checkpoint")
+        print("  Model architecture from checkpoint config")
     else:
         with open(args.config, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
-        print("  Using config from file")
+        print("  Model architecture from file config (no config in checkpoint)")
+
+    # 数据路径: 始终从当前 YAML 文件读取（可能已变更）
+    with open(args.config, 'r', encoding='utf-8') as f:
+        file_config = yaml.safe_load(f)
+    config["data"] = file_config.get("data", config.get("data", {}))
+    print(f"  Data config from {args.config}")
 
     # 确保模型配置存在
     model_config = config.get("model", {})
@@ -729,7 +797,7 @@ def main():
     )
 
     # ── 按模式执行 ────────────────────────────────────────────
-    if args.mode in ("zero_shot", "by_combination"):
+    if args.mode == "all":
         # 加载数据
         print(f"\nLoading {args.split} dataset...")
         train_loader, val_loader, test_loader, _ = create_czsl_dataloaders(
@@ -744,69 +812,71 @@ def main():
             print(f"Error: No {args.split} data available!")
             return
 
-    if args.mode == "zero_shot":
-        print(f"\nEvaluating on {args.split} set with zero-shot mode...")
-        results = evaluator.evaluate_zero_shot(data_loader, use_combinations=True, debug=True)
-        evaluator.print_metrics(results["metrics"])
+        # ── 1) Zero-Shot (组合特征匹配) ──
+        print(f"\n{'='*60}")
+        print(f"  [1/2] Zero-Shot Evaluation (combination matching)")
+        print(f"{'='*60}")
+        results_zs = evaluator.evaluate_zero_shot(data_loader, use_combinations=True, debug=True)
+        evaluator.print_metrics(results_zs["metrics"])
 
-        np.savez(str(output_dir / f"multishape_vit_results_{args.split}.npz"),
-                 labels=results["labels"], predictions=results["predictions"],
-                 features=results["features"])
-
-        evaluator.plot_confusion_by_combination(
-            results["labels"], results["predictions"],
-            save_path=str(output_dir / f"multishape_vit_confusion_{args.split}.png"),
-        )
+        np.savez(str(output_dir / f"multishape_vit_zeroshot_{args.split}.npz"),
+                 labels=results_zs["labels"], predictions=results_zs["predictions"],
+                 features=results_zs["features"])
 
         if args.visualize:
-            print("\nGenerating visualizations...")
-            evaluator.plot_feature_tsne(
-                results["features"], results["labels"],
-                save_path=str(output_dir / f"multishape_vit_tsne_{args.split}.png"),
+            evaluator.plot_confusion_by_combination(
+                results_zs["labels"], results_zs["predictions"],
+                save_path=str(output_dir / f"multishape_vit_confusion_zs_{args.split}.png"),
             )
-            evaluator.plot_feature_umap(
-                results["features"], results["labels"],
-                save_path=str(output_dir / f"multishape_vit_umap_{args.split}.png"),
-            )
+        if args.visualize:
             evaluator.plot_label_cooccurrence(
-                results["labels"], results["predictions"],
+                results_zs["labels"], results_zs["predictions"],
                 save_path=str(output_dir / f"multishape_vit_cooccurrence_{args.split}.png"),
             )
-
-    elif args.mode == "by_combination":
-        print(f"\nEvaluating by combination type on {args.split} set...")
-        results = evaluator.evaluate_by_combination_type(data_loader)
-        metrics = results["metrics"]
-        print("\n" + "=" * 60)
-        print("Evaluation by Combination Type")
-        print("=" * 60)
-        print(f"Seen Accuracy:    {metrics['seen_accuracy']:.4f} ({metrics['seen_samples']} samples)")
-        print(f"Unseen Accuracy:  {metrics['unseen_accuracy']:.4f} ({metrics['unseen_samples']} samples)")
-        print(f"Other Accuracy:   {metrics['other_accuracy']:.4f} ({metrics['other_samples']} samples)")
-
-        np.savez(str(output_dir / f"multishape_vit_results_{args.split}.npz"),
-                 labels=results["labels"], predictions=results["predictions"],
-                 features=results["features"])
-
-        evaluator.plot_confusion_by_combination(
-            results["labels"], results["predictions"],
-            save_path=str(output_dir / f"multishape_vit_confusion_{args.split}.png"),
-        )
-
-        plot_roc_curves(
-            results["labels"], results["probabilities"], class_names,
-            save_dir=str(output_dir), prefix="multishape_vit",
-            mode_title="by_combination"
-        )
-
-        if args.visualize:
+        if args.tsne:
+            print("\nGenerating t-SNE visualization...")
             evaluator.plot_feature_tsne(
-                results["features"], results["labels"],
+                results_zs["features"], results_zs["labels"],
                 save_path=str(output_dir / f"multishape_vit_tsne_{args.split}.png"),
             )
+        if args.umap:
+            print("\nGenerating UMAP visualization...")
             evaluator.plot_feature_umap(
-                results["features"], results["labels"],
+                results_zs["features"], results_zs["labels"],
                 save_path=str(output_dir / f"multishape_vit_umap_{args.split}.png"),
+            )
+
+        # ── 2) By-Combination (单类特征 + softmax) ──
+        print(f"\n{'='*60}")
+        print(f"  [2/2] By-Combination Evaluation (single-class + softmax)")
+        print(f"{'='*60}")
+        results_bc = evaluator.evaluate_by_combination_type(data_loader)
+        metrics_bc = results_bc["metrics"]
+        print(f"  Seen Accuracy:    {metrics_bc['seen_accuracy']:.4f} ({metrics_bc['seen_samples']} samples)")
+        print(f"  Unseen Accuracy:  {metrics_bc['unseen_accuracy']:.4f} ({metrics_bc['unseen_samples']} samples)")
+        print(f"  Other Accuracy:   {metrics_bc['other_accuracy']:.4f} ({metrics_bc.get('other_samples', 0)} samples)")
+        print(f"{'='*60}")
+
+        np.savez(str(output_dir / f"multishape_vit_bycombo_{args.split}.npz"),
+                 labels=results_bc["labels"], predictions=results_bc["predictions"],
+                 features=results_bc["features"])
+
+        if args.visualize:
+            evaluator.plot_confusion_by_combination(
+                results_bc["labels"], results_bc["predictions"],
+                save_path=str(output_dir / f"multishape_vit_confusion_bc_{args.split}.png"),
+            )
+        if args.visualize or args.roc:
+            plot_roc_curves(
+                results_bc["labels"], results_bc["probabilities"], class_names,
+                save_dir=str(output_dir), prefix=f"multishape_vit_{args.split}_byc",
+                mode_title=f"by_combination ({args.split})"
+            )
+        if args.visualize or args.pr:
+            plot_pr_curves(
+                results_bc["labels"], results_bc["probabilities"], class_names,
+                save_dir=str(output_dir), prefix=f"multishape_vit_{args.split}_byc",
+                mode_title=f"by_combination ({args.split})"
             )
 
     elif args.mode == "by_jnr":
@@ -833,13 +903,22 @@ def main():
         evaluator.plot_jnr_metrics(
             results, save_path=str(output_dir / f"jnr_metrics_{args.split}.png"))
 
-        for jnr_val, jnr_results in sorted(results.items()):
-            if "probabilities" in jnr_results and jnr_results["probabilities"].size > 0:
-                plot_roc_curves(
-                    jnr_results["labels"], jnr_results["probabilities"], class_names,
-                    save_dir=str(output_dir), prefix=f"jnr_{jnr_val:+.0f}",
-                    mode_title=f"JNR={jnr_val:+d}"
-                )
+        do_jnr_curves = args.visualize or args.roc or args.pr
+        if do_jnr_curves:
+            for jnr_val, jnr_results in sorted(results.items()):
+                if "probabilities" in jnr_results and jnr_results["probabilities"].size > 0:
+                    if args.visualize or args.roc:
+                        plot_roc_curves(
+                            jnr_results["labels"], jnr_results["probabilities"], class_names,
+                            save_dir=str(output_dir), prefix=f"jnr_{jnr_val:+.0f}_{args.split}",
+                            mode_title=f"JNR={jnr_val:+d}"
+                        )
+                    if args.visualize or args.pr:
+                        plot_pr_curves(
+                            jnr_results["labels"], jnr_results["probabilities"], class_names,
+                            save_dir=str(output_dir), prefix=f"jnr_{jnr_val:+.0f}_{args.split}",
+                            mode_title=f"JNR={jnr_val:+d}"
+                        )
 
     # 保存评估摘要
     print(f"\nResults saved to {output_dir}")

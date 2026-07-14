@@ -100,6 +100,7 @@ class Trainer:
         self.checkpoint_config = config.get("checkpoint", {})
         self.save_dir = Path(self.checkpoint_config.get("save_dir", "checkpoints"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.model_name = self.checkpoint_config.get("model_name", "")
 
     def train_epoch(self) -> dict:
         """
@@ -314,12 +315,11 @@ class Trainer:
         }
 
         # 保存最新检查点
-        latest_path = self.save_dir / "latest_checkpoint.pt"
+        latest_path = self.save_dir / f"{self.model_name + '_' if self.model_name else ''}latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
 
-        # 保存最佳检查点
         if is_best:
-            best_path = self.save_dir / "best_model.pt"
+            best_path = self.save_dir / f"{self.model_name + '_' if self.model_name else ''}best_model.pt"
             torch.save(checkpoint, best_path)
             print(f"  ★ Saved best model with F1: {metrics['f1_macro']:.4f}")
 

@@ -655,7 +655,8 @@ class DualBranchContrastiveLoss(nn.Module):
 
     def forward(
         self,
-        image_features: torch.Tensor,
+        image_features_deception: torch.Tensor,
+        image_features_suppression: torch.Tensor,
         text_features_deception: torch.Tensor,
         text_features_suppression: torch.Tensor,
         labels_deception: torch.Tensor,
@@ -665,7 +666,8 @@ class DualBranchContrastiveLoss(nn.Module):
         计算双分支对比损失
 
         Args:
-            image_features: 图像特征 [batch_size, embed_dim]
+            image_features_deception: 欺骗分支图像特征 [batch_size, embed_dim]
+            image_features_suppression: 压制分支图像特征 [batch_size, embed_dim]
             text_features_deception: 欺骗分支文本特征 [batch_size, embed_dim]
             text_features_suppression: 压制分支文本特征 [batch_size, embed_dim]
             labels_deception: 欺骗分支标签 [batch_size, num_deception_classes]
@@ -677,12 +679,12 @@ class DualBranchContrastiveLoss(nn.Module):
         """
         # 欺骗分支损失
         loss_deception, logits_deception, info_deception = self.deception_loss(
-            image_features, text_features_deception, labels_deception
+            image_features_deception, text_features_deception, labels_deception
         )
 
         # 压制分支损失
         loss_suppression, logits_suppression, info_suppression = self.suppression_loss(
-            image_features, text_features_suppression, labels_suppression
+            image_features_suppression, text_features_suppression, labels_suppression
         )
 
         # 加权求和

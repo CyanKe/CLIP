@@ -774,6 +774,8 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
     parser.add_argument("--output_dir", type=str, default="results/dual_branch_few/")
+    parser.add_argument("--visualize", action="store_true",
+                        help="Generate visualizations (confusion matrices, F1, metrics)")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--save_stft", action="store_true", help="Save STFT images with predictions")
     parser.add_argument("--max_stft_samples", type=int, default=100, help="Maximum number of STFT images to save")
@@ -864,41 +866,42 @@ def main():
     print(f"\nResults saved to {results_path}")
 
     # 可视化
-    print("\nGenerating visualizations...")
+    if args.visualize:
+        print("\nGenerating visualizations...")
 
-    # 混淆矩阵
-    evaluator.plot_confusion_matrices(
-        metrics,
-        save_path=str(output_dir / f"confusion_matrices_{args.split}.png")
-    )
+        # 混淆矩阵
+        evaluator.plot_confusion_matrices(
+            metrics,
+            save_path=str(output_dir / f"confusion_matrices_{args.split}.png")
+        )
 
-    # 每个类别的 F1 分数
-    evaluator.plot_per_class_f1(
-        metrics,
-        save_path=str(output_dir / f"per_class_f1_{args.split}.png")
-    )
+        # 每个类别的 F1 分数
+        evaluator.plot_per_class_f1(
+            metrics,
+            save_path=str(output_dir / f"per_class_f1_{args.split}.png")
+        )
 
-    # 指标汇总
-    evaluator.plot_metrics_summary(
-        metrics,
-        save_path=str(output_dir / f"metrics_summary_{args.split}.png")
-    )
+        # 指标汇总
+        evaluator.plot_metrics_summary(
+            metrics,
+            save_path=str(output_dir / f"metrics_summary_{args.split}.png")
+        )
 
-    # 组合混淆矩阵
-    evaluator.plot_combination_confusion_matrix(
-        metrics,
-        save_path=str(output_dir / f"combination_confusion_{args.split}.png"),
-        seen_combinations=seen_combinations,
-        unseen_combinations=unseen_combinations,
-        all_class_names=all_class_names
-    )
+        # 组合混淆矩阵
+        evaluator.plot_combination_confusion_matrix(
+            metrics,
+            save_path=str(output_dir / f"combination_confusion_{args.split}.png"),
+            seen_combinations=seen_combinations,
+            unseen_combinations=unseen_combinations,
+            all_class_names=all_class_names
+        )
 
-    # 打印组合级别指标
-    evaluator.print_combination_metrics(
-        metrics,
-        seen_combinations=seen_combinations,
-        unseen_combinations=unseen_combinations
-    )
+        # 打印组合级别指标
+        evaluator.print_combination_metrics(
+            metrics,
+            seen_combinations=seen_combinations,
+            unseen_combinations=unseen_combinations
+        )
 
     # 保存 STFT 图像
     if args.save_stft:

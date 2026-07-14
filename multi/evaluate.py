@@ -59,13 +59,16 @@ class Evaluator:
         self.threshold = threshold
 
     @torch.no_grad()
-    def evaluate(self, data_loader: DataLoader, mode: str = "zero_shot") -> dict:
+    def evaluate(self, data_loader: DataLoader, mode: str = "zero_shot",
+                 seen_combinations: list = None, unseen_combinations: list = None) -> dict:
         """
         评估模型
 
         Args:
             data_loader: 数据加载器
             mode: 评估模式 "supervised" 或 "zero_shot"
+            seen_combinations: 已见组合索引列表，如 [[0], [1], [0, 2]]
+            unseen_combinations: 未见组合索引列表
 
         Returns:
             评估指标字典
@@ -75,6 +78,15 @@ class Evaluator:
         all_labels = []
         all_probs = []
         all_features = []
+
+        # 构建 seen/unseen 集合（用于按组合类型统计准确率）
+        seen_set = set(tuple(sorted(c)) for c in (seen_combinations or []))
+        unseen_set = set(tuple(sorted(c)) for c in (unseen_combinations or []))
+        has_combination_info = bool(seen_set or unseen_set)
+
+        seen_results = {"correct": 0, "total": 0}
+        unseen_results = {"correct": 0, "total": 0}
+        other_results = {"correct": 0, "total": 0}
 
         eval_bar = tqdm(data_loader, desc="Evaluating")
 
@@ -99,6 +111,26 @@ class Evaluator:
             all_probs.append(probs.cpu())
             all_features.append(image_features.cpu())
 
+            # 按 seen/unseen 分类统计
+            if has_combination_info:
+                for i in range(labels.shape[0]):
+                    true_comb = tuple(sorted(torch.where(labels[i] == 1)[0].tolist()))
+                    pred_comb = tuple(sorted(torch.where(preds[i] == 1)[0].tolist()))
+                    is_correct = (true_comb == pred_comb)
+
+                    if true_comb in seen_set:
+                        seen_results["total"] += 1
+                        if is_correct:
+                            seen_results["correct"] += 1
+                    elif true_comb in unseen_set:
+                        unseen_results["total"] += 1
+                        if is_correct:
+                            unseen_results["correct"] += 1
+                    else:
+                        other_results["total"] += 1
+                        if is_correct:
+                            other_results["correct"] += 1
+
         # 合并结果
         all_preds = torch.cat(all_preds).numpy()
         all_labels = torch.cat(all_labels).numpy()
@@ -107,6 +139,15 @@ class Evaluator:
 
         # 计算指标
         metrics = self._compute_metrics(all_labels, all_preds, all_probs)
+
+        # 添加 seen/unseen 准确率
+        if has_combination_info:
+            metrics["seen_accuracy"] = seen_results["correct"] / seen_results["total"] if seen_results["total"] > 0 else 0.0
+            metrics["seen_samples"] = seen_results["total"]
+            metrics["unseen_accuracy"] = unseen_results["correct"] / unseen_results["total"] if unseen_results["total"] > 0 else 0.0
+            metrics["unseen_samples"] = unseen_results["total"]
+            metrics["other_accuracy"] = other_results["correct"] / other_results["total"] if other_results["total"] > 0 else 0.0
+            metrics["other_samples"] = other_results["total"]
 
         return {
             "metrics": metrics,
@@ -260,6 +301,14 @@ class Evaluator:
         print("=" * 60)
         print(f"Overall Accuracy:       {metrics['accuracy']:.4f}")
         print(f"Subset Accuracy:        {metrics['subset_accuracy']:.4f}")
+
+        # 如果存在 seen/unseen 准确率则打印
+        if 'seen_accuracy' in metrics:
+            print(f"Seen Accuracy:          {metrics['seen_accuracy']:.4f} ({metrics['seen_samples']} samples)")
+            print(f"Unseen Accuracy:        {metrics['unseen_accuracy']:.4f} ({metrics['unseen_samples']} samples)")
+            if metrics.get('other_samples', 0) > 0:
+                print(f"Other Accuracy:         {metrics['other_accuracy']:.4f} ({metrics['other_samples']} samples)")
+
         print(f"Macro F1 Score:         {metrics['f1_macro']:.4f}")
         print(f"Micro F1 Score:         {metrics['f1_micro']:.4f}")
         print(f"Macro Precision:        {metrics['precision_macro']:.4f}")
@@ -463,7 +512,8 @@ def load_datasets_by_jnr(base_path, jnr_start, jnr_end, jnr_step, split="val", s
     return datasets
 
 
-def evaluate_single_jnr(model, dataset, device, class_names, threshold=0.5, mode="supervised"):
+def evaluate_single_jnr(model, dataset, device, class_names, threshold=0.5, mode="supervised",
+                         seen_combinations=None, unseen_combinations=None):
     """
     评估单个JNR级别的数据集
 
@@ -484,7 +534,41 @@ def evaluate_single_jnr(model, dataset, device, class_names, threshold=0.5, mode
         num_workers=0  # Windows兼容性
     )
 
-    return evaluator.evaluate(data_loader, mode=mode)
+    return evaluator.evaluate(
+        data_loader, mode=mode,
+        seen_combinations=seen_combinations,
+        unseen_combinations=unseen_combinations
+    )
+
+
+def _convert_combination_names_to_indices(combinations: list, class_names: list) -> list:
+    """
+    将组合中的类别名称转换为索引
+
+    Args:
+        combinations: 组合列表，如 [["DFTJ"], ["DFTJ", "ISRJ"]]
+        class_names: 类别名称列表
+
+    Returns:
+        索引组合列表，如 [[0], [0, 1]]
+    """
+    if not combinations:
+        return []
+
+    name_to_idx = {name: i for i, name in enumerate(class_names)}
+    result = []
+
+    for comb in combinations:
+        indices = []
+        for name in comb:
+            if name in name_to_idx:
+                indices.append(name_to_idx[name])
+            else:
+                print(f"Warning: Unknown class name '{name}' in combination {comb}")
+        if indices:
+            result.append(sorted(indices))
+
+    return result
 
 
 def main():
@@ -523,6 +607,15 @@ def main():
     class_names = [cls["name"] for cls in config.get("jamming_classes", [])]
     data_config = config.get("data", {})
 
+    # 加载 CZSL seen/unseen 组合（用于按组合类型统计准确率）
+    czsl_config = config.get("czsl", {})
+    seen_comb_names = czsl_config.get("seen_combinations", [])
+    unseen_comb_names = czsl_config.get("unseen_combinations", [])
+    seen_combinations = _convert_combination_names_to_indices(seen_comb_names, class_names)
+    unseen_combinations = _convert_combination_names_to_indices(unseen_comb_names, class_names)
+    if seen_combinations or unseen_combinations:
+        print(f"Loaded {len(seen_combinations)} seen, {len(unseen_combinations)} unseen combinations for accuracy breakdown")
+
     # 创建模型
     model = create_clip_model(config, device=str(device))
 
@@ -560,7 +653,9 @@ def main():
                 device=device,
                 class_names=class_names,
                 threshold=config.get("evaluation", {}).get("threshold", 0.5),
-                mode=args.mode
+                mode=args.mode,
+                seen_combinations=seen_combinations,
+                unseen_combinations=unseen_combinations
             )
             all_results[jnr] = results
 
@@ -665,34 +760,61 @@ def main():
                 print(f"  Saved results to {jnr_dir}")
 
         # 汇总表格
-        print(f"\n{'='*80}")
+        has_seen_unseen = any('seen_accuracy' in r['metrics'] for r in all_results.values())
+        print(f"\n{'='*100}")
         print("Summary by JNR Level")
-        print(f"{'='*80}")
-        print(f"{'JNR':<8} {'Samples':<8} {'Accuracy':<10} {'SubsetAcc':<10} {'F1_sub':<10} {'mAP':<10}")
-        print("-" * 80)
+        print(f"{'='*100}")
+        if has_seen_unseen:
+            print(f"{'JNR':<8} {'Samples':<8} {'Accuracy':<10} {'SubsetAcc':<10} {'SeenAcc':<10} {'UnseenAcc':<10} {'F1_sub':<10} {'mAP':<10}")
+        else:
+            print(f"{'JNR':<8} {'Samples':<8} {'Accuracy':<10} {'SubsetAcc':<10} {'F1_sub':<10} {'mAP':<10}")
+        print("-" * 100)
         for jnr in sorted(all_results.keys(), key=lambda x: int(x.replace('+', ''))):
             r = all_results[jnr]
-            print(f"{jnr:<8} {r['labels'].shape[0]:<8} "
-                  f"{r['metrics']['accuracy']:<10.4f} "
-                  f"{r['metrics']['subset_accuracy']:<10.4f} "
-                  f"{r['metrics']['f1_sub']:<10.4f} "
-                  f"{r['metrics']['map']:<10.4f}")
+            m = r['metrics']
+            if has_seen_unseen:
+                print(f"{jnr:<8} {r['labels'].shape[0]:<8} "
+                      f"{m['accuracy']:<10.4f} "
+                      f"{m['subset_accuracy']:<10.4f} "
+                      f"{m.get('seen_accuracy', 0):<10.4f} "
+                      f"{m.get('unseen_accuracy', 0):<10.4f} "
+                      f"{m['f1_sub']:<10.4f} "
+                      f"{m['map']:<10.4f}")
+            else:
+                print(f"{jnr:<8} {r['labels'].shape[0]:<8} "
+                      f"{m['accuracy']:<10.4f} "
+                      f"{m['subset_accuracy']:<10.4f} "
+                      f"{m['f1_sub']:<10.4f} "
+                      f"{m['map']:<10.4f}")
 
         # 保存汇总结果
         summary_path = output_dir / "summary_by_jnr.txt"
         with open(summary_path, 'w') as f:
             f.write(f"Evaluation Results by JNR Level\n")
             f.write(f"Mode: {args.mode}, Split: {args.split}\n")
-            f.write(f"{'='*80}\n")
-            f.write(f"{'JNR':<8} {'Samples':<8} {'Accuracy':<10} {'SubsetAcc':<10} {'F1_sub':<10} {'mAP':<10}\n")
-            f.write("-" * 80 + "\n")
+            f.write(f"{'='*100}\n")
+            if has_seen_unseen:
+                f.write(f"{'JNR':<8} {'Samples':<8} {'Accuracy':<10} {'SubsetAcc':<10} {'SeenAcc':<10} {'UnseenAcc':<10} {'F1_sub':<10} {'mAP':<10}\n")
+            else:
+                f.write(f"{'JNR':<8} {'Samples':<8} {'Accuracy':<10} {'SubsetAcc':<10} {'F1_sub':<10} {'mAP':<10}\n")
+            f.write("-" * 100 + "\n")
             for jnr in sorted(all_results.keys(), key=lambda x: int(x.replace('+', ''))):
                 r = all_results[jnr]
-                f.write(f"{jnr:<8} {r['labels'].shape[0]:<8} "
-                       f"{r['metrics']['accuracy']:<10.4f} "
-                       f"{r['metrics']['subset_accuracy']:<10.4f} "
-                       f"{r['metrics']['f1_sub']:<10.4f} "
-                       f"{r['metrics']['map']:<10.4f}\n")
+                m = r['metrics']
+                if has_seen_unseen:
+                    f.write(f"{jnr:<8} {r['labels'].shape[0]:<8} "
+                           f"{m['accuracy']:<10.4f} "
+                           f"{m['subset_accuracy']:<10.4f} "
+                           f"{m.get('seen_accuracy', 0):<10.4f} "
+                           f"{m.get('unseen_accuracy', 0):<10.4f} "
+                           f"{m['f1_sub']:<10.4f} "
+                           f"{m['map']:<10.4f}\n")
+                else:
+                    f.write(f"{jnr:<8} {r['labels'].shape[0]:<8} "
+                           f"{m['accuracy']:<10.4f} "
+                           f"{m['subset_accuracy']:<10.4f} "
+                           f"{m['f1_sub']:<10.4f} "
+                           f"{m['map']:<10.4f}\n")
         print(f"\nSummary saved to {summary_path}")
 
     else:
@@ -730,7 +852,11 @@ def main():
 
         # 评估
         print(f"\nEvaluating on {args.split} set with mode={args.mode}...")
-        results = evaluator.evaluate(data_loader, mode=args.mode)
+        results = evaluator.evaluate(
+            data_loader, mode=args.mode,
+            seen_combinations=seen_combinations,
+            unseen_combinations=unseen_combinations
+        )
 
         # 打印指标
         evaluator.print_metrics(results["metrics"])

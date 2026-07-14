@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from multi.model import create_czsl_model, CLIPForCZSL
 from multi.data import create_czsl_dataloaders, create_preprocessed_dataloaders
-from multi.loss import create_loss_function, LabelAwareInfoNCELoss, MultiLabelSigmoidLoss, MultiLabelInfoNCELoss
+from multi.loss import create_loss_function, LabelAwareInfoNCELoss, MultiLabelSigmoidLoss
 
 
 class CZSLTrainer:
@@ -61,6 +61,7 @@ class CZSLTrainer:
         self.checkpoint_config = config.get("checkpoint", {})
         self.save_dir = Path(self.checkpoint_config.get("save_dir", "checkpoints"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.model_name = self.checkpoint_config.get("model_name", "czsl")
 
         # 检测模型类型
         self.model_type = config.get("model", {}).get("clip_model", "ViT-B/32")
@@ -68,7 +69,6 @@ class CZSLTrainer:
         # 初始化损失函数（根据模型类型选择）
         self.loss_fn = create_loss_function(config, model_type=self.model_type)
         self.use_label_aware_loss = isinstance(self.loss_fn, LabelAwareInfoNCELoss)
-        self.use_multilabel_infonce = isinstance(self.loss_fn, MultiLabelInfoNCELoss)
         self.use_sigmoid_loss = isinstance(self.loss_fn, MultiLabelSigmoidLoss)
 
         print(f"Loss function: {type(self.loss_fn).__name__}")
@@ -136,16 +136,19 @@ class CZSLTrainer:
 
             # 计算损失（根据模型类型选择不同的损失计算方式）
             if self.use_sigmoid_loss:
+                # SigLIP Sigmoid Loss
                 loss, logits_per_image, loss_info = self.loss_fn(
                     image_features, text_features, labels
                 )
                 logits_per_text = logits_per_image.T
-            elif self.use_label_aware_loss or self.use_multilabel_infonce:
+            elif self.use_label_aware_loss:
+                # CLIP Label-Aware InfoNCE Loss
                 loss, logits_per_image, loss_info = self.loss_fn(
                     image_features, text_features, labels
                 )
                 logits_per_text = logits_per_image.T
             else:
+                # 标准 CLIP InfoNCE 损失：对角线为正样本对
                 logit_scale = self.model.model.logit_scale.exp()
                 logits_per_image = logit_scale * (image_features @ text_features.t())
                 logits_per_text = logits_per_image.t()
@@ -157,6 +160,7 @@ class CZSLTrainer:
 
             loss.backward()
 
+            # 梯度裁剪
             if self.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
@@ -164,17 +168,15 @@ class CZSLTrainer:
 
             total_loss += loss.item() * batch_size
 
-            # 计算标签感知准确率（基于 logits 的 argmax 是否命中正样本）
+            # 计算对比学习准确率（对角线准确率作为参考指标）
             with torch.no_grad():
-                # 构建正样本 mask: [B, B], mask[i,j]=1 表示样本 i 和 j 共享标签
-                labels_f = labels.float()
-                pos_mask = (labels_f @ labels_f.T) > 0
-                # i2t: 对每行，argmax 命中的样本是否与 i 有共享标签
+                # 对于 label-aware 模式，对角线准确率仅供参考
+                # 实际评估应使用 zero-shot 或 KNN
+                targets = torch.arange(batch_size, device=self.device)
                 pred_i2t = logits_per_image.argmax(dim=1)
-                total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
-                # t2i: 同理
                 pred_t2i = logits_per_text.argmax(dim=1)
-                total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
+                total_correct += (pred_i2t == targets).sum().item()
+                total_correct += (pred_t2i == targets).sum().item()
                 total_samples += batch_size * 2
 
             train_bar.set_postfix(loss=loss.item())
@@ -242,18 +244,21 @@ class CZSLTrainer:
 
             image_features, text_features = self.model(stft_images, text_tokens, time_signals)
 
-            # 计算损失
+            # 计算损失（根据模型类型选择不同的损失计算方式）
             if self.use_sigmoid_loss:
+                # SigLIP Sigmoid Loss
                 loss, logits_per_image, loss_info = self.loss_fn(
                     image_features, text_features, labels
                 )
                 logits_per_text = logits_per_image.T
-            elif self.use_label_aware_loss or self.use_multilabel_infonce:
+            elif self.use_label_aware_loss:
+                # CLIP Label-Aware InfoNCE Loss
                 loss, logits_per_image, loss_info = self.loss_fn(
                     image_features, text_features, labels
                 )
                 logits_per_text = logits_per_image.T
             else:
+                # 标准 CLIP InfoNCE 损失
                 logit_scale = self.model.model.logit_scale.exp()
                 logits_per_image = logit_scale * (image_features @ text_features.t())
                 logits_per_text = logits_per_image.t()
@@ -265,13 +270,12 @@ class CZSLTrainer:
 
             total_loss += loss.item() * batch_size
 
-            # 标签感知准确率
-            labels_f = labels.float()
-            pos_mask = (labels_f @ labels_f.T) > 0
+            # 计算对角线准确率（仅供参考）
+            targets = torch.arange(batch_size, device=self.device)
             pred_i2t = logits_per_image.argmax(dim=1)
-            total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
             pred_t2i = logits_per_text.argmax(dim=1)
-            total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
+            total_correct += (pred_i2t == targets).sum().item()
+            total_correct += (pred_t2i == targets).sum().item()
             total_samples += batch_size * 2
 
             val_bar.set_postfix(loss=loss.item())
@@ -291,11 +295,11 @@ class CZSLTrainer:
             "config": self.config
         }
 
-        latest_path = self.save_dir / "czsl_latest_checkpoint.pt"
+        latest_path = self.save_dir / f"{self.model_name}_latest.pt"
         torch.save(checkpoint, latest_path)
 
         if is_best:
-            best_path = self.save_dir / "czsl_best_model.pt"
+            best_path = self.save_dir / f"{self.model_name}_best.pt"
             torch.save(checkpoint, best_path)
             print(f"  ★ Saved best model with loss: {metrics['loss']:.4f}")
 
@@ -409,8 +413,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 获取模型类型
+    # 获取模型类型和文本风格
     model_type = config.get("model", {}).get("clip_model", "ViT-B/32")
+    text_style = config.get("czsl", {}).get("text_style", "class_only")
 
     # 创建模型（需要先创建模型以获取 processor）
     print("\nCreating CZSL model...")
@@ -430,6 +435,7 @@ def main():
             load_test=False,
             model_type=model_type,
             processor=processor,
+            text_style=text_style,
         )
     else:
         train_loader, val_loader, test_loader, num_classes = create_czsl_dataloaders(
@@ -440,12 +446,14 @@ def main():
             load_test=False,
             model_type=model_type,
             processor=processor,
+            text_style=text_style,
         )
 
-    # 缓存文本特征（使用配置文件中的 seen_combinations）
+    # 缓存文本特征（使用配置文件中的 seen_combinations 和 text_style）
     czsl_config = config.get("czsl", {})
     seen_combos = czsl_config.get("seen_combinations", None)
-    model.cache_text_features(max_combination_size=2, include_single=True, seen_combinations=seen_combos)
+    model.cache_text_features(max_combination_size=2, include_single=True,
+                              seen_combinations=seen_combos, text_style=text_style)
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)

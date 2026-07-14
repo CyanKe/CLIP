@@ -159,17 +159,13 @@ class PersistenceTrainer:
             batch_size = images.size(0)
             total_loss += loss.item() * batch_size
 
+            # 对角线准确率（与 multi/train_czsl.py 对齐，仅供参考）
             with torch.no_grad():
-                # Label-aware accuracy: matching any sample with identical labels counts as correct
-                # This avoids penalizing the model when batch contains multiple samples of the same class
-                pred_i2t = logits_per_image.argmax(dim=1)  # [B]
-                pred_t2i = logits_per_text.argmax(dim=1)   # [B]
-                # Build [B, B] boolean matrix: label_eq[i,j]==True if labels[i]==labels[j]
-                label_eq = (labels.unsqueeze(1) == labels.unsqueeze(0)).all(dim=2)  # [B, B]
-                # Count correct: predicted index falls in any position with identical labels
-                correct_i2t = label_eq[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
-                correct_t2i = label_eq[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
-                total_correct += correct_i2t + correct_t2i
+                targets = torch.arange(batch_size, device=self.device)
+                pred_i2t = logits_per_image.argmax(dim=1)
+                pred_t2i = logits_per_text.argmax(dim=1)
+                total_correct += (pred_i2t == targets).sum().item()
+                total_correct += (pred_t2i == targets).sum().item()
                 total_samples += batch_size * 2
 
             train_bar.set_postfix(loss=f"{loss.item():.4f}")
@@ -242,13 +238,12 @@ class PersistenceTrainer:
             batch_size = images.size(0)
             total_loss += loss.item() * batch_size
 
-            # Label-aware accuracy: matching any sample with identical labels counts as correct
+            # 对角线准确率（与 multi/train_czsl.py 对齐，仅供参考）
+            targets = torch.arange(batch_size, device=self.device)
             pred_i2t = logits_per_image.argmax(dim=1)
             pred_t2i = logits_per_text.argmax(dim=1)
-            label_eq = (labels.unsqueeze(1) == labels.unsqueeze(0)).all(dim=2)
-            correct_i2t = label_eq[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
-            correct_t2i = label_eq[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
-            total_correct += correct_i2t + correct_t2i
+            total_correct += (pred_i2t == targets).sum().item()
+            total_correct += (pred_t2i == targets).sum().item()
             total_samples += batch_size * 2
 
             val_bar.set_postfix(loss=f"{loss.item():.4f}")
@@ -275,11 +270,11 @@ class PersistenceTrainer:
             "config": self.config,
         }
 
-        latest_path = self.save_dir / f"{prefix}_latest_checkpoint.pt"
+        latest_path = self.save_dir / f"{prefix}_latest.pt"
         torch.save(checkpoint, latest_path)
 
         if is_best:
-            best_path = self.save_dir / f"{prefix}_best_model.pt"
+            best_path = self.save_dir / f"{prefix}_best.pt"
             torch.save(checkpoint, best_path)
             print(f"  ★ Saved best model with loss: {metrics['loss']:.4f}")
 

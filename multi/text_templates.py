@@ -314,6 +314,28 @@ def get_inference_description(jam_types: list, use_translation: bool = False) ->
         return f"a radar signal with combined jamming: {', '.join(names)}"
 
 
+def get_simple_clip_description(jam_types: list, use_translation: bool = False) -> str:
+    """
+    生成简单 CLIP 风格描述（论文风格）
+
+    Args:
+        jam_types: 干扰类型列表，如 ["DFTJ"] 或 ["DFTJ", "ISRJ"]
+        use_translation: 是否使用翻译后的名称（如 "Dense False Target Jamming"）
+
+    Returns:
+        描述字符串，如 "a photo of DFTJ" 或 "a photo of DFTJ and ISRJ"
+    """
+    if not jam_types:
+        return "a photo of a radar signal"
+
+    names = [get_translated_name(jt, use_translation) for jt in jam_types]
+
+    if len(names) == 1:
+        return f"a photo of {names[0]}"
+    else:
+        return f"a photo of {' and '.join(names)}"
+
+
 def get_class_only_description(metadata: dict, use_translation: bool = False) -> str:
     """
     生成只包含干扰类型的描述（不包含 JNR 等参数）
@@ -455,6 +477,7 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_tr
             - 'simple': 简单类别名
             - 'template': 模板描述
             - 'meta': 结合 metadata 的动态描述（包含 JNR 等参数）
+            - 'simple_clip': 简单 CLIP 风格 "a photo of DFTJ"（论文风格）
             - 'class_only': 只包含干扰类型的描述（推荐用于训练，不含 JNR）
             - 'imagenet': ImageNet 风格多样化描述
             - 'all': 返回所有风格
@@ -482,6 +505,14 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_tr
             return get_meta_description(metadata, use_translation=use_translation)
         return "a radar signal with jamming"
 
+    elif style == 'simple_clip':
+        # 简单 CLIP 风格（论文风格）: "a photo of DFTJ"
+        if metadata and 'jam_types' in metadata:
+            jam_types = _normalize_jam_types(metadata.get('jam_types'))
+            if jam_types:
+                return get_simple_clip_description(jam_types, use_translation=use_translation)
+        return "a photo of a radar signal"
+
     elif style == 'class_only':
         # 推荐用于训练：只包含干扰类型，不包含 JNR
         if metadata:
@@ -500,6 +531,7 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_tr
             'simple': 'a radar signal',
             'template': 'a radar signal with jamming',
             'meta': 'a radar signal with jamming',
+            'simple_clip': 'a photo of a radar signal',
             'class_only': 'a radar signal with unknown jamming',
         }
         if metadata and 'jam_types' in metadata:
@@ -510,6 +542,7 @@ def generate_text_descriptions(metadata: dict = None, style: str = 'all', use_tr
         if metadata:
             result['meta'] = get_meta_description(metadata, use_translation=use_translation)
             result['class_only'] = get_class_only_description(metadata, use_translation=use_translation)
+            result['simple_clip'] = get_simple_clip_description(jam_types if 'jam_types' in metadata else [], use_translation=use_translation)
         return result
 
     return "a radar signal"

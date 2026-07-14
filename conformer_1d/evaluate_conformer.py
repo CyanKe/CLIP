@@ -35,6 +35,13 @@ sys.path.insert(0, _parent)
 
 from conformer_1d.model_1d import Base1DCZSLModel, create_1d_model
 from conformer_1d.data_1d import TimeSignalDataset, create_1d_dataloaders, collate_fn_conformer, TokenizerWrapper, set_collate_use_translation
+from multi.metrics_czsl import (
+    compute_metrics_bundle,
+    compute_subset_bundles,
+    print_metrics_report,
+    print_jnr_metrics_table,
+    save_metrics_json,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -183,29 +190,49 @@ class ConformerEvaluator:
     # Zero-shot evaluation
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
-    def evaluate_zero_shot(self, data_loader, debug: bool = False, output_dir: str = None):
-        """Global zero-shot evaluation using combo-space text features.
+    def _build_single_jnr_loader(self, config: dict, split: str, jnr: int):
+        """Build one JNR DataLoader on demand (lazy; freed by caller after use)."""
+        data_config = config.get('data', {})
+        base_path = data_config.get('base_path')
+        time_var_name = data_config.get('time_var_name', 'all_times')
+        time_seq_len = data_config.get('time_seq_len', 8000)
+        batch_size = config.get('train', {}).get('batch_size', 16)
+        pin_memory = data_config.get('pin_memory', True)
 
-        Uses combo-space prediction (topk=1) matching multi/evaluate_czsl.py zero_shot.
-        Single-class probs are computed separately for ROC/PR curves.
-        """
-        self.model.eval()
+        data_folder = os.path.join(base_path, f'JNR_+{jnr}')
+        time_file = os.path.join(data_folder, f'{split}_echo_times.mat')
+        metadata_file = os.path.join(data_folder, f'{split}_echo_metadata.json')
+        if not os.path.exists(time_file) or not os.path.exists(metadata_file):
+            return None
+
+        ds = TimeSignalDataset(
+            time_file=time_file,
+            metadata_file=metadata_file,
+            time_var_name=time_var_name,
+            class_names=self.class_names,
+            time_seq_len=time_seq_len,
+        )
+        from functools import partial
+        tokenizer = TokenizerWrapper(model_type="clip")
+        collate = partial(collate_fn_conformer, tokenizer_fn=tokenizer, model_type="clip")
+        return DataLoader(
+            ds, batch_size=batch_size, shuffle=False,
+            num_workers=0, pin_memory=pin_memory, collate_fn=collate,
+        )
+
+    def _run_zero_shot_on_loader(self, data_loader, debug: bool = False, debug_done: bool = False):
+        """Process one loader; returns batch accumulators + debug_done flag."""
         all_labels, all_preds, all_probs = [], [], []
-
-        # Seen / Unseen 统计
-        seen_correct, seen_total = 0, 0
-        unseen_correct, unseen_total = 0, 0
-        other_correct, other_total = 0, 0
+        seen_correct = unseen_correct = other_correct = 0
+        seen_total = unseen_total = other_total = 0
         has_seen_unseen = bool(self.seen_set or self.unseen_set)
 
-        debug_done = False
-        for batch in tqdm(data_loader, desc="Zero-shot eval"):
+        for batch in tqdm(data_loader, desc="Zero-shot eval", leave=False):
             time_signals, _, _, labels, texts, metas = batch[:6]
             labels = labels.to(self.device)
             batch_size = time_signals.shape[0]
 
-            # ── Single-class probs for ROC/PR curves ──
+            # Single-class probs for ROC/PR (match multi)
             single_text_features = self.model.get_cached_text_features()
             single_text_features = F.normalize(single_text_features, dim=-1)
             signal_features = self.model.encode_image(time_signals)
@@ -215,10 +242,10 @@ class ConformerEvaluator:
             single_probs = torch.softmax(single_logits, dim=-1)
             all_probs.append(single_probs.cpu())
 
-            # ── Combo-space prediction (matching multi's zero_shot) ──
+            # Combo-space top-1 (match multi)
             _, top_indices, all_names = self.model.zero_shot_predict(
                 time_signals, use_combinations=True, top_k=1,
-                use_translation=self.config.get('use_translation', False)
+                use_translation=self.config.get('use_translation', False),
             )
             preds = torch.zeros(batch_size, self.num_classes, device=self.device)
             pred_names_list = []
@@ -233,7 +260,6 @@ class ConformerEvaluator:
             all_labels.append(labels.cpu())
             all_preds.append(preds.cpu())
 
-            # 按 seen/unseen/other 分类统计
             if has_seen_unseen:
                 for i in range(batch_size):
                     true_comb = tuple(sorted(torch.where(labels[i] == 1)[0].tolist()))
@@ -265,29 +291,95 @@ class ConformerEvaluator:
                     print(f"       Top-3 single: {[(self.class_names[j.item()], f'{v:.3f}') for v, j in zip(top3_vals, top3_idx)]}")
                 debug_done = True
 
+        stats = {
+            'seen_correct': seen_correct, 'seen_total': seen_total,
+            'unseen_correct': unseen_correct, 'unseen_total': unseen_total,
+            'other_correct': other_correct, 'other_total': other_total,
+        }
+        return all_labels, all_preds, all_probs, stats, debug_done
+
+    @torch.no_grad()
+    def evaluate_zero_shot(
+        self,
+        data_loader=None,
+        config: dict = None,
+        split: str = 'test',
+        debug: bool = False,
+        output_dir: str = None,
+    ):
+        """Global zero-shot: combo-space top-1 (multi-style).
+
+        Prefer JNR lazy-load (config+split): load one JNR at a time, then concat.
+        Falls back to a pre-built data_loader if provided.
+        """
+        self.model.eval()
+        all_labels, all_preds, all_probs = [], [], []
+        seen_correct = unseen_correct = other_correct = 0
+        seen_total = unseen_total = other_total = 0
+        has_seen_unseen = bool(self.seen_set or self.unseen_set)
+        debug_done = False
+
+        if config is not None:
+            # JNR lazy-load → global concat
+            set_collate_use_translation(config.get('use_translation', False))
+            data_config = config.get('data', {})
+            jnr_start = data_config.get('jnr_start', 0)
+            jnr_end = data_config.get('jnr_end', 20)
+            jnr_step = data_config.get('jnr_step', 1)
+            jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
+            print(f"Zero-shot: JNR lazy-load on {split} "
+                  f"(JNR {jnr_start}..{jnr_end} step {jnr_step})")
+
+            for jnr in jnr_levels:
+                loader = self._build_single_jnr_loader(config, split, jnr)
+                if loader is None:
+                    print(f"  Skipping JNR=+{jnr}: data not found")
+                    continue
+                print(f"  Evaluating JNR=+{jnr}...")
+                labs, preds, probs, stats, debug_done = self._run_zero_shot_on_loader(
+                    loader, debug=debug, debug_done=debug_done,
+                )
+                all_labels.extend(labs)
+                all_preds.extend(preds)
+                all_probs.extend(probs)
+                seen_correct += stats['seen_correct']
+                seen_total += stats['seen_total']
+                unseen_correct += stats['unseen_correct']
+                unseen_total += stats['unseen_total']
+                other_correct += stats['other_correct']
+                other_total += stats['other_total']
+                del loader
+        elif data_loader is not None:
+            labs, preds, probs, stats, debug_done = self._run_zero_shot_on_loader(
+                data_loader, debug=debug, debug_done=False,
+            )
+            all_labels, all_preds, all_probs = labs, preds, probs
+            seen_correct = stats['seen_correct']
+            seen_total = stats['seen_total']
+            unseen_correct = stats['unseen_correct']
+            unseen_total = stats['unseen_total']
+            other_correct = stats['other_correct']
+            other_total = stats['other_total']
+        else:
+            raise ValueError("evaluate_zero_shot requires config=... or data_loader=...")
+
+        if not all_labels:
+            empty = np.zeros((0, self.num_classes))
+            return {}, empty, empty, empty
+
         all_labels_np = torch.cat(all_labels).numpy()
         all_preds_np = torch.cat(all_preds).numpy()
         all_probs_np = torch.cat(all_probs).numpy()
 
-        metrics = self._compute_metrics(all_labels_np, all_preds_np, all_probs_np)
+        metrics = compute_metrics_bundle(
+            all_labels_np, all_preds_np, self.class_names,
+            y_prob=all_probs_np,
+            seen_set=self.seen_set, unseen_set=self.unseen_set,
+            dual_write=True,
+        )
+        _ = (has_seen_unseen, seen_correct, seen_total, unseen_correct, unseen_total,
+             other_correct, other_total)
 
-        # 添加 seen/unseen 准确率
-        if has_seen_unseen:
-            metrics['seen_accuracy'] = seen_correct / seen_total if seen_total > 0 else 0.0
-            metrics['seen_samples'] = seen_total
-            metrics['unseen_accuracy'] = unseen_correct / unseen_total if unseen_total > 0 else 0.0
-            metrics['unseen_samples'] = unseen_total
-            if other_total > 0:
-                metrics['other_accuracy'] = other_correct / other_total
-                metrics['other_samples'] = other_total
-            # Harmonic mean (CZSL 核心指标)
-            if metrics['seen_accuracy'] + metrics['unseen_accuracy'] > 0:
-                metrics['harmonic_mean'] = (2 * metrics['seen_accuracy'] * metrics['unseen_accuracy']
-                                            / (metrics['seen_accuracy'] + metrics['unseen_accuracy']))
-            else:
-                metrics['harmonic_mean'] = 0.0
-
-        # Save confusion matrix if output_dir specified
         if output_dir:
             self.plot_confusion_matrix(
                 all_labels_np, all_preds_np, output_dir,
@@ -352,19 +444,17 @@ class ConformerEvaluator:
         all_preds_np = torch.cat(all_preds).numpy()
         all_probs_np = torch.cat(all_probs).numpy()
 
-        metrics = self._compute_metrics(all_labels_np, all_preds_np, all_probs_np)
-        metrics['seen_accuracy'] = seen_correct / seen_total if seen_total > 0 else 0
-        metrics['seen_samples'] = seen_total
-        metrics['unseen_accuracy'] = unseen_correct / unseen_total if unseen_total > 0 else 0
-        metrics['unseen_samples'] = unseen_total
-        if other_total > 0:
-            metrics['other_accuracy'] = other_correct / other_total
-            metrics['other_samples'] = other_total
-        metrics['harmonic_mean'] = (
-            2 * metrics['seen_accuracy'] * metrics['unseen_accuracy'] /
-            (metrics['seen_accuracy'] + metrics['unseen_accuracy'])
-            if (metrics['seen_accuracy'] + metrics['unseen_accuracy']) > 0 else 0
+        # Global + seen/unseen subset bundles
+        bundles = compute_subset_bundles(
+            all_labels_np, all_preds_np, self.class_names,
+            seen_set=self.seen_set, unseen_set=self.unseen_set,
+            y_prob=all_probs_np, dual_write=True,
         )
+        metrics = dict(bundles["global"])
+        metrics["global"] = bundles["global"]
+        metrics["seen"] = bundles["seen"]
+        metrics["unseen"] = bundles["unseen"]
+        _ = (seen_correct, seen_total, unseen_correct, unseen_total, other_correct, other_total)
 
         # Save confusion matrices
         if output_dir:
@@ -462,15 +552,15 @@ class ConformerEvaluator:
                     per_class_f1[c] = (2 * per_class_precision[c] * per_class_recall[c] /
                                        (per_class_precision[c] + per_class_recall[c]))
 
+            bundle = compute_metrics_bundle(
+                all_labels_np, all_preds_np, self.class_names,
+                y_prob=all_probs_np,
+                seen_set=self.seen_set, unseen_set=self.unseen_set,
+                dual_write=True,
+            )
             results[jnr] = {
-                'combination_accuracy': (seen_correct + unseen_correct) / (seen_total + unseen_total) if (seen_total + unseen_total) > 0 else 0,
-                'total_samples': seen_total + unseen_total,
-                'seen_accuracy': seen_correct / seen_total if seen_total > 0 else 0,
-                'seen_samples': seen_total,
-                'unseen_accuracy': unseen_correct / unseen_total if unseen_total > 0 else 0,
-                'unseen_samples': unseen_total,
-                'f1_macro': f1_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
-                'f1_micro': f1_score(all_labels_np, all_preds_np, average='micro', zero_division=0),
+                **bundle,
+                'total_samples': bundle['num_samples'],
                 'per_class_recall': per_class_recall,
                 'per_class_precision': per_class_precision,
                 'per_class_f1': per_class_f1,
@@ -478,74 +568,24 @@ class ConformerEvaluator:
                 'all_preds': all_preds_np,
                 'all_probs': all_probs_np,
             }
+            _ = (seen_correct, unseen_correct, seen_total, unseen_total)
 
         return results
-
-    # ------------------------------------------------------------------
-    # Metric computation
-    # ------------------------------------------------------------------
-
-    def _compute_metrics(self, labels, preds, probs):
-        """Compute standard multi-label metrics."""
-        metrics = {
-            'exact_match': accuracy_score(labels, preds),
-            'f1_macro': f1_score(labels, preds, average='macro', zero_division=0),
-            'f1_micro': f1_score(labels, preds, average='micro', zero_division=0),
-            'f1_weighted': f1_score(labels, preds, average='weighted', zero_division=0),
-            'precision_macro': precision_score(labels, preds, average='macro', zero_division=0),
-            'recall_macro': recall_score(labels, preds, average='macro', zero_division=0),
-        }
-
-        # Per-class metrics
-        num_classes = labels.shape[1]
-        per_class = {}
-        for c in range(num_classes):
-            per_class[self.class_names[c]] = {
-                'f1': f1_score(labels[:, c], preds[:, c], zero_division=0),
-                'precision': precision_score(labels[:, c], preds[:, c], zero_division=0),
-                'recall': recall_score(labels[:, c], preds[:, c], zero_division=0),
-            }
-        metrics['per_class'] = per_class
-
-        return metrics
 
     # ------------------------------------------------------------------
     # Report & visualization
     # ------------------------------------------------------------------
 
     def print_report(self, metrics, title="Evaluation Results"):
-        """Print formatted evaluation results."""
-        print(f"\n{'='*60}")
-        print(f"  {title}")
-        print(f"{'='*60}")
-
-        # Seen / Unseen accuracy (CZSL 核心)
-        if 'seen_accuracy' in metrics:
-            print(f"  {'Seen Accuracy':25s}: {metrics['seen_accuracy']:.4f}  ({metrics.get('seen_samples', 0)} samples)")
-            print(f"  {'Unseen Accuracy':25s}: {metrics['unseen_accuracy']:.4f}  ({metrics.get('unseen_samples', 0)} samples)")
-            if 'other_accuracy' in metrics:
-                print(f"  {'Other Accuracy':25s}: {metrics['other_accuracy']:.4f}  ({metrics.get('other_samples', 0)} samples)")
-            if 'harmonic_mean' in metrics:
-                print(f"  {'Harmonic Mean':25s}: {metrics['harmonic_mean']:.4f}")
-            print(f"  {'-'*50}")
-
-        for k, v in metrics.items():
-            if k in ('per_class', 'seen_accuracy', 'unseen_accuracy', 'other_accuracy',
-                     'seen_samples', 'unseen_samples', 'other_samples', 'harmonic_mean'):
-                continue
-            if isinstance(v, float):
-                print(f"  {k:25s}: {v:.4f}")
-            elif isinstance(v, int):
-                print(f"  {k:25s}: {v}")
-
-        if 'per_class' in metrics:
-            print(f"\n  Per-class F1:")
-            pc = metrics['per_class']
-            for cls_name in self.class_names:
-                if cls_name in pc:
-                    print(f"    {cls_name:8s}: F1={pc[cls_name]['f1']:.4f}  "
-                          f"P={pc[cls_name]['precision']:.4f}  R={pc[cls_name]['recall']:.4f}")
-        print(f"{'='*60}")
+        """Print formatted evaluation results (unified MetricsBundle)."""
+        if isinstance(metrics.get("global"), dict) and "subset_accuracy" in metrics.get("global", {}):
+            print_metrics_report(metrics["global"], title=f"{title} — global")
+            if metrics.get("seen", {}).get("num_samples", 0):
+                print_metrics_report(metrics["seen"], title=f"{title} — seen subset")
+            if metrics.get("unseen", {}).get("num_samples", 0):
+                print_metrics_report(metrics["unseen"], title=f"{title} — unseen subset")
+            return
+        print_metrics_report(metrics, title=title)
 
     # ------------------------------------------------------------------
     # Confusion matrix
@@ -704,7 +744,10 @@ class ConformerEvaluator:
         jnrs = sorted(jnr_results.keys())
         seen_accs = [jnr_results[j]['seen_accuracy'] for j in jnrs]
         unseen_accs = [jnr_results[j]['unseen_accuracy'] for j in jnrs]
-        overall = [jnr_results[j]['combination_accuracy'] for j in jnrs]
+        overall = [
+            jnr_results[j].get('subset_accuracy', jnr_results[j].get('combination_accuracy', 0))
+            for j in jnrs
+        ]
 
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.plot(jnrs, seen_accs, 'o-', label='Seen', linewidth=2)
@@ -796,16 +839,32 @@ def main():
     model.eval()
     print(f"  Loaded {len(filtered)} / {len(state_dict)} keys")
 
-    # Cache text features
+    # Cache text features: singles + seen ∪ unseen combinations (align multi)
     czsl_config = config.get('czsl', {})
-    seen_combos = czsl_config.get('seen_combinations', None)
-    model.cache_text_features(max_combination_size=2, include_single=True,
-                               seen_combinations=seen_combos,
-                               use_translation=config.get('use_translation', False))
+    seen_combos = czsl_config.get('seen_combinations', []) or []
+    unseen_combos = czsl_config.get('unseen_combinations', []) or []
+    all_comb_names = []
+    _seen_keys = set()
+    for c in list(seen_combos) + list(unseen_combos):
+        key = tuple(sorted(c))
+        if key not in _seen_keys:
+            _seen_keys.add(key)
+            all_comb_names.append(c)
+    print(f"  CZSL text cache: {len(seen_combos)} seen + {len(unseen_combos)} unseen "
+          f"→ {len(all_comb_names)} unique entries (incl. singles in list)")
+    model.cache_text_features(
+        max_combination_size=2,
+        include_single=True,
+        seen_combinations=all_comb_names if all_comb_names else None,
+        use_translation=config.get('use_translation', False),
+    )
     print(f"  Cached {len(model._combination_names)} text features")
 
     # Create evaluator
     evaluator = ConformerEvaluator(model, config, device)
+
+    out_dir = args.output_dir or "results/conformer_1d"
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     # Run evaluation
     if args.mode == "by_jnr":
@@ -813,20 +872,40 @@ def main():
         jnr_loaders = create_1d_jnr_dataloaders(config, split=args.split)
         jnr_results = evaluator.evaluate_by_jnr(jnr_loaders)
 
-        # Print summary
-        print(f"\n{'='*70}")
-        print(f"  Per-JNR Results (split={args.split})")
-        print(f"{'='*70}")
-        print(f"  {'JNR':>6s}  {'Seen':>8s}  {'Unseen':>8s}  {'Overall':>8s}  {'F1 Macro':>8s}  {'Total':>6s}")
-        print(f"  {'-'*58}")
-        for jnr in sorted(jnr_results.keys()):
-            r = jnr_results[jnr]
-            print(f"  +{jnr:>3d} dB  {r['seen_accuracy']:>8.4f}  {r['unseen_accuracy']:>8.4f}  "
-                  f"{r['combination_accuracy']:>8.4f}  {r['f1_macro']:>8.4f}  {r['total_samples']:>6d}")
+        # Print summary (rates only; no global mixed with zero_shot)
+        print_jnr_metrics_table(jnr_results, title=f"Per-JNR Results (split={args.split})")
+        jnr_json = {
+            str(jnr): {
+                k: v for k, v in m.items()
+                if k not in ("all_labels", "all_preds", "all_probs",
+                             "per_class_recall", "per_class_precision", "per_class_f1")
+            }
+            for jnr, m in jnr_results.items()
+        }
+        save_metrics_json(
+            {"per_jnr": jnr_json}, out_dir,
+            filename=f"metrics_by_jnr_{args.split}.json",
+            mode="by_jnr", split=args.split,
+            extra_meta={"checkpoint": args.checkpoint},
+        )
 
         # Plot
-        evaluator.plot_jnr_curve(jnr_results, args.output_dir)
+        evaluator.plot_jnr_curve(jnr_results, out_dir)
 
+    elif args.mode == "zero_shot":
+        # JNR lazy-load → global concat (align multi / persistence)
+        print(f"\nZero-Shot Evaluation on {args.split} (JNR lazy-load)...")
+        metrics, labels, preds, probs = evaluator.evaluate_zero_shot(
+            config=config, split=args.split,
+            debug=args.debug, output_dir=out_dir,
+        )
+        evaluator.print_report(metrics, f"Zero-Shot Evaluation ({args.split})")
+        save_metrics_json(
+            metrics, out_dir,
+            filename=f"metrics_zero_shot_{args.split}.json",
+            mode="zero_shot", split=args.split,
+            extra_meta={"checkpoint": args.checkpoint},
+        )
     else:
         print(f"\nLoading {args.split} data...")
         train_loader, val_loader, test_loader = create_1d_dataloaders(config)
@@ -837,16 +916,21 @@ def main():
         else:
             loader = train_loader
 
-        if args.mode == "zero_shot":
-            metrics, labels, preds, probs = evaluator.evaluate_zero_shot(
-                loader, debug=args.debug, output_dir=args.output_dir
-            )
-            evaluator.print_report(metrics, f"Zero-Shot Evaluation ({args.split})")
-        else:
-            metrics, labels, preds, probs = evaluator.evaluate_by_combination(
-                loader, debug=args.debug, output_dir=args.output_dir
-            )
-            evaluator.print_report(metrics, f"By-Combination Evaluation ({args.split})")
+        metrics, labels, preds, probs = evaluator.evaluate_by_combination(
+            loader, debug=args.debug, output_dir=out_dir
+        )
+        evaluator.print_report(metrics, f"By-Combination Evaluation ({args.split})")
+        save_metrics_json(
+            {
+                "global": metrics.get("global", metrics),
+                "seen": metrics.get("seen", {}),
+                "unseen": metrics.get("unseen", {}),
+            },
+            out_dir,
+            filename=f"metrics_by_combination_{args.split}.json",
+            mode="by_combination", split=args.split,
+            extra_meta={"checkpoint": args.checkpoint},
+        )
 
     print(f"\nDone!")
 

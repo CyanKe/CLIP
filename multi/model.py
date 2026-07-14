@@ -183,6 +183,7 @@ class CLIPForCZSL(nn.Module):
         time_seq_len: int = 8000,
         use_feature_context: bool = False,
         n_ctx_per_domain: dict = None,
+        patch_pooling: str = "cls",
     ):
         """
         初始化 CZSL-CLIP 模型
@@ -199,6 +200,7 @@ class CLIPForCZSL(nn.Module):
             time_seq_len: 时域信号序列长度
             use_feature_context: 是否使用特征条件上下文 (CoOp-style)
             n_ctx_per_domain: 各域上下文 token 数
+            patch_pooling: 视觉特征池化方式 ("cls" | "mean")
         """
         super().__init__()
         self.device = device
@@ -217,6 +219,10 @@ class CLIPForCZSL(nn.Module):
             self.model, self.preprocess = clip.load(clip_model, device=device)
 
         self.model = self.model.float()  # 转换为 FP32
+
+        # 设置 patch pooling 方式
+        if hasattr(self.model, 'visual') and hasattr(self.model.visual, 'pooling'):
+            self.model.visual.pooling = patch_pooling
 
         # 获取特征维度
         self.embed_dim = self.model.text_projection.shape[1]
@@ -282,11 +288,24 @@ class CLIPForCZSL(nn.Module):
                 for param in self.model.visual.transformer.resblocks[i].parameters():
                     param.requires_grad = True
         elif hasattr(self.model.visual, 'layer4'):
-            for param in self.model.visual.layer4.parameters():
-                param.requires_grad = True
-            if layers_unfreeze > 1:
-                for param in self.model.visual.layer3.parameters():
-                    param.requires_grad = True
+            # ResNet: 逐步解冻 block layer4 → layer3 → layer2 → layer1
+            resnet_layers = ['layer4', 'layer3', 'layer2', 'layer1']
+            n_to_unfreeze = min(layers_unfreeze, len(resnet_layers))
+            for i in range(n_to_unfreeze):
+                layer = getattr(self.model.visual, resnet_layers[i], None)
+                if layer is not None:
+                    for param in layer.parameters():
+                        param.requires_grad = True
+            # layers_unfreeze >= 5: 再解冻 stem (conv1, bn1, attnpool)
+            if layers_unfreeze >= 5:
+                for attr in ['conv1', 'bn1', 'attnpool']:
+                    module = getattr(self.model.visual, attr, None)
+                    if module is not None:
+                        if isinstance(module, nn.Parameter):
+                            module.requires_grad = True
+                        else:
+                            for p in module.parameters():
+                                p.requires_grad = True
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         """编码图像"""
@@ -432,7 +451,8 @@ class CLIPForCZSL(nn.Module):
         max_combination_size: int = 2,
         include_single: bool = True,
         seen_combinations: list = None,
-        use_translation: bool = False
+        use_translation: bool = False,
+        text_style: str = "class_only"
     ):
         """
         缓存所有类别和组合的文本特征
@@ -443,6 +463,7 @@ class CLIPForCZSL(nn.Module):
             include_single: 是否包含单干扰
             seen_combinations: 已见组合列表（用于 CZSL）
             use_translation: 是否使用翻译后的类别名称（如 "Dense False Target Jamming"）
+            text_style: 文本描述风格 ("class_only" | "simple_clip")
         """
         self.eval()
 
@@ -453,15 +474,19 @@ class CLIPForCZSL(nn.Module):
 
         from itertools import combinations
 
+        # 选择描述生成函数
+        if text_style == "simple_clip":
+            from multi.text_templates import get_simple_clip_description as _get_desc
+        else:
+            from multi.text_templates import get_inference_description as _get_desc
+
         all_features = []
         all_names = []
 
         # 单干扰特征
         if include_single:
-            from multi.text_templates import get_inference_description
             for cls_name in self.class_names:
-                # 使用与训练一致的格式（无参数版本）
-                desc = get_inference_description([cls_name], use_translation=use_translation)
+                desc = _get_desc([cls_name], use_translation=use_translation)
 
                 tokens = clip.tokenize(desc, truncate=True).to(self.device)
                 features = self.encode_text(tokens)
@@ -471,12 +496,10 @@ class CLIPForCZSL(nn.Module):
 
         # 组合特征
         if max_combination_size >= 2:
-            from multi.text_templates import get_inference_description
             if seen_combinations:
                 combo_only = [c for c in seen_combinations if len(c) > 1]
                 for combo in combo_only:
-                    # 使用与训练一致的格式（无参数版本）
-                    combined_desc = get_inference_description(list(combo), use_translation=use_translation)
+                    combined_desc = _get_desc(list(combo), use_translation=use_translation)
                     tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
                     features = self.encode_text(tokens)
                     features = F.normalize(features, dim=-1)
@@ -486,8 +509,7 @@ class CLIPForCZSL(nn.Module):
                 for i, j in combinations(range(len(self.class_names)), 2):
                     cls1, cls2 = self.class_names[i], self.class_names[j]
 
-                    # 使用与训练一致的格式（无参数版本）
-                    combined_desc = get_inference_description([cls1, cls2], use_translation=use_translation)
+                    combined_desc = _get_desc([cls1, cls2], use_translation=use_translation)
                     tokens = clip.tokenize(combined_desc, truncate=True).to(self.device)
                     features = self.encode_text(tokens)
                     features = F.normalize(features, dim=-1)
@@ -714,6 +736,7 @@ def create_czsl_model(config: dict, device: str = "cuda"):
         time_seq_len=time_seq_len,
         use_feature_context=use_feature_context,
         n_ctx_per_domain=n_ctx_per_domain,
+        patch_pooling=model_config.get("patch_pooling", "cls"),
     )
 
     # LoRA 配置
@@ -770,6 +793,7 @@ class DualBranchCLIPForCZSL(nn.Module):
         time_seq_len: int = 8000,
         use_feature_context: bool = False,
         n_ctx_per_domain: dict = None,
+        patch_pooling: str = "cls",
     ):
         """
         初始化双分支 CZSL-CLIP 模型
@@ -786,6 +810,7 @@ class DualBranchCLIPForCZSL(nn.Module):
             time_seq_len: 时域信号序列长度
             use_feature_context: 是否使用特征条件上下文 (CoOp-style)
             n_ctx_per_domain: 各域上下文 token 数
+            patch_pooling: 视觉特征池化方式 ("cls" | "mean")
         """
         super().__init__()
         self.device = device
@@ -811,6 +836,10 @@ class DualBranchCLIPForCZSL(nn.Module):
             self.model, self.preprocess = clip.load(clip_model, device=device)
 
         self.model = self.model.float()
+
+        # 设置 patch pooling 方式
+        if hasattr(self.model, 'visual') and hasattr(self.model.visual, 'pooling'):
+            self.model.visual.pooling = patch_pooling
 
         # 获取特征维度
         self.embed_dim = self.model.text_projection.shape[1]
@@ -874,11 +903,24 @@ class DualBranchCLIPForCZSL(nn.Module):
                 for param in self.model.visual.transformer.resblocks[i].parameters():
                     param.requires_grad = True
         elif hasattr(self.model.visual, 'layer4'):
-            for param in self.model.visual.layer4.parameters():
-                param.requires_grad = True
-            if layers_unfreeze > 1:
-                for param in self.model.visual.layer3.parameters():
-                    param.requires_grad = True
+            # ResNet: 逐步解冻 block layer4 → layer3 → layer2 → layer1
+            resnet_layers = ['layer4', 'layer3', 'layer2', 'layer1']
+            n_to_unfreeze = min(layers_unfreeze, len(resnet_layers))
+            for i in range(n_to_unfreeze):
+                layer = getattr(self.model.visual, resnet_layers[i], None)
+                if layer is not None:
+                    for param in layer.parameters():
+                        param.requires_grad = True
+            # layers_unfreeze >= 5: 再解冻 stem (conv1, bn1, attnpool)
+            if layers_unfreeze >= 5:
+                for attr in ['conv1', 'bn1', 'attnpool']:
+                    module = getattr(self.model.visual, attr, None)
+                    if module is not None:
+                        if isinstance(module, nn.Parameter):
+                            module.requires_grad = True
+                        else:
+                            for p in module.parameters():
+                                p.requires_grad = True
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         """编码图像"""
@@ -1150,6 +1192,7 @@ def create_dual_branch_model(config: dict, device: str = "cuda") -> DualBranchCL
         time_seq_len=time_seq_len,
         use_feature_context=use_feature_context,
         n_ctx_per_domain=n_ctx_per_domain,
+        patch_pooling=model_config.get("patch_pooling", "cls"),
     )
 
     # LoRA 配置

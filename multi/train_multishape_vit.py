@@ -77,6 +77,7 @@ class MultiShapeViTTrainer:
         self.checkpoint_config = config.get("checkpoint", {})
         self.save_dir = Path(self.checkpoint_config.get("save_dir", "checkpoints"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.model_name = self.checkpoint_config.get("model_name", "multishape_vit")
 
         # 损失函数
         self.loss_fn = create_loss_function(config)
@@ -258,12 +259,12 @@ class MultiShapeViTTrainer:
         }
 
         # 保存最新检查点
-        latest_path = self.save_dir / "multishape_vit_latest.pt"
+        latest_path = self.save_dir / f"{self.model_name}_latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
 
         # 只保存最佳模型
         if is_best:
-            best_path = self.save_dir / "multishape_vit_best.pt"
+            best_path = self.save_dir / f"{self.model_name}_best_model.pt"
             torch.save(checkpoint, best_path)
             print(f"  ★ Saved best model (loss: {metrics['loss']:.4f}, acc: {metrics['accuracy']:.4f})")
 

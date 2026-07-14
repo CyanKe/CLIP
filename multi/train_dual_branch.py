@@ -77,6 +77,7 @@ class DualBranchTrainer:
         self.checkpoint_config = config.get("checkpoint", {})
         self.save_dir = Path(self.checkpoint_config.get("save_dir", "checkpoints"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.model_name = self.checkpoint_config.get("model_name", "dual_branch")
 
         # 初始化损失函数
         loss_config = config.get("loss", {})
@@ -144,16 +145,25 @@ class DualBranchTrainer:
 
             self.optimizer.zero_grad()
 
-            # 前向传播
-            image_features, text_features_deception, text_features_suppression = self.model(
+            # 前向传播 — 兼容 dict 格式 (MultiShapePatchViTForDualBranch)
+            # 和 3-tuple 格式 (DualBranchCLIPForCZSL)
+            result = self.model(
                 stft_images, text_tokens_deception, text_tokens_suppression
             )
+            if isinstance(result, dict):
+                img_feat_d, txt_feat_d = result["deception"]
+                img_feat_s, txt_feat_s = result["suppression"]
+            else:
+                image_features, txt_feat_d, txt_feat_s = result
+                img_feat_d = image_features
+                img_feat_s = image_features
 
             # 计算损失
             loss, loss_info = self.loss_fn(
-                image_features,
-                text_features_deception,
-                text_features_suppression,
+                img_feat_d,
+                img_feat_s,
+                txt_feat_d,
+                txt_feat_s,
                 labels_deception,
                 labels_suppression
             )
@@ -169,16 +179,12 @@ class DualBranchTrainer:
 
             # 计算准确率 (Subset + Jaccard, 基于标签匹配)
             with torch.no_grad():
-                # 兼容两种模型结构
-                if hasattr(self.model, 'model'):
-                    logit_scale = self.model.model.logit_scale.exp()
-                else:
-                    logit_scale = self.model.logit_scale.exp()
+                logit_scale = self.model.logit_scale.exp()
 
                 batch_indices = torch.arange(batch_size, device=self.device)
 
                 # --- 欺骗分支 ---
-                logits_deception = logit_scale * (image_features @ text_features_deception.t())
+                logits_deception = logit_scale * (img_feat_d @ txt_feat_d.t())
                 pred_deception = logits_deception.argmax(dim=1)
                 pred_labels_d = labels_deception[pred_deception]
                 true_labels_d = labels_deception[batch_indices]
@@ -200,7 +206,7 @@ class DualBranchTrainer:
                 per_class_correct_d += per_class_match_d
 
                 # --- 压制分支 ---
-                logits_suppression = logit_scale * (image_features @ text_features_suppression.t())
+                logits_suppression = logit_scale * (img_feat_s @ txt_feat_s.t())
                 pred_suppression = logits_suppression.argmax(dim=1)
                 pred_labels_s = labels_suppression[pred_suppression]
                 true_labels_s = labels_suppression[batch_indices]
@@ -274,16 +280,24 @@ class DualBranchTrainer:
                 print(f"{'='*80}")
                 debug_done = True
 
-            # 前向传播
-            image_features, text_features_deception, text_features_suppression = self.model(
+            # 前向传播 — 兼容 dict 和 3-tuple 格式
+            result = self.model(
                 stft_images, text_tokens_deception, text_tokens_suppression
             )
+            if isinstance(result, dict):
+                img_feat_d, txt_feat_d = result["deception"]
+                img_feat_s, txt_feat_s = result["suppression"]
+            else:
+                image_features, txt_feat_d, txt_feat_s = result
+                img_feat_d = image_features
+                img_feat_s = image_features
 
             # 计算损失
             loss, loss_info = self.loss_fn(
-                image_features,
-                text_features_deception,
-                text_features_suppression,
+                img_feat_d,
+                img_feat_s,
+                txt_feat_d,
+                txt_feat_s,
                 labels_deception,
                 labels_suppression
             )
@@ -291,16 +305,12 @@ class DualBranchTrainer:
             total_loss += loss.item() * batch_size
 
             # 计算准确率 (Subset + Jaccard, 基于标签匹配)
-            # 兼容两种模型结构
-            if hasattr(self.model, 'model'):
-                logit_scale = self.model.model.logit_scale.exp()
-            else:
-                logit_scale = self.model.logit_scale.exp()
+            logit_scale = self.model.logit_scale.exp()
 
             batch_indices = torch.arange(batch_size, device=self.device)
 
             # --- 欺骗分支 ---
-            logits_deception = logit_scale * (image_features @ text_features_deception.t())
+            logits_deception = logit_scale * (img_feat_d @ txt_feat_d.t())
             pred_deception = logits_deception.argmax(dim=1)
             pred_labels_d = labels_deception[pred_deception]
             true_labels_d = labels_deception[batch_indices]
@@ -319,7 +329,7 @@ class DualBranchTrainer:
             per_class_correct_d += per_class_match_d
 
             # --- 压制分支 ---
-            logits_suppression = logit_scale * (image_features @ text_features_suppression.t())
+            logits_suppression = logit_scale * (img_feat_s @ txt_feat_s.t())
             pred_suppression = logits_suppression.argmax(dim=1)
             pred_labels_s = labels_suppression[pred_suppression]
             true_labels_s = labels_suppression[batch_indices]
@@ -361,11 +371,11 @@ class DualBranchTrainer:
             "config": self.config
         }
 
-        latest_path = self.save_dir / "dual_branch_latest_checkpoint.pt"
+        latest_path = self.save_dir / f"{self.model_name}_latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
 
         if is_best:
-            best_path = self.save_dir / "dual_branch_best_model.pt"
+            best_path = self.save_dir / f"{self.model_name}_best_model.pt"
             torch.save(checkpoint, best_path)
             print(f"  Saved best model with loss: {metrics['loss']:.4f}")
 

@@ -127,22 +127,6 @@ class Trainer1D:
         print(f"Loss function: {type(self.loss_fn).__name__}")
 
     # ------------------------------------------------------------------
-    # Classification accuracy (matched to evaluate's top-1 single-class口径)
-    # ------------------------------------------------------------------
-    def _batch_class_accuracy(self, signal_features, labels) -> int:
-        """算一个 batch 的分类正确数。信号与缓存的单类文本特征比相似度，argmax 当预测，
-        labels.argmax 当真值。克服同类型文本碰撞导致的对角线口径失真。"""
-        text_feats = self.model.get_cached_text_features()  # [num_classes, D] 已归一化
-        if text_feats is None or text_feats.shape[0] != labels.shape[1]:
-            return 0
-        sig = F.normalize(signal_features, dim=-1)
-        logit_scale = self.model.model.logit_scale.exp()
-        logits = logit_scale * (sig @ text_feats.T)  # [B, num_classes]
-        pred = logits.argmax(dim=1)
-        target = labels.argmax(dim=1)
-        return (pred == target).sum().item()
-
-    # ------------------------------------------------------------------
     # Training epoch
     # ------------------------------------------------------------------
 
@@ -215,9 +199,14 @@ class Trainer1D:
             batch_size = time_signals.size(0)
             total_loss += loss.item() * batch_size
 
+            # 对角线准确率（与 multi/train_czsl.py 对齐，仅供参考）
             with torch.no_grad():
-                total_correct += self._batch_class_accuracy(signal_features, labels)
-                total_samples += batch_size
+                targets = torch.arange(batch_size, device=self.device)
+                pred_i2t = logits_per_image.argmax(dim=1)
+                pred_t2i = logits_per_text.argmax(dim=1)
+                total_correct += (pred_i2t == targets).sum().item()
+                total_correct += (pred_t2i == targets).sum().item()
+                total_samples += batch_size * 2
 
             train_bar.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -288,8 +277,13 @@ class Trainer1D:
             batch_size = time_signals.size(0)
             total_loss += loss.item() * batch_size
 
-            total_correct += self._batch_class_accuracy(signal_features, labels)
-            total_samples += batch_size
+            # 对角线准确率（与 multi/train_czsl.py 对齐，仅供参考）
+            targets = torch.arange(batch_size, device=self.device)
+            pred_i2t = logits_per_image.argmax(dim=1)
+            pred_t2i = logits_per_text.argmax(dim=1)
+            total_correct += (pred_i2t == targets).sum().item()
+            total_correct += (pred_t2i == targets).sum().item()
+            total_samples += batch_size * 2
 
             val_bar.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -466,13 +460,21 @@ def main():
     print("\nLoading 1D time-domain datasets...")
     train_loader, val_loader, test_loader = create_1d_dataloaders(config)
 
-    # Cache text features
+    # Cache text features: singles + seen ∪ unseen (align multi evaluate)
     czsl_config = config.get("czsl", {})
-    seen_combos = czsl_config.get("seen_combinations", None)
+    seen_combos = czsl_config.get("seen_combinations", []) or []
+    unseen_combos = czsl_config.get("unseen_combinations", []) or []
+    all_comb_names = []
+    _seen_keys = set()
+    for c in list(seen_combos) + list(unseen_combos):
+        key = tuple(sorted(c))
+        if key not in _seen_keys:
+            _seen_keys.add(key)
+            all_comb_names.append(c)
     model.cache_text_features(
         max_combination_size=2,
         include_single=True,
-        seen_combinations=seen_combos,
+        seen_combinations=all_comb_names if all_comb_names else None,
         use_translation=config.get('use_translation', False),
     )
 

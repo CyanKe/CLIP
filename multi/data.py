@@ -86,7 +86,7 @@ def collate_fn(batch):
     return stft_images, None, text_tokens, labels, texts, metadata_list, features_batched
 
 
-def _collate_fn(batch, model_type="clip", processor=None):
+def _collate_fn(batch, model_type="clip", processor=None, text_style="class_only"):
     """Collate 函数，支持 CLIP tokenization（模块级别以便 pickle）"""
     from multi.text_templates import generate_text_descriptions
 
@@ -107,10 +107,10 @@ def _collate_fn(batch, model_type="clip", processor=None):
     stft_images = torch.stack(stft_images, dim=0)
     labels = torch.stack(labels, dim=0)
 
-    # 生成文本描述
+    # 生成文本描述（使用 config 指定的 text_style）
     texts = []
     for meta in metadata_list:
-        text = generate_text_descriptions(meta, style='class_only')
+        text = generate_text_descriptions(meta, style=text_style)
         texts.append(text)
 
     # 使用统一的 tokenize 函数
@@ -119,18 +119,19 @@ def _collate_fn(batch, model_type="clip", processor=None):
     return stft_images, None, text_tokens, labels, texts, metadata_list, features_batched
 
 
-def create_collate_fn(model_type: str = "clip", processor=None):
+def create_collate_fn(model_type: str = "clip", processor=None, text_style: str = "class_only"):
     """
     创建支持 CLIP 或  的 collate 函数
 
     Args:
         model_type: 模型类型 ("clip")
+        text_style: 文本描述风格 ("class_only" | "simple_clip" | ...)
 
     Returns:
         collate 函数
     """
     from functools import partial
-    return partial(_collate_fn, model_type=model_type, processor=processor)
+    return partial(_collate_fn, model_type=model_type, processor=processor, text_style=text_style)
 
 
 class STFTDataset(Dataset):
@@ -187,7 +188,7 @@ class STFTDataset(Dataset):
         self.augmentation = augmentation
         self.return_raw_mag = return_raw_mag
 
-        # 一次性加载全部 STFT 数据到内存，避免逐 slice 的 HDF5 随机磁盘 I/O
+        # 一次性加载全部 STFT 数据到内存（HDD 顺序读，速度快）
         with h5py.File(stft_file, 'r') as f:
             self._all_stfts = f[stft_var_name][()]
             self.num_samples = self._all_stfts.shape[2]
@@ -535,7 +536,7 @@ class DualBranchSTFTDataset(Dataset):
         self.metadata_file = metadata_file
         self.stft_var_name = stft_var_name
 
-        # 一次性加载全部 STFT 数据到内存，避免逐 slice 的 HDF5 随机磁盘 I/O
+        # 一次性加载全部 STFT 数据到内存（HDD 顺序读，速度快）
         with h5py.File(stft_file, 'r') as f:
             self._all_stfts = f[stft_var_name][()]
             self.num_samples = self._all_stfts.shape[2]
@@ -884,6 +885,7 @@ def create_czsl_dataloaders(
     load_test: bool = True,
     model_type: str = "clip",
     processor=None,
+    text_style: str = "class_only",
 ) -> tuple:
     """
     创建 CZSL 数据加载器 (train/val/test)
@@ -996,7 +998,7 @@ def create_czsl_dataloaders(
     test_dataset = load_split('test', required=False) if load_test else None
 
     # 创建 collate 函数（支持 CLIP ）
-    _collate_fn = create_collate_fn(model_type, processor)
+    _collate_fn = create_collate_fn(model_type, processor, text_style=text_style)
 
     # 创建数据加载器
     train_loader = DataLoader(
@@ -1039,6 +1041,7 @@ def create_preprocessed_dataloaders(
     load_test: bool = True,
     model_type: str = "clip",
     processor=None,
+    text_style: str = "class_only",
 ) -> tuple:
     """
     创建基于预处理 .pt 文件的 CZSL 数据加载器
@@ -1098,7 +1101,7 @@ def create_preprocessed_dataloaders(
     val_dataset = load_split('val', required=True)
     test_dataset = load_split('test', required=False) if load_test else None
 
-    _collate_fn = create_collate_fn(model_type, processor)
+    _collate_fn = create_collate_fn(model_type, processor, text_style=text_style)
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,

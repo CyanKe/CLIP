@@ -53,6 +53,14 @@ from persistence.data import (
     PersistenceDataset, collate_fn, TokenizerWrapper,
     AblationDataset,
 )
+from multi.metrics_czsl import (
+    compute_metrics_bundle,
+    compute_subset_bundles,
+    print_metrics_report,
+    print_jnr_metrics_table,
+    save_metrics_json,
+    build_seen_unseen_sets,
+)
 
 
 # ===========================================================================
@@ -352,13 +360,17 @@ class PersistenceEvaluator:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _compute_single_class_probs(self, images: torch.Tensor) -> np.ndarray:
+    def _compute_single_class_probs(self, images: torch.Tensor) -> tuple:
         """Compute single-class softmax probabilities for ROC/PR curves.
 
-        Uses only the single-class entries from the cached text features
-        (they are stored first by cache_text_features with include_single=True).
+        Matches multi/evaluate_czsl.py zero_shot: probs from single-class
+        text features only (not combination-space).
         """
-        single_features = self.model._text_features_cache[:self.num_classes]
+        single_features = self.model.get_cached_text_features()
+        if single_features is None:
+            raise RuntimeError(
+                "Text features cache is empty. Call cache_text_features() first."
+            )
         single_features = F.normalize(single_features, dim=-1)
 
         image_features = self.model.encode_image(images)
@@ -368,6 +380,50 @@ class PersistenceEvaluator:
         logits = logit_scale * (image_features @ single_features.T)
         probs = torch.softmax(logits, dim=-1)
         return probs.cpu().numpy(), image_features.cpu().numpy()
+
+    # ------------------------------------------------------------------
+    # Single-class prediction (single softmax + topk) — matching conformer
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _predict_batch(self, images: torch.Tensor, threshold: float = None):
+        """Single-class softmax + top-k(3) > threshold prediction.
+
+        Uses only single-class text features (not combination-space).
+        Matches conformer_1d/evaluate_conformer.py _predict_batch pattern.
+
+        Returns:
+            probs: (B, num_classes) softmax probabilities
+            preds: (B, num_classes) multi-hot predictions
+        """
+        num_classes = self.num_classes
+        if threshold is None:
+            threshold = (self.eval_config.get('by_combination_threshold')
+                         or self.eval_config.get('threshold')
+                         or 1.0 / num_classes)
+
+        # Use single-class text features only
+        single_features = self.model.get_cached_text_features()
+        single_features = F.normalize(single_features, dim=-1)
+
+        image_features = self.model.encode_image(images)
+        image_features = F.normalize(image_features, dim=-1)
+
+        logit_scale = self.model.logit_scale.exp()
+        logits = logit_scale * (image_features @ single_features.T)
+
+        probs = torch.softmax(logits, dim=-1)
+        batch_size = images.size(0)
+        top_k = 3
+        topk_values, topk_indices = torch.topk(probs, k=top_k, dim=-1)
+
+        preds = torch.zeros(batch_size, num_classes, device=images.device)
+        for b in range(batch_size):
+            for j, idx in enumerate(topk_indices[b]):
+                if topk_values[b, j] > threshold:
+                    preds[b, idx] = 1.0
+
+        return probs.cpu(), preds.cpu()
 
     # ------------------------------------------------------------------
     # Shared: build a single-JNR loader on demand
@@ -436,7 +492,7 @@ class PersistenceEvaluator:
         return loader
 
     # ------------------------------------------------------------------
-    # Zero-shot evaluation — per-JNR lazy loading
+    # Zero-shot evaluation — delegates to unified per-JNR method
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -447,66 +503,83 @@ class PersistenceEvaluator:
         ablation_mode: str = 'persistence',
         dataloader=None,
         threshold: float = None,
+        print_samples: bool = False,
     ) -> dict:
-        """Run zero-shot evaluation with per-JNR lazy loading.
+        """Zero-shot eval: combo-space top-1 (multi-style) via JNR lazy load.
 
-        Accepts either a pre-built dataloader (backward compat) or
-        config+split+ablation_mode for on-demand per-JNR loading.
+        Prediction matches multi/evaluate_czsl.py:
+          zero_shot_predict(use_combinations=True, top_k=1) → decode "A+B"
+        ROC/PR probabilities use single-class softmax.
+        Data is loaded one JNR at a time then concatenated globally.
         """
-        if threshold is None:
-            threshold = self.eval_config.get('threshold', 0.5)
-
         self.model.eval()
 
-        # Backward compat: if a pre-built dataloader is passed, use it directly
+        # Backward compat: pre-built dataloader
         if dataloader is not None:
-            return self._evaluate_zero_shot_on_loader(dataloader, threshold)
+            raw = self._evaluate_zero_shot_on_loader(dataloader, print_samples=print_samples)
+        else:
+            # JNR lazy-load → global concat (same as multi ChainedLoaderIterable intent)
+            result = self._evaluate_unified_per_jnr(
+                config, split, ablation_mode,
+                collect_per_jnr=False,
+                print_samples=print_samples,
+                predict_mode="combo_top1",
+            )
+            raw = result['global']
 
-        # Per-JNR lazy loading
-        data_config = config.get('data', {})
-        jnr_start = data_config.get('jnr_start', 0)
-        jnr_end = data_config.get('jnr_end', 20)
-        jnr_step = data_config.get('jnr_step', 1)
-        jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
-
-        all_preds = []
-        all_labels = []
-        all_probs = []
-        all_features = []
-
-        for jnr in jnr_levels:
-            loader = self._build_single_jnr_loader(config, split, jnr, ablation_mode)
-            if loader is None:
-                continue
-            result = self._evaluate_zero_shot_on_loader(loader, threshold)
-            all_preds.append(result["predictions"])
-            all_labels.append(result["labels"])
-            all_probs.append(result["probabilities"])
-            all_features.append(result["features"])
-            del loader
-
-        all_preds = np.concatenate(all_preds, axis=0) if all_preds else np.array([])
-        all_labels = np.concatenate(all_labels, axis=0) if all_labels else np.array([])
-        all_probs = np.concatenate(all_probs, axis=0) if all_probs else np.array([])
-        all_features = np.concatenate(all_features, axis=0) if all_features else np.array([])
-
-        metrics = self._compute_multilabel_metrics(all_labels, all_preds)
-        metrics['num_samples'] = len(all_preds)
+        seen_set, unseen_set = build_seen_unseen_sets(
+            self.czsl_config.get('seen_combinations', []),
+            self.czsl_config.get('unseen_combinations', []),
+            self.class_names,
+        )
+        metrics = compute_metrics_bundle(
+            raw['labels'], raw['predictions'], self.class_names,
+            y_prob=raw.get('probabilities'),
+            seen_set=seen_set, unseen_set=unseen_set,
+            dual_write=True,
+        )
 
         return {
             "metrics": metrics,
-            "labels": all_labels,
-            "predictions": all_preds,
-            "probabilities": all_probs,
-            "features": all_features,
+            "labels": raw['labels'],
+            "predictions": raw['predictions'],
+            "probabilities": raw['probabilities'],
+            "features": raw['features'],
         }
 
-    def _evaluate_zero_shot_on_loader(self, dataloader, threshold: float) -> dict:
-        """Internal: run zero-shot eval on a single DataLoader."""
+    def _decode_combo_top1_preds(
+        self, images: torch.Tensor,
+    ) -> tuple:
+        """Multi-style combo-space top-1 → multi-hot + single-class probs + features.
+
+        Returns:
+            preds (B, C) np.float32, probs (B, C) np, features (B, D) np
+        """
+        probs_single, img_feats = self._compute_single_class_probs(images)
+        _, _, pred_names = self.model.zero_shot_predict(
+            images, use_combinations=True, top_k=1,
+        )
+        batch_size = images.size(0)
+        preds = np.zeros((batch_size, self.num_classes), dtype=np.float32)
+        for i, names in enumerate(pred_names):
+            if not names:
+                continue
+            comb_name = names[0]
+            for part in comb_name.split('+'):
+                part = part.strip()
+                if part in self.class_names:
+                    preds[i, self.class_names.index(part)] = 1.0
+        return preds, probs_single, img_feats
+
+    def _evaluate_zero_shot_on_loader(
+        self, dataloader, print_samples: bool = False,
+    ) -> dict:
+        """Internal: multi-style zero-shot on a single DataLoader."""
         all_preds = []
         all_labels = []
         all_probs = []
         all_features = []
+        sample_idx = 0
 
         for batch_data in tqdm(dataloader, desc="Zero-shot eval", leave=False):
             if len(batch_data) >= 6:
@@ -515,35 +588,31 @@ class PersistenceEvaluator:
                 images, text_tokens, labels, texts, metas = batch_data
 
             images = images.to(self.device)
-            labels = labels.to(self.device)
+            labels_np = labels.cpu().numpy()
 
-            probs_single, img_feats = self._compute_single_class_probs(images)
+            preds, probs_single, img_feats = self._decode_combo_top1_preds(images)
+
+            if print_samples:
+                for i in range(images.size(0)):
+                    true_names = [self.class_names[j] for j in range(self.num_classes)
+                                  if labels_np[i, j] > 0]
+                    pred_names = [self.class_names[j] for j in range(self.num_classes)
+                                  if preds[i, j] > 0]
+                    correct = sorted(true_names) == sorted(pred_names)
+                    print(f"  [SAMPLE {sample_idx}] true={'+'.join(true_names):30s} | "
+                          f"pred={'+'.join(pred_names):30s} | correct={correct}", flush=True)
+                    sample_idx += 1
+
+            all_preds.append(preds)
             all_probs.append(probs_single)
             all_features.append(img_feats)
-
-            predictions = self.model.zero_shot_predict(images, threshold=threshold)
-
-            for pred_names in predictions:
-                pred_vec = np.zeros(self.num_classes, dtype=np.float32)
-                for name in pred_names:
-                    for part in name.split('+'):
-                        part = part.strip()
-                        if part in self.class_names:
-                            pred_vec[self.class_names.index(part)] = 1.0
-                all_preds.append(pred_vec)
-
-            all_labels.append(labels.cpu().numpy())
-
-        all_preds = np.array(all_preds)
-        all_labels = np.concatenate(all_labels, axis=0)
-        all_probs = np.concatenate(all_probs, axis=0)
-        all_features = np.concatenate(all_features, axis=0)
+            all_labels.append(labels_np)
 
         return {
-            "predictions": all_preds,
-            "labels": all_labels,
-            "probabilities": all_probs,
-            "features": all_features,
+            "predictions": np.concatenate(all_preds, axis=0) if all_preds else np.array([]),
+            "labels": np.concatenate(all_labels, axis=0) if all_labels else np.array([]),
+            "probabilities": np.concatenate(all_probs, axis=0) if all_probs else np.array([]),
+            "features": np.concatenate(all_features, axis=0) if all_features else np.array([]),
         }
 
     # ------------------------------------------------------------------
@@ -554,36 +623,19 @@ class PersistenceEvaluator:
         self,
         y_true: np.ndarray,
         y_pred: np.ndarray,
+        y_prob: np.ndarray = None,
     ) -> dict:
-        """Compute multilabel classification metrics."""
-        # Per-class F1
-        per_class_f1 = {}
-        for i, cls_name in enumerate(self.class_names):
-            if y_true[:, i].sum() > 0 or y_pred[:, i].sum() > 0:
-                f1 = f1_score(y_true[:, i], y_pred[:, i], zero_division=0)
-                per_class_f1[cls_name] = f1
-
-        # Micro / Macro / Sample F1
-        f1_micro = f1_score(y_true, y_pred, average='micro', zero_division=0)
-        f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
-        f1_samples = f1_score(y_true, y_pred, average='samples', zero_division=0)
-
-        # Precision / Recall
-        precision = precision_score(y_true, y_pred, average='samples', zero_division=0)
-        recall = recall_score(y_true, y_pred, average='samples', zero_division=0)
-
-        # Subset accuracy (exact match)
-        subset_acc = accuracy_score(y_true, y_pred)
-
-        return {
-            'f1_micro': f1_micro,
-            'f1_macro': f1_macro,
-            'f1_samples': f1_samples,
-            'precision': precision,
-            'recall': recall,
-            'subset_accuracy': subset_acc,
-            'per_class_f1': per_class_f1,
-        }
+        """Compute multilabel metrics via unified MetricsBundle."""
+        seen_set, unseen_set = build_seen_unseen_sets(
+            self.czsl_config.get('seen_combinations', []),
+            self.czsl_config.get('unseen_combinations', []),
+            self.class_names,
+        )
+        return compute_metrics_bundle(
+            y_true, y_pred, self.class_names,
+            y_prob=y_prob, seen_set=seen_set, unseen_set=unseen_set,
+            dual_write=True,
+        )
 
     # ------------------------------------------------------------------
     # By-combination evaluation (seen vs unseen)
@@ -597,18 +649,20 @@ class PersistenceEvaluator:
         ablation_mode: str = 'persistence',
         dataloader=None,
         threshold: float = None,
+        print_samples: bool = False,
     ) -> dict:
         """Evaluate broken down by seen and unseen combinations — per-JNR lazy loading.
 
         Accepts either a pre-built dataloader (backward compat) or
         config+split+ablation_mode for on-demand per-JNR loading.
+
+        Threshold priority: CLI > evaluation.by_combination_threshold > evaluation.threshold > 1/num_classes
         """
-        if threshold is None:
-            threshold = self.czsl_config.get('zero_shot', {}).get('threshold', 0.14)
 
         # Backward compat: pre-built dataloader
         if dataloader is not None:
-            return self._evaluate_by_combination_on_loader(dataloader, threshold)
+            return self._evaluate_by_combination_on_loader(dataloader, threshold,
+                                                           print_samples=print_samples)
 
         # Per-JNR lazy loading
         data_config = config.get('data', {})
@@ -622,7 +676,8 @@ class PersistenceEvaluator:
             loader = self._build_single_jnr_loader(config, split, jnr, ablation_mode)
             if loader is None:
                 continue
-            result = self._evaluate_by_combination_on_loader(loader, threshold)
+            result = self._evaluate_by_combination_on_loader(loader, threshold,
+                                                           print_samples=print_samples)
             all_results.append(result)
             del loader
 
@@ -631,42 +686,48 @@ class PersistenceEvaluator:
             return {'_labels': np.array([]), '_predictions': np.array([]),
                     '_probabilities': np.array([]), '_features': np.array([])}
 
-        merged = {}
-        # Merge seen
-        seen_preds = np.concatenate([r.get('_seen_preds', np.array([])) for r in all_results if r.get('_seen_preds') is not None and len(r['_seen_preds']) > 0], axis=0) if any(r.get('_seen_preds') is not None and len(r['_seen_preds']) > 0 for r in all_results) else []
-        seen_labels = np.concatenate([r.get('_seen_labels', np.array([])) for r in all_results if r.get('_seen_labels') is not None and len(r['_seen_labels']) > 0], axis=0) if any(r.get('_seen_labels') is not None and len(r['_seen_labels']) > 0 for r in all_results) else []
-        if len(seen_preds) > 0:
-            merged['seen'] = self._compute_multilabel_metrics(seen_labels, seen_preds)
-            merged['seen']['count'] = len(seen_preds)
-            print(f"\nSeen combinations ({len(seen_preds)} samples):")
-            print(f"  F1_macro: {merged['seen']['f1_macro']:.4f}")
-            print(f"  F1_micro: {merged['seen']['f1_micro']:.4f}")
-
-        # Merge unseen
-        unseen_preds = np.concatenate([r.get('_unseen_preds', np.array([])) for r in all_results if r.get('_unseen_preds') is not None and len(r['_unseen_preds']) > 0], axis=0) if any(r.get('_unseen_preds') is not None and len(r['_unseen_preds']) > 0 for r in all_results) else []
-        unseen_labels = np.concatenate([r.get('_unseen_labels', np.array([])) for r in all_results if r.get('_unseen_labels') is not None and len(r['_unseen_labels']) > 0], axis=0) if any(r.get('_unseen_labels') is not None and len(r['_unseen_labels']) > 0 for r in all_results) else []
-        if len(unseen_preds) > 0:
-            merged['unseen'] = self._compute_multilabel_metrics(unseen_labels, unseen_preds)
-            merged['unseen']['count'] = len(unseen_preds)
-            print(f"\nUnseen combinations ({len(unseen_preds)} samples):")
-            print(f"  F1_macro: {merged['unseen']['f1_macro']:.4f}")
-            print(f"  F1_micro: {merged['unseen']['f1_micro']:.4f}")
-
-        # Merge all
+        # Merge all predictions, then global + seen/unseen subset bundles
         all_preds = np.concatenate([r['_predictions'] for r in all_results], axis=0)
         all_labels = np.concatenate([r['_labels'] for r in all_results], axis=0)
         all_probs = np.concatenate([r['_probabilities'] for r in all_results], axis=0)
         all_features = np.concatenate([r['_features'] for r in all_results], axis=0)
 
-        merged['_labels'] = all_labels
-        merged['_predictions'] = all_preds
-        merged['_probabilities'] = all_probs
-        merged['_features'] = all_features
+        seen_set, unseen_set = build_seen_unseen_sets(
+            self.czsl_config.get('seen_combinations', []),
+            self.czsl_config.get('unseen_combinations', []),
+            self.class_names,
+        )
+        bundles = compute_subset_bundles(
+            all_labels, all_preds, self.class_names,
+            seen_set=seen_set, unseen_set=unseen_set,
+            y_prob=all_probs, dual_write=True,
+        )
+        merged = {
+            "global": bundles["global"],
+            "seen": bundles["seen"],
+            "unseen": bundles["unseen"],
+            # flat = global for backward compat
+            **bundles["global"],
+            "_labels": all_labels,
+            "_predictions": all_preds,
+            "_probabilities": all_probs,
+            "_features": all_features,
+        }
+        print_metrics_report(bundles["global"], title="By-Combination — global")
+        if bundles["seen"].get("num_samples", 0):
+            print_metrics_report(bundles["seen"], title="By-Combination — seen subset")
+        if bundles["unseen"].get("num_samples", 0):
+            print_metrics_report(bundles["unseen"], title="By-Combination — unseen subset")
 
         return merged
 
-    def _evaluate_by_combination_on_loader(self, dataloader, threshold: float) -> dict:
-        """Internal: run by-combination eval on a single DataLoader."""
+    def _evaluate_by_combination_on_loader(self, dataloader, threshold: float,
+                                             print_samples: bool = False) -> dict:
+        """Internal: run by-combination eval on a single DataLoader.
+
+        Uses single-class softmax + topk(3) > threshold (_predict_batch),
+        matching conformer_1d's by_combination pattern.
+        """
         seen_combos_raw = _unwrap_combinations(
             self.czsl_config.get('seen_combinations', []), 'seen_combinations')
         unseen_combos_raw = _unwrap_combinations(
@@ -697,20 +758,17 @@ class PersistenceEvaluator:
             images = images.to(self.device)
             labels_np = labels.cpu().numpy()
 
-            probs_single, img_feats = self._compute_single_class_probs(images)
-            all_probs_list.append(probs_single)
+            # _predict_batch returns (probs, preds) — single-class softmax + topk
+            probs, preds_batch = self._predict_batch(images, threshold)
+            all_probs_list.append(probs.numpy())
+
+            # Image features for visualization (separate lightweight forward pass)
+            img_feats = self.model.encode_image(images)
+            img_feats = F.normalize(img_feats, dim=-1).cpu().numpy()
             all_features_list.append(img_feats)
 
-            predictions = self.model.zero_shot_predict(images, threshold=threshold)
-
-            for i, pred_names in enumerate(predictions):
-                pred_vec = np.zeros(self.num_classes, dtype=np.float32)
-                for name in pred_names:
-                    for part in name.split('+'):
-                        part = part.strip()
-                        if part in self.class_names:
-                            pred_vec[self.class_names.index(part)] = 1.0
-
+            for i in range(images.size(0)):
+                pred_vec = preds_batch[i].numpy()
                 all_preds_list.append(pred_vec)
                 all_labels_list.append(labels_np[i])
 
@@ -718,6 +776,17 @@ class PersistenceEvaluator:
                     self.class_names[j] for j in range(self.num_classes)
                     if labels_np[i, j] > 0
                 ]))
+                pred_classes = tuple(sorted([
+                    self.class_names[j] for j in range(self.num_classes)
+                    if pred_vec[j] > 0
+                ]))
+
+                # ---- Per-sample debug print ----
+                if print_samples:
+                    correct = (true_classes == pred_classes)
+                    print(f"  [SAMPLE {len(all_labels_list)-1}] "
+                          f"true={'+'.join(true_classes):30s} | "
+                          f"pred={'+'.join(pred_classes):30s} | correct={correct}", flush=True)
 
                 if true_classes in seen_keys or len(true_classes) <= 1:
                     seen_preds.append(pred_vec)
@@ -738,6 +807,227 @@ class PersistenceEvaluator:
         }
 
     # ------------------------------------------------------------------
+    # Unified per-JNR evaluation (zero_shot + by_jnr combined)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _evaluate_unified_per_jnr(
+        self,
+        config: dict,
+        split: str = 'test',
+        ablation_mode: str = 'persistence',
+        threshold: float = None,
+        output_dir: str = None,
+        collect_per_jnr: bool = False,
+        print_samples: bool = False,
+        predict_mode: str = "combo_top1",
+    ) -> dict:
+        """Unified evaluation: load each JNR once, accumulate global + per-JNR stats.
+
+        Prediction (default ``combo_top1``, multi-aligned):
+          zero_shot_predict(use_combinations=True, top_k=1) + single-class probs
+
+        Args:
+            collect_per_jnr: if True, compute per-JNR metrics dict
+            output_dir: if set, generate per-JNR confusion matrices
+            predict_mode: ``combo_top1`` (default, multi-style) | reserved for future
+
+        Returns:
+            dict with keys:
+                'global': {labels, predictions, probabilities, features} — concatenated
+                'per_jnr': {jnr: metrics_dict, ...} — only if collect_per_jnr=True
+        """
+        del threshold  # multi-style top-1 does not use threshold
+        del predict_mode  # currently only combo_top1
+
+        data_config = config.get('data', {})
+        jnr_start = data_config.get('jnr_start', 0)
+        jnr_end = data_config.get('jnr_end', 20)
+        jnr_step = data_config.get('jnr_step', 1)
+        jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
+
+        # Seen/unseen sets for per-JNR breakdown
+        seen_combos_raw = _unwrap_combinations(
+            self.czsl_config.get('seen_combinations', []), 'seen_combinations')
+        unseen_combos_raw = _unwrap_combinations(
+            self.czsl_config.get('unseen_combinations', []), 'unseen_combinations')
+
+        # Convert combination names → class indices for fast matching
+        seen_set = set()
+        for sc in seen_combos_raw:
+            seen_set.add(tuple(sorted(self.class_names.index(c) for c in sc if c in self.class_names)))
+        unseen_set = set()
+        for uc in unseen_combos_raw:
+            unseen_set.add(tuple(sorted(self.class_names.index(c) for c in uc if c in self.class_names)))
+
+        self.model.eval()
+
+        # Global accumulation
+        all_labels = []
+        all_preds = []
+        all_probs = []
+        all_features = []
+
+        # Per-JNR accumulation
+        jnr_results = {}
+        all_jnr_metrics = []
+        global_sample_idx = 0
+
+        for jnr in jnr_levels:
+            loader = self._build_single_jnr_loader(config, split, jnr, ablation_mode)
+            if loader is None:
+                print(f"  Skipping JNR=+{jnr}: data not found")
+                continue
+
+            # Per-JNR accumulators
+            jnr_labels = []
+            jnr_preds = []
+            jnr_probs = []
+            jnr_feats = []
+            class_stats = np.zeros((self.num_classes, 4), dtype=np.int64)
+            seen_correct, seen_total = 0, 0
+            unseen_correct, unseen_total = 0, 0
+
+            for batch_data in tqdm(loader, desc=f"JNR=+{jnr}", leave=False):
+                if len(batch_data) >= 6:
+                    images, _, text_tokens, labels, texts, metas = batch_data[:6]
+                else:
+                    images, text_tokens, labels, texts, metas = batch_data
+
+                images = images.to(self.device)
+                labels_np = labels.cpu().numpy()
+                batch_size = images.size(0)
+
+                # Multi-style: combo top-1 preds + single-class softmax for ROC/PR
+                preds, probs_single, img_feats = self._decode_combo_top1_preds(images)
+
+                # ---- Per-sample debug print ----
+                if print_samples:
+                    for i in range(batch_size):
+                        true_names = [self.class_names[j] for j in range(self.num_classes)
+                                      if labels_np[i, j] > 0]
+                        pred_names = [self.class_names[j] for j in range(self.num_classes)
+                                      if preds[i, j] > 0]
+                        correct = (sorted(true_names) == sorted(pred_names))
+                        print(f"  [SAMPLE {global_sample_idx}] true={'+'.join(true_names):30s} | "
+                              f"pred={'+'.join(pred_names):30s} | correct={correct}", flush=True)
+                        global_sample_idx += 1
+
+                # Accumulate global
+                all_labels.append(labels_np)
+                all_preds.append(preds)
+                all_probs.append(probs_single)
+                all_features.append(img_feats)
+
+                # Accumulate per-JNR
+                jnr_labels.append(labels_np)
+                jnr_preds.append(preds)
+                jnr_probs.append(probs_single)
+                jnr_feats.append(img_feats)
+
+                # Per-class TP/FP/FN/TN
+                for c in range(self.num_classes):
+                    true_c = labels_np[:, c]
+                    pred_c = preds[:, c]
+                    class_stats[c, 0] += np.sum((true_c == 1) & (pred_c == 1))  # TP
+                    class_stats[c, 1] += np.sum((true_c == 0) & (pred_c == 1))  # FP
+                    class_stats[c, 2] += np.sum((true_c == 1) & (pred_c == 0))  # FN
+                    class_stats[c, 3] += np.sum((true_c == 0) & (pred_c == 0))  # TN
+
+                # Seen/unseen accuracy
+                for i in range(batch_size):
+                    true_comb = tuple(sorted(np.where(labels_np[i] == 1)[0].tolist()))
+                    pred_comb = tuple(sorted(np.where(preds[i] == 1)[0].tolist()))
+                    is_correct = (true_comb == pred_comb)
+                    if true_comb in seen_set:
+                        seen_total += 1
+                        if is_correct:
+                            seen_correct += 1
+                    elif true_comb in unseen_set:
+                        unseen_total += 1
+                        if is_correct:
+                            unseen_correct += 1
+
+            # ---- Per-JNR metrics ----
+            jnr_labels_np = np.concatenate(jnr_labels, axis=0)
+            jnr_preds_np = np.concatenate(jnr_preds, axis=0)
+            jnr_probs_np = np.concatenate(jnr_probs, axis=0)
+            jnr_feats_np = np.concatenate(jnr_feats, axis=0)
+
+            per_class_recall = np.zeros(self.num_classes)
+            per_class_precision = np.zeros(self.num_classes)
+            per_class_f1 = np.zeros(self.num_classes)
+            for c in range(self.num_classes):
+                tp, fp, fn, tn = class_stats[c]
+                per_class_recall[c] = tp / (tp + fn) if (tp + fn) > 0 else 0
+                per_class_precision[c] = tp / (tp + fp) if (tp + fp) > 0 else 0
+                if per_class_precision[c] + per_class_recall[c] > 0:
+                    per_class_f1[c] = (2 * per_class_precision[c] * per_class_recall[c]
+                                        / (per_class_precision[c] + per_class_recall[c]))
+
+            bundle = compute_metrics_bundle(
+                jnr_labels_np, jnr_preds_np, self.class_names,
+                y_prob=jnr_probs_np,
+                seen_set=seen_set, unseen_set=unseen_set,
+                dual_write=True,
+            )
+            jnr_metrics = {
+                **bundle,
+                'jnr': jnr,
+                'total_samples': bundle['num_samples'],  # dual-write legacy
+                'per_class_recall': per_class_recall,
+                'per_class_precision': per_class_precision,
+                'per_class_f1': per_class_f1,
+                'labels': jnr_labels_np,
+                'probabilities': jnr_probs_np,
+                'features': jnr_feats_np,
+            }
+            _ = (seen_correct, unseen_correct, seen_total, unseen_total)
+            if collect_per_jnr:
+                jnr_results[jnr] = jnr_metrics
+                all_jnr_metrics.append(jnr_metrics)
+
+            # Per-JNR confusion matrix
+            if output_dir:
+                jnr_dir = os.path.join(output_dir, "by_jnr")
+                os.makedirs(jnr_dir, exist_ok=True)
+                seen_idx = _convert_combination_names_to_indices(seen_combos_raw, self.class_names)
+                unseen_idx = _convert_combination_names_to_indices(unseen_combos_raw, self.class_names)
+                prefix = "persistence" if ablation_mode == "persistence" else f"persistence_{ablation_mode}"
+                self.plot_confusion_by_combination(
+                    jnr_labels_np, jnr_preds_np,
+                    save_path=os.path.join(jnr_dir, f"{prefix}_confusion_jnr_{jnr:+.0f}.png"),
+                    seen_combinations=seen_idx,
+                    unseen_combinations=unseen_idx,
+                )
+
+            # Free this JNR's data
+            del loader
+
+        # ---- Aggregate global ----
+        global_data = {}
+        if all_labels:
+            global_data['labels'] = np.concatenate(all_labels, axis=0)
+            global_data['predictions'] = np.concatenate(all_preds, axis=0)
+            global_data['probabilities'] = np.concatenate(all_probs, axis=0)
+            global_data['features'] = np.concatenate(all_features, axis=0)
+        else:
+            global_data = {'labels': np.array([]), 'predictions': np.array([]),
+                           'probabilities': np.array([]), 'features': np.array([])}
+
+        # JNR metrics panel plot (after all JNRs)
+        if output_dir and all_jnr_metrics:
+            jnr_dir = os.path.join(output_dir, "by_jnr")
+            os.makedirs(jnr_dir, exist_ok=True)
+            prefix = "persistence" if ablation_mode == "persistence" else f"persistence_{ablation_mode}"
+            self.plot_jnr_metrics(jnr_results, save_path=os.path.join(jnr_dir, f'{prefix}_jnr_metrics.png'))
+
+        return {
+            'global': global_data,
+            'per_jnr': jnr_results if collect_per_jnr else {},
+        }
+
+    # ------------------------------------------------------------------
     # By-JNR evaluation
     # ------------------------------------------------------------------
 
@@ -749,243 +1039,34 @@ class PersistenceEvaluator:
         ablation_mode: str = 'persistence',
         threshold: float = None,
         output_dir: str = None,
+        print_samples: bool = False,
     ) -> dict:
-        """Evaluate separately at each JNR level — loads one JNR at a time to save memory.
+        """Evaluate separately at each JNR level — delegates to _evaluate_unified_per_jnr.
 
         Args:
             config: full YAML config dict
             split: data split to evaluate
             ablation_mode: 'persistence', 'stft', or 'fusion'
             threshold: prediction threshold override
-            output_dir: directory for JNR metrics panel plot
+            output_dir: directory for JNR metrics panel + per-JNR confusion matrices
 
         Returns:
             dict: {jnr: metrics, ...}
         """
-        if threshold is None:
-            threshold = self.czsl_config.get('zero_shot', {}).get('threshold', 0.14)
+        result = self._evaluate_unified_per_jnr(
+            config, split, ablation_mode,
+            output_dir=output_dir,
+            collect_per_jnr=True,
+            predict_mode="combo_top1",
+            print_samples=print_samples,
+        )
 
-        # Data config for on-demand loader building
-        data_config = config.get('data', {})
-        base_path = data_config.get('base_path')
-        jnr_start = data_config.get('jnr_start', 0)
-        jnr_end = data_config.get('jnr_end', 20)
-        jnr_step = data_config.get('jnr_step', 1)
-        image_size = data_config.get('image_size', 224)
-        batch_size = config.get('train', {}).get('batch_size', 32)
-        persistence_var_name = data_config.get('persistence_var_name', 'all_persistences')
-        persistence_suffix = data_config.get('persistence_suffix', 'echo_persistences')
-        stft_suffix = data_config.get('stft_suffix', 'echo_stfts')
-        stft_var_name = data_config.get('stft_var_name', 'all_stfts')
-        pin_memory = data_config.get('pin_memory', True)
+        jnr_results = result['per_jnr']
 
-        tokenizer = TokenizerWrapper(model_type="clip")
-
-        # Build seen/unseen sets
-        seen_combos_raw = _unwrap_combinations(
-            self.czsl_config.get('seen_combinations', []), 'seen_combinations')
-        unseen_combos_raw = _unwrap_combinations(
-            self.czsl_config.get('unseen_combinations', []), 'unseen_combinations')
-
-        def combo_key(c):
-            return tuple(sorted(c))
-
-        seen_set = set(combo_key(sc) for sc in seen_combos_raw)
-        unseen_set = set(combo_key(uc) for uc in unseen_combos_raw)
-
-        jnr_levels = list(range(jnr_start, jnr_end + 1, jnr_step))
-        jnr_results = {}
-        all_jnr_metrics = []
-
-        for jnr in jnr_levels:
-            # --- Build single-JNR loader on demand (freed after eval) ---
-            data_folder = os.path.join(base_path, f'JNR_+{jnr}')
-            metadata_file = os.path.join(data_folder, f'{split}_echo_metadata.json')
-            if not os.path.exists(metadata_file):
-                continue
-
-            persistence_file = None
-            if ablation_mode in ('persistence', 'fusion'):
-                pf = os.path.join(data_folder, f'{split}_{persistence_suffix}.mat')
-                if os.path.exists(pf):
-                    persistence_file = pf
-                else:
-                    continue
-
-            stft_file = None
-            if ablation_mode in ('stft', 'fusion'):
-                sf = os.path.join(data_folder, f'{split}_{stft_suffix}.mat')
-                if os.path.exists(sf):
-                    stft_file = sf
-                else:
-                    continue
-
-            if ablation_mode == 'persistence':
-                ds = PersistenceDataset(
-                    persistence_file=persistence_file,
-                    metadata_file=metadata_file,
-                    persistence_var_name=persistence_var_name,
-                    class_names=self.class_names,
-                    image_size=image_size,
-                    apply_clip_norm=True,
-                )
-            else:
-                ds = AblationDataset(
-                    persistence_file=persistence_file,
-                    metadata_file=metadata_file,
-                    persistence_var_name=persistence_var_name,
-                    stft_file=stft_file,
-                    stft_var_name=stft_var_name,
-                    class_names=self.class_names,
-                    image_size=image_size,
-                    apply_clip_norm=True,
-                    ablation_mode=ablation_mode,
-                )
-
-            loader = DataLoader(
-                ds, batch_size=batch_size, shuffle=False,
-                num_workers=0, pin_memory=pin_memory,
-                collate_fn=partial(collate_fn, tokenizer_fn=tokenizer, model_type="clip"),
-            )
-
-            self.model.eval()
-
-            _all_labels = []
-            _all_preds = []
-            _all_probs = []
-            _all_features = []
-            class_stats = np.zeros((self.num_classes, 4), dtype=np.int64)
-            seen_correct, seen_total = 0, 0
-            unseen_correct, unseen_total = 0, 0
-
-            for batch_data in tqdm(loader, desc=f"JNR=+{jnr}"):
-                if len(batch_data) >= 6:
-                    images, _, text_tokens, labels, texts, metas = batch_data[:6]
-                else:
-                    images, text_tokens, labels, texts, metas = batch_data
-
-                images = images.to(self.device)
-                labels_dev = labels.to(self.device)
-                labels_np = labels_dev.cpu().numpy()
-
-                # Single-class probabilities + image features
-                probs_single, img_feats = self._compute_single_class_probs(images)
-                _all_probs.append(probs_single)
-                _all_features.append(img_feats)
-
-                # Zero-shot prediction
-                predictions = self.model.zero_shot_predict(images, threshold=threshold)
-
-                preds = np.zeros((images.size(0), self.num_classes), dtype=np.float32)
-                for i, pred_names in enumerate(predictions):
-                    for name in pred_names:
-                        for part in name.split('+'):
-                            part = part.strip()
-                            if part in self.class_names:
-                                preds[i, self.class_names.index(part)] = 1.0
-
-                _all_preds.append(preds)
-                _all_labels.append(labels_np)
-
-                # Per-class statistics
-                for c in range(self.num_classes):
-                    true_c = labels_np[:, c]
-                    pred_c = preds[:, c]
-                    class_stats[c, 0] += np.sum((true_c == 1) & (pred_c == 1))  # TP
-                    class_stats[c, 1] += np.sum((true_c == 0) & (pred_c == 1))  # FP
-                    class_stats[c, 2] += np.sum((true_c == 1) & (pred_c == 0))  # FN
-                    class_stats[c, 3] += np.sum((true_c == 0) & (pred_c == 0))  # TN
-
-                # Seen/unseen accuracy
-                for i in range(images.size(0)):
-                    true_comb = tuple(sorted(
-                        np.where(labels_np[i] == 1)[0].tolist()
-                    ))
-                    pred_comb = tuple(sorted(
-                        np.where(preds[i] == 1)[0].tolist()
-                    ))
-                    is_correct = (true_comb == pred_comb)
-
-                    if true_comb in seen_set:
-                        seen_total += 1
-                        if is_correct:
-                            seen_correct += 1
-                    elif true_comb in unseen_set:
-                        unseen_total += 1
-                        if is_correct:
-                            unseen_correct += 1
-
-            all_labels_np = np.concatenate(_all_labels, axis=0)
-            all_preds_np = np.concatenate(_all_preds, axis=0)
-            all_probs_np = np.concatenate(_all_probs, axis=0)
-            all_feats_np = np.concatenate(_all_features, axis=0)
-
-            # Per-class metrics
-            per_class_recall = np.zeros(self.num_classes)
-            per_class_precision = np.zeros(self.num_classes)
-            per_class_f1 = np.zeros(self.num_classes)
-            for c in range(self.num_classes):
-                tp, fp, fn, tn = class_stats[c]
-                per_class_recall[c] = tp / (tp + fn) if (tp + fn) > 0 else 0
-                per_class_precision[c] = tp / (tp + fp) if (tp + fp) > 0 else 0
-                if per_class_precision[c] + per_class_recall[c] > 0:
-                    per_class_f1[c] = (2 * per_class_precision[c] * per_class_recall[c]
-                                       / (per_class_precision[c] + per_class_recall[c]))
-
-            total_samples = len(all_preds_np)
-            metrics = {
-                'f1_macro': f1_score(all_labels_np, all_preds_np, average='macro', zero_division=0),
-                'f1_micro': f1_score(all_labels_np, all_preds_np, average='micro', zero_division=0),
-                'f1_samples': f1_score(all_labels_np, all_preds_np, average='samples', zero_division=0),
-                'precision': precision_score(all_labels_np, all_preds_np, average='samples', zero_division=0),
-                'recall': recall_score(all_labels_np, all_preds_np, average='samples', zero_division=0),
-                'subset_accuracy': accuracy_score(all_labels_np, all_preds_np),
-                'jnr': jnr,
-                'num_samples': total_samples,
-                'combination_accuracy': seen_correct + unseen_correct,
-                'total_samples': seen_total + unseen_total,
-                'seen_accuracy': seen_correct / seen_total if seen_total > 0 else 0,
-                'seen_samples': seen_total,
-                'unseen_accuracy': unseen_correct / unseen_total if unseen_total > 0 else 0,
-                'unseen_samples': unseen_total,
-                'per_class_recall': per_class_recall,
-                'per_class_precision': per_class_precision,
-                'per_class_f1': per_class_f1,
-                # For per-JNR ROC/PR:
-                'labels': all_labels_np,
-                'probabilities': all_probs_np,
-                'features': all_feats_np,
-            }
-
-            jnr_results[jnr] = metrics
-            all_jnr_metrics.append(metrics)
+        # Print per-JNR summary
+        for jnr, metrics in sorted(jnr_results.items()):
             print(f"  JNR=+{jnr}: F1_macro={metrics['f1_macro']:.4f}, "
                   f"F1_micro={metrics['f1_micro']:.4f}")
-
-            # --- Per-JNR confusion matrix ---
-            if output_dir:
-                jnr_dir = os.path.join(output_dir, "by_jnr")
-                os.makedirs(jnr_dir, exist_ok=True)
-                # Convert combo name-lists to index-lists for the plot
-                seen_idx = _convert_combination_names_to_indices(seen_combos_raw, self.class_names)
-                unseen_idx = _convert_combination_names_to_indices(unseen_combos_raw, self.class_names)
-                prefix = "persistence" if ablation_mode == "persistence" else f"persistence_{ablation_mode}"
-                self.plot_confusion_by_combination(
-                    all_labels_np, all_preds_np,
-                    save_path=os.path.join(jnr_dir, f"{prefix}_confusion_jnr_{jnr:+.0f}.png"),
-                    seen_combinations=seen_idx,
-                    unseen_combinations=unseen_idx,
-                )
-
-            # Free this JNR's data before loading the next one
-            del loader, ds
-
-        # Plot JNR metrics panel → save in by_jnr subfolder
-        if output_dir and all_jnr_metrics:
-            jnr_dir = os.path.join(output_dir, "by_jnr")
-            os.makedirs(jnr_dir, exist_ok=True)
-            prefix = "persistence" if ablation_mode == "persistence" else f"persistence_{ablation_mode}"
-            self.plot_jnr_metrics(jnr_results, save_path=os.path.join(jnr_dir, f'{prefix}_jnr_metrics.png'))
 
         return jnr_results
 
@@ -1007,8 +1088,10 @@ class PersistenceEvaluator:
 
         for jnr in jnrs:
             m = results[jnr]
-            total = m.get('total_samples', m.get('num_samples', 1))
-            acc = m.get('combination_accuracy', 0) / total if total > 0 else 0
+            n = m.get('num_samples', m.get('total_samples', 0))
+            acc = m.get('subset_accuracy', m.get('combination_accuracy', 0.0))
+            if isinstance(acc, (int, float)) and acc > 1.0 and n:
+                acc = acc / n
             accuracies.append(acc)
             f1_macros.append(m['f1_macro'])
             seen_accs.append(m.get('seen_accuracy', 0))
@@ -1104,7 +1187,8 @@ class PersistenceEvaluator:
                         configured_combs.append(ct)
             unique_combs = configured_combs
             print(f"\nUsing configured combinations: {len(unique_combs)} "
-                  f"(Seen: {len(seen_combinations or [])}, Unseen: {len(unseen_combinations or [])})")
+                  f"(Seen: {len(seen_combinations or [])}, Unseen: {len(unseen_combinations or [])})",
+                  flush=True)
         else:
             true_combs = [tuple(sorted(np.where(labels[i] == 1)[0].tolist()))
                           for i in range(len(labels))]
@@ -1161,7 +1245,7 @@ class PersistenceEvaluator:
         if save_path:
             os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Confusion matrix saved to {save_path}")
+            print(f"Confusion matrix saved to {save_path}", flush=True)
         else:
             plt.show()
         plt.close()
@@ -1367,48 +1451,39 @@ class PersistenceEvaluator:
     # Print helpers
     # ------------------------------------------------------------------
 
-    def print_metrics(self, metrics: dict):
-        """Pretty-print evaluation metrics."""
-        print(f"\n{'='*60}")
-        print(f"Evaluation Results ({metrics.get('num_samples', '?')} samples)")
-        print(f"{'='*60}")
-        print(f"  F1_macro:       {metrics['f1_macro']:.4f}")
-        print(f"  F1_micro:       {metrics['f1_micro']:.4f}")
-        print(f"  F1_samples:     {metrics['f1_samples']:.4f}")
-        print(f"  Precision:      {metrics['precision']:.4f}")
-        print(f"  Recall:         {metrics['recall']:.4f}")
-        print(f"  Subset accuracy: {metrics['subset_accuracy']:.4f}")
-        if metrics.get('per_class_f1'):
-            print(f"\nPer-class F1:")
-            for cls_name, f1 in sorted(metrics['per_class_f1'].items()):
-                print(f"  {cls_name:8s}: {f1:.4f}")
+    def print_metrics(self, metrics: dict, title: str = "Evaluation Results"):
+        """Pretty-print evaluation metrics (unified MetricsBundle)."""
+        if isinstance(metrics.get("global"), dict) and "subset_accuracy" in metrics.get("global", {}):
+            print_metrics_report(metrics["global"], title=f"{title} — global")
+            if metrics.get("seen", {}).get("num_samples", 0):
+                print_metrics_report(metrics["seen"], title=f"{title} — seen subset")
+            if metrics.get("unseen", {}).get("num_samples", 0):
+                print_metrics_report(metrics["unseen"], title=f"{title} — unseen subset")
+            return
+        print_metrics_report(metrics, title=title)
 
     def print_jnr_results(self, results: dict, save_path: str = None):
-        """Print and optionally save per-JNR results table."""
-        print("\n" + "=" * 80)
-        print("Evaluation Results by JNR Level")
-        print("=" * 80)
-        print(f"{'JNR':>6} | {'Accuracy':>10} | {'F1_Macro':>10} | "
-              f"{'Seen_Acc':>10} | {'Unseen_Acc':>10} | {'Samples':>8}")
-        print("-" * 80)
+        """Print and optionally save per-JNR results table (rates only; no global)."""
+        print_jnr_metrics_table(results)
 
         lines = []
         for jnr, m in sorted(results.items()):
-            total = m.get('total_samples', m.get('num_samples', 1))
-            acc = m.get('combination_accuracy', 0) / total if total > 0 else 0
-            print(f"{jnr:>6} | {acc:>10.4f} | {m['f1_macro']:>10.4f} | "
-                  f"{m.get('seen_accuracy', 0):>10.4f} | "
-                  f"{m.get('unseen_accuracy', 0):>10.4f} | "
-                  f"{total:>8}")
-            lines.append(f"{jnr},{acc:.4f},{m['f1_macro']:.4f},"
-                        f"{m.get('seen_accuracy', 0):.4f},"
-                        f"{m.get('unseen_accuracy', 0):.4f},"
-                        f"{total}")
+            n = m.get('num_samples', m.get('total_samples', 0))
+            acc = m.get('subset_accuracy', m.get('combination_accuracy', 0.0))
+            if isinstance(acc, (int, float)) and acc > 1.0 and n:
+                acc = acc / n
+            lines.append(
+                f"{jnr},{acc:.4f},{m.get('f1_macro', 0):.4f},"
+                f"{m.get('seen_accuracy', 0):.4f},"
+                f"{m.get('unseen_accuracy', 0):.4f},"
+                f"{m.get('harmonic_mean', 0):.4f},"
+                f"{n}"
+            )
 
         if save_path:
             os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
             with open(save_path, 'w', encoding='utf-8') as f:
-                f.write("JNR,Accuracy,F1_Macro,Seen_Acc,Unseen_Acc,Samples\n")
+                f.write("JNR,SubsetAcc,F1_Macro,Seen_Acc,Unseen_Acc,HM,Samples\n")
                 f.write("\n".join(lines))
             print(f"\nResults saved to {save_path}")
 
@@ -1419,70 +1494,98 @@ class PersistenceEvaluator:
 
 def main():
     parser = argparse.ArgumentParser(description="Persistence Spectrum CLIP CZSL Evaluation")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to model checkpoint (.pt file)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to model checkpoint (.pt) — defaults to config evaluation.checkpoint")
     parser.add_argument("--config", type=str, default=None,
-                        help="Path to config file (default: use config from checkpoint)")
-    parser.add_argument("--mode", type=str, default="all",
+                        help="Path to config file (default: config.yaml)")
+    parser.add_argument("--mode", type=str, default=None,
                         choices=["all", "zero_shot", "by_combination", "by_jnr"],
-                        help="Evaluation mode: 'all'=zero_shot+by_combination, "
-                             "'by_jnr'=per-JNR breakdown")
-    parser.add_argument("--split", type=str, default="test",
-                        help="Data split to evaluate on")
+                        help="Evaluation mode (overrides config)")
+    parser.add_argument("--split", type=str, default=None,
+                        choices=["train", "val", "test"],
+                        help="Data split (overrides config)")
     parser.add_argument("--threshold", type=float, default=None,
                         help="Override prediction threshold")
-    parser.add_argument("--output_dir", type=str, default="results/persistence",
-                        help="Output directory for results and plots")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Output directory (overrides config)")
     parser.add_argument("--ablation_mode", type=str, default=None,
                         choices=["persistence", "stft", "fusion"],
-                        help="Override ablation mode from checkpoint config")
-    # Visualization flags (matching evaluate_czsl)
-    parser.add_argument("--visualize", action="store_true",
-                        help="Generate all visualizations (confusion, ROC, PR, t-SNE, UMAP)")
-    parser.add_argument("--tsne", action="store_true",
+                        help="Override ablation mode")
+    # Visualization flags
+    parser.add_argument("--visualize", action="store_true", default=None,
+                        help="Generate all visualizations")
+    parser.add_argument("--tsne", action="store_true", default=None,
                         help="Generate t-SNE visualization only")
-    parser.add_argument("--umap", action="store_true",
+    parser.add_argument("--umap", action="store_true", default=None,
                         help="Generate UMAP visualization only")
-    parser.add_argument("--roc", action="store_true",
+    parser.add_argument("--roc", action="store_true", default=None,
                         help="Generate ROC curves only")
-    parser.add_argument("--pr", action="store_true",
+    parser.add_argument("--pr", action="store_true", default=None,
                         help="Generate PR curves only")
+    parser.add_argument("--print_samples", action="store_true", default=None,
+                        help="Print true and predicted labels for every sample")
+    parser.add_argument("--combo_only", action="store_true", default=None,
+                        help="Use only combination texts (no single-class) for zero_shot cache")
     args = parser.parse_args()
 
-    checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    # ── Load config ──
+    default_config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
+    config_path = args.config or default_config_path
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        print(f"Loaded config from: {config_path}")
+    else:
+        config = {}
+        print("No config file found, using CLI args only")
+
+    # ── Resolve checkpoint path: CLI > config > error ──
+    eval_cfg = config.get('evaluation', {})
+    checkpoint_path = args.checkpoint or eval_cfg.get('checkpoint')
+    if not checkpoint_path:
+        raise ValueError(
+            "No checkpoint specified. Set --checkpoint or add evaluation.checkpoint to config.yaml"
+        )
+    print(f"Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load config — default to config.yaml, checkpoint config as fallback
-    default_config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
-    if args.config:
-        config_path = args.config
-    elif os.path.exists(default_config_path):
-        config_path = default_config_path
-    else:
-        config = checkpoint.get('config', {})
-        if not config:
-            raise ValueError("No config found and --config not specified")
-        config_path = None
+    # ── Merge ablation mode from checkpoint if config doesn't have it ──
+    if 'ablation' not in config:
+        ckpt_ablation = checkpoint.get('config', {}).get('ablation', {})
+        if ckpt_ablation:
+            config['ablation'] = ckpt_ablation
 
-    if config_path:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-        # Merge ablation mode from checkpoint if present (allows training-time mode to carry over)
-        if 'ablation' not in config:
-            ckpt_ablation = checkpoint.get('config', {}).get('ablation', {})
-            if ckpt_ablation:
-                config['ablation'] = ckpt_ablation
+    # ── Resolve all params: CLI > config > default ──
+    ablation_cfg = config.get('ablation', {})
+    ablation_mode = args.ablation_mode or ablation_cfg.get('mode', 'persistence')
 
-    # Detect ablation mode (CLI override takes precedence)
-    ablation_config = config.get('ablation', {})
-    ablation_mode = args.ablation_mode or ablation_config.get('mode', 'persistence')
+    mode = args.mode or eval_cfg.get('mode', 'all')
+    split = args.split or eval_cfg.get('split', 'test')
+    threshold = args.threshold if args.threshold is not None else eval_cfg.get('threshold')
+    print_samples = args.print_samples if args.print_samples is not None else False
+    combo_only = args.combo_only if args.combo_only is not None else eval_cfg.get('combo_only', False)
+    output_dir_str = args.output_dir or eval_cfg.get('output_dir', 'results/persistence')
+
+    # Visualization flags: CLI --flag (explicitly set) > config > false
+    def _viz_flag(cli_val, config_key):
+        if cli_val is not None:
+            return cli_val
+        return eval_cfg.get(config_key, False)
+    do_viz = _viz_flag(args.visualize, 'visualize')
+    do_tsne = _viz_flag(args.tsne, 'tsne')
+    do_umap = _viz_flag(args.umap, 'umap')
+    do_roc = _viz_flag(args.roc, 'roc')
+    do_pr = _viz_flag(args.pr, 'pr')
+
     print(f"Ablation mode: {ablation_mode}")
+    print(f"Mode: {mode}, Split: {split}, Threshold: {threshold}")
 
-    # Mode-aware output directory — isolate results per mode
-    output_dir = Path(args.output_dir)
-    if ablation_mode != 'persistence' and args.output_dir == "results/persistence":
-        # Auto-suffix default output dir with mode
+    # ── Mode-aware output directory ──
+    output_dir = Path(output_dir_str)
+    if ablation_mode != 'persistence' and output_dir_str == "results/persistence":
         output_dir = Path(f"results/persistence_{ablation_mode}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1502,12 +1605,28 @@ def main():
     # Cache text features
     czsl_config = config.get("czsl", {})
     _seen_raw = _unwrap_combinations(czsl_config.get("seen_combinations", None), 'seen_combinations')
-    seen_comb_names = _seen_raw if _seen_raw else None
+    seen_comb_names = _seen_raw if _seen_raw else []
+    _unseen_raw = _unwrap_combinations(czsl_config.get("unseen_combinations", None), 'unseen_combinations')
+    unseen_comb_names = _unseen_raw if _unseen_raw else []
+    # Merge seen + unseen → the full set of class/combinations we want in the cache
+    # e.g. 17 single-class + 72 unseen combos = 89 text entries
+    all_comb_names = seen_comb_names + unseen_comb_names
+    print(f"CZSL text cache: {len(seen_comb_names)} seen + {len(unseen_comb_names)} unseen "
+          f"= {len(all_comb_names)} total class/combinations")
+
     model.cache_text_features(
         max_combination_size=2,
-        include_single=True,
-        seen_combinations=seen_comb_names,
+        include_single=not combo_only,
+        # combo_only: cache ALL 2-class combos indiscriminately — for testing
+        # whether the model can recognize single jamming via combo texts only.
+        seen_combinations=None if combo_only else (all_comb_names if all_comb_names else None),
     )
+
+    if combo_only:
+        print("⚠ combo_only=True: using only combination texts (no single-class) for zero_shot cache")
+        if mode in ("by_combination", "all"):
+            print("⚠ WARNING: by_combination/all modes use single-class features for _predict_batch; "
+                  "results may be incorrect with combo_only")
 
     evaluator = PersistenceEvaluator(model, config, device)
 
@@ -1518,247 +1637,327 @@ def main():
     unseen_combinations = _convert_combination_names_to_indices(unseen_comb_names, class_names)
 
     # ==================================================================
-    # Mode: all — zero_shot + by_combination (like evaluate_czsl)
+    # Mode: all — unified (zero_shot + by_jnr) + by_combination
     # ==================================================================
-    if args.mode == "all":
-        # ── 1) Zero-Shot ──
+    if mode == "all":
+        # ── 1) Unified pass: zero_shot + by_jnr simultaneously ──
         print(f"\n{'='*60}")
-        print(f"  [1/3] Zero-Shot Evaluation on {args.split}")
+        print(f"  [1/2] Unified Evaluation (zero_shot + by_jnr) on {split}")
         print(f"{'='*60}")
-        results_zs = evaluator.evaluate_zero_shot(
-            config=config, split=args.split, ablation_mode=ablation_mode,
-            threshold=args.threshold)
-        evaluator.print_metrics(results_zs["metrics"])
+        unified = evaluator._evaluate_unified_per_jnr(
+            config=config, split=split, ablation_mode=ablation_mode,
+            output_dir=str(output_dir),
+            collect_per_jnr=True,
+            print_samples=print_samples,
+            predict_mode="combo_top1",
+        )
+        global_data = unified['global']
+        jnr_results = unified['per_jnr']
 
-        np.savez(str(output_dir / f"{mode_prefix}_zeroshot_{args.split}.npz"),
-                 labels=results_zs["labels"],
-                 predictions=results_zs["predictions"],
-                 features=results_zs["features"])
+        # Zero-shot metrics from global accumulation (separate JSON from by_jnr)
+        zs_metrics = evaluator._compute_multilabel_metrics(
+            global_data['labels'], global_data['predictions'],
+            y_prob=global_data.get('probabilities'),
+        )
+        evaluator.print_metrics(zs_metrics, title="Zero-Shot Evaluation Results")
+        save_metrics_json(
+            zs_metrics, output_dir,
+            filename=f"metrics_zero_shot_{split}.json",
+            mode="zero_shot", split=split,
+            extra_meta={"checkpoint": str(checkpoint_path), "ablation_mode": ablation_mode},
+        )
 
-        if args.visualize:
+        np.savez(str(output_dir / f"{mode_prefix}_zeroshot_{split}.npz"),
+                 labels=global_data["labels"],
+                 predictions=global_data["predictions"],
+                 features=global_data["features"])
+
+        print(f"\n[DEBUG ZS] Calling plot_confusion_by_combination: labels={global_data['labels'].shape}, preds={global_data['predictions'].shape}", flush=True)
+        # Clear any accumulated matplotlib state from per-JNR plots
+        import matplotlib.pyplot as _plt
+        _plt.close('all')
+        try:
             evaluator.plot_confusion_by_combination(
-                results_zs["labels"], results_zs["predictions"],
-                save_path=str(output_dir / f"{mode_prefix}_confusion_zs_{args.split}.png"),
+                global_data["labels"], global_data["predictions"],
+                save_path=str(output_dir / f"{mode_prefix}_confusion_zs_{split}.png"),
                 seen_combinations=seen_combinations,
                 unseen_combinations=unseen_combinations,
             )
-        if args.visualize or args.roc:
+            print(f"[DEBUG ZS] plot_confusion_by_combination OK", flush=True)
+        except Exception as e:
+            print(f"[DEBUG ZS] plot_confusion_by_combination FAILED: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+        if do_viz or do_roc:
             plot_roc_curves(
-                results_zs["labels"], results_zs["probabilities"], class_names,
-                save_dir=str(output_dir), prefix=f"{mode_prefix}_{args.split}_zs",
-                mode_title=f"zero_shot ({args.split})",
+                global_data["labels"], global_data["probabilities"], class_names,
+                save_dir=str(output_dir), prefix=f"{mode_prefix}_{split}_zs",
+                mode_title=f"zero_shot ({split})",
             )
-        if args.visualize or args.pr:
+        if do_viz or do_pr:
             plot_pr_curves(
-                results_zs["labels"], results_zs["probabilities"], class_names,
-                save_dir=str(output_dir), prefix=f"{mode_prefix}_{args.split}_zs",
-                mode_title=f"zero_shot ({args.split})",
+                global_data["labels"], global_data["probabilities"], class_names,
+                save_dir=str(output_dir), prefix=f"{mode_prefix}_{split}_zs",
+                mode_title=f"zero_shot ({split})",
             )
-        if args.tsne:
+        if do_tsne:
             print("\nGenerating t-SNE (zero-shot)...")
             evaluator.plot_feature_tsne(
-                results_zs["features"], results_zs["labels"],
-                save_path=str(output_dir / f"{mode_prefix}_tsne_{args.split}.png"),
+                global_data["features"], global_data["labels"],
+                save_path=str(output_dir / f"{mode_prefix}_tsne_{split}.png"),
                 seen_combinations=seen_combinations,
                 unseen_combinations=unseen_combinations,
             )
-        if args.umap:
+        if do_umap:
             print("\nGenerating UMAP (zero-shot)...")
             evaluator.plot_feature_umap(
-                results_zs["features"], results_zs["labels"],
-                save_path=str(output_dir / f"{mode_prefix}_umap_{args.split}.png"),
+                global_data["features"], global_data["labels"],
+                save_path=str(output_dir / f"{mode_prefix}_umap_{split}.png"),
                 seen_combinations=seen_combinations,
                 unseen_combinations=unseen_combinations,
             )
-        if args.visualize:
+        if do_viz:
             evaluator.plot_label_cooccurrence(
-                results_zs["labels"], results_zs["predictions"],
-                save_path=str(output_dir / f"{mode_prefix}_cooccurrence_{args.split}.png"),
+                global_data["labels"], global_data["predictions"],
+                save_path=str(output_dir / f"{mode_prefix}_cooccurrence_{split}.png"),
             )
 
-        # ── 2) By-Combination ──
-        print(f"\n{'='*60}")
-        print(f"  [2/3] By-Combination Evaluation on {args.split}")
-        print(f"{'='*60}")
-        results_bc = evaluator.evaluate_by_combination(
-            config=config, split=args.split, ablation_mode=ablation_mode,
-            threshold=args.threshold)
-
-        bc_labels = results_bc.get('_labels')
-        bc_preds = results_bc.get('_predictions')
-        bc_probs = results_bc.get('_probabilities')
-        bc_feats = results_bc.get('_features')
-
-        if bc_labels is not None:
-            np.savez(str(output_dir / f"{mode_prefix}_bycombo_{args.split}.npz"),
-                     labels=bc_labels, predictions=bc_preds, features=bc_feats)
-
-            if args.visualize:
-                evaluator.plot_confusion_by_combination(
-                    bc_labels, bc_preds,
-                    save_path=str(output_dir / f"{mode_prefix}_confusion_bc_{args.split}.png"),
-                    seen_combinations=seen_combinations,
-                    unseen_combinations=unseen_combinations,
-                )
-            if args.visualize or args.roc:
-                plot_roc_curves(
-                    bc_labels, bc_probs, class_names,
-                    save_dir=str(output_dir), prefix=f"{mode_prefix}_{args.split}_byc",
-                    mode_title=f"by_combination ({args.split})",
-                )
-            if args.visualize or args.pr:
-                plot_pr_curves(
-                    bc_labels, bc_probs, class_names,
-                    save_dir=str(output_dir), prefix=f"{mode_prefix}_{args.split}_byc",
-                    mode_title=f"by_combination ({args.split})",
-                )
-
-        # ── 3) By-JNR ──
-        print(f"\n{'='*60}")
-        print(f"  [3/3] By-JNR Evaluation on {args.split}")
-        print(f"{'='*60}")
-        results_jnr = evaluator.evaluate_by_jnr(
-            config=config, split=args.split, ablation_mode=ablation_mode,
-            threshold=args.threshold, output_dir=str(output_dir),
-        )
+        # By-JNR output only (no global mixed into by_jnr JSON — decision E)
         evaluator.print_jnr_results(
-            results_jnr,
-            save_path=str(output_dir / "by_jnr" / f"{mode_prefix}_jnr_results_{args.split}.csv"),
+            jnr_results,
+            save_path=str(output_dir / "by_jnr" / f"{mode_prefix}_jnr_results_{split}.csv"),
+        )
+        jnr_json = {}
+        for jnr, m in jnr_results.items():
+            jnr_json[str(jnr)] = {
+                k: v for k, v in m.items()
+                if k not in ("labels", "probabilities", "features",
+                             "per_class_recall", "per_class_precision", "per_class_f1")
+            }
+        save_metrics_json(
+            {"per_jnr": jnr_json}, output_dir,
+            filename=f"metrics_by_jnr_{split}.json",
+            mode="by_jnr", split=split,
+            extra_meta={"checkpoint": str(checkpoint_path), "ablation_mode": ablation_mode},
         )
         # Per-JNR ROC / PR curves
-        do_jnr_curves = args.visualize or args.roc or args.pr
+        do_jnr_curves = do_viz or do_roc or do_pr
         if do_jnr_curves:
             jnr_viz_dir = str(output_dir / "by_jnr")
-            for jnr_val, jnr_result in sorted(results_jnr.items()):
+            for jnr_val, jnr_result in sorted(jnr_results.items()):
                 if "probabilities" in jnr_result and jnr_result["probabilities"].size > 0:
-                    prefix = f"{mode_prefix}_jnr_{jnr_val:+.0f}_{args.split}"
-                    if args.visualize or args.roc:
+                    prefix = f"{mode_prefix}_jnr_{jnr_val:+.0f}_{split}"
+                    if do_viz or do_roc:
                         plot_roc_curves(
                             jnr_result["labels"], jnr_result["probabilities"],
                             class_names, save_dir=jnr_viz_dir, prefix=prefix,
                             mode_title=f"JNR={jnr_val:+d}",
                         )
-                    if args.visualize or args.pr:
+                    if do_viz or do_pr:
                         plot_pr_curves(
                             jnr_result["labels"], jnr_result["probabilities"],
                             class_names, save_dir=jnr_viz_dir, prefix=prefix,
                             mode_title=f"JNR={jnr_val:+d}",
                         )
 
+        # ── 2) By-Combination (separate pass — uses single-class _predict_batch) ──
+        print(f"\n{'='*60}")
+        print(f"  [2/2] By-Combination Evaluation on {split}")
+        print(f"{'='*60}")
+        results_bc = evaluator.evaluate_by_combination(
+            config=config, split=split, ablation_mode=ablation_mode,
+            threshold=threshold, print_samples=print_samples)
+
+        bc_labels = results_bc.get('_labels')
+        bc_preds = results_bc.get('_predictions')
+        bc_probs = results_bc.get('_probabilities')
+        bc_feats = results_bc.get('_features')
+
+        # JSON: global + seen + unseen subset bundles only
+        bc_export = {
+            "global": results_bc.get("global", {}),
+            "seen": results_bc.get("seen", {}),
+            "unseen": results_bc.get("unseen", {}),
+        }
+        save_metrics_json(
+            bc_export, output_dir,
+            filename=f"metrics_by_combination_{split}.json",
+            mode="by_combination", split=split,
+            extra_meta={"checkpoint": str(checkpoint_path), "ablation_mode": ablation_mode},
+        )
+
+        if bc_labels is not None:
+            np.savez(str(output_dir / f"{mode_prefix}_bycombo_{split}.npz"),
+                     labels=bc_labels, predictions=bc_preds, features=bc_feats)
+
+            print(f"\n[DEBUG BC] Calling plot_confusion_by_combination: labels={bc_labels.shape}, preds={bc_preds.shape}", flush=True)
+            import matplotlib.pyplot as _plt; _plt.close('all')
+            try:
+                evaluator.plot_confusion_by_combination(
+                    bc_labels, bc_preds,
+                    save_path=str(output_dir / f"{mode_prefix}_confusion_bc_{split}.png"),
+                    seen_combinations=seen_combinations,
+                    unseen_combinations=unseen_combinations,
+                )
+                print(f"[DEBUG BC] plot_confusion_by_combination OK", flush=True)
+            except Exception as e:
+                print(f"[DEBUG BC] FAILED: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+
+            if do_viz or do_roc:
+                plot_roc_curves(
+                    bc_labels, bc_probs, class_names,
+                    save_dir=str(output_dir), prefix=f"{mode_prefix}_{split}_byc",
+                    mode_title=f"by_combination ({split})",
+                )
+            if do_viz or do_pr:
+                plot_pr_curves(
+                    bc_labels, bc_probs, class_names,
+                    save_dir=str(output_dir), prefix=f"{mode_prefix}_{split}_byc",
+                    mode_title=f"by_combination ({split})",
+                )
+
     # ==================================================================
     # Mode: zero_shot
     # ==================================================================
-    elif args.mode == "zero_shot":
+    elif mode == "zero_shot":
         print(f"\n{'='*60}")
-        print(f"Zero-Shot Evaluation on {args.split} split")
+        print(f"Zero-Shot Evaluation on {split} split")
         print(f"{'='*60}")
 
         results = evaluator.evaluate_zero_shot(
-            config=config, split=args.split, ablation_mode=ablation_mode,
-            threshold=args.threshold)
-        evaluator.print_metrics(results["metrics"])
+            config=config, split=split, ablation_mode=ablation_mode,
+            threshold=threshold, print_samples=print_samples)
+        evaluator.print_metrics(results["metrics"], title="Zero-Shot Evaluation Results")
+        save_metrics_json(
+            results["metrics"], output_dir,
+            filename=f"metrics_zero_shot_{split}.json",
+            mode="zero_shot", split=split,
+            extra_meta={"checkpoint": str(checkpoint_path), "ablation_mode": ablation_mode},
+        )
 
-        np.savez(str(output_dir / f"{mode_prefix}_zeroshot_{args.split}.npz"),
+        np.savez(str(output_dir / f"{mode_prefix}_zeroshot_{split}.npz"),
                  labels=results["labels"],
                  predictions=results["predictions"],
                  features=results["features"])
 
-        if args.visualize:
-            evaluator.plot_confusion_by_combination(
-                results["labels"], results["predictions"],
-                save_path=str(output_dir / f"{mode_prefix}_confusion_zs_{args.split}.png"),
-                seen_combinations=seen_combinations,
-                unseen_combinations=unseen_combinations,
-            )
-        if args.visualize or args.roc:
+        evaluator.plot_confusion_by_combination(
+            results["labels"], results["predictions"],
+            save_path=str(output_dir / f"{mode_prefix}_confusion_zs_{split}.png"),
+            seen_combinations=seen_combinations,
+            unseen_combinations=unseen_combinations,
+        )
+        if do_viz or do_roc:
             plot_roc_curves(
                 results["labels"], results["probabilities"], class_names,
-                save_dir=str(output_dir), prefix=f"{mode_prefix}_{args.split}_zs",
-                mode_title=f"zero_shot ({args.split})",
+                save_dir=str(output_dir), prefix=f"{mode_prefix}_{split}_zs",
+                mode_title=f"zero_shot ({split})",
             )
-        if args.visualize or args.pr:
+        if do_viz or do_pr:
             plot_pr_curves(
                 results["labels"], results["probabilities"], class_names,
-                save_dir=str(output_dir), prefix=f"{mode_prefix}_{args.split}_zs",
-                mode_title=f"zero_shot ({args.split})",
+                save_dir=str(output_dir), prefix=f"{mode_prefix}_{split}_zs",
+                mode_title=f"zero_shot ({split})",
             )
-        if args.tsne:
+        if do_tsne:
             print("\nGenerating t-SNE...")
             evaluator.plot_feature_tsne(
                 results["features"], results["labels"],
-                save_path=str(output_dir / f"{mode_prefix}_tsne_{args.split}.png"),
+                save_path=str(output_dir / f"{mode_prefix}_tsne_{split}.png"),
                 seen_combinations=seen_combinations,
                 unseen_combinations=unseen_combinations,
             )
-        if args.umap:
+        if do_umap:
             print("\nGenerating UMAP...")
             evaluator.plot_feature_umap(
                 results["features"], results["labels"],
-                save_path=str(output_dir / f"{mode_prefix}_umap_{args.split}.png"),
+                save_path=str(output_dir / f"{mode_prefix}_umap_{split}.png"),
                 seen_combinations=seen_combinations,
                 unseen_combinations=unseen_combinations,
             )
-        if args.visualize:
+        if do_viz:
             evaluator.plot_label_cooccurrence(
                 results["labels"], results["predictions"],
-                save_path=str(output_dir / f"{mode_prefix}_cooccurrence_{args.split}.png"),
+                save_path=str(output_dir / f"{mode_prefix}_cooccurrence_{split}.png"),
             )
 
     # ==================================================================
     # Mode: by_combination
     # ==================================================================
-    elif args.mode == "by_combination":
+    elif mode == "by_combination":
         print(f"\n{'='*60}")
-        print(f"By-Combination Evaluation on {args.split} split")
+        print(f"By-Combination Evaluation on {split} split")
         print(f"{'='*60}")
 
         results = evaluator.evaluate_by_combination(
-            config=config, split=args.split, ablation_mode=ablation_mode,
-            threshold=args.threshold)
+            config=config, split=split, ablation_mode=ablation_mode,
+            threshold=threshold, print_samples=print_samples)
 
         bc_labels = results.get('_labels')
         bc_preds = results.get('_predictions')
         bc_probs = results.get('_probabilities')
         bc_feats = results.get('_features')
 
+        save_metrics_json(
+            {
+                "global": results.get("global", {}),
+                "seen": results.get("seen", {}),
+                "unseen": results.get("unseen", {}),
+            },
+            output_dir,
+            filename=f"metrics_by_combination_{split}.json",
+            mode="by_combination", split=split,
+            extra_meta={"checkpoint": str(checkpoint_path), "ablation_mode": ablation_mode},
+        )
+
         if bc_labels is not None:
-            np.savez(str(output_dir / f"{mode_prefix}_bycombo_{args.split}.npz"),
+            np.savez(str(output_dir / f"{mode_prefix}_bycombo_{split}.npz"),
                      labels=bc_labels, predictions=bc_preds, features=bc_feats)
 
-            if args.visualize:
+            print(f"\n[DEBUG BC] Calling plot_confusion_by_combination: labels={bc_labels.shape}, preds={bc_preds.shape}", flush=True)
+            import matplotlib.pyplot as _plt; _plt.close('all')
+            try:
                 evaluator.plot_confusion_by_combination(
                     bc_labels, bc_preds,
-                    save_path=str(output_dir / f"{mode_prefix}_confusion_bc_{args.split}.png"),
+                    save_path=str(output_dir / f"{mode_prefix}_confusion_bc_{split}.png"),
                     seen_combinations=seen_combinations,
                     unseen_combinations=unseen_combinations,
                 )
-            if args.visualize or args.roc:
+                print(f"[DEBUG BC] plot_confusion_by_combination OK", flush=True)
+            except Exception as e:
+                print(f"[DEBUG BC] FAILED: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+
+            if do_viz or do_roc:
                 plot_roc_curves(
                     bc_labels, bc_probs, class_names,
-                    save_dir=str(output_dir), prefix=f"{mode_prefix}_{args.split}_byc",
-                    mode_title=f"by_combination ({args.split})",
+                    save_dir=str(output_dir), prefix=f"{mode_prefix}_{split}_byc",
+                    mode_title=f"by_combination ({split})",
                 )
-            if args.visualize or args.pr:
+            if do_viz or do_pr:
                 plot_pr_curves(
                     bc_labels, bc_probs, class_names,
-                    save_dir=str(output_dir), prefix=f"{mode_prefix}_{args.split}_byc",
-                    mode_title=f"by_combination ({args.split})",
+                    save_dir=str(output_dir), prefix=f"{mode_prefix}_{split}_byc",
+                    mode_title=f"by_combination ({split})",
                 )
 
     # ==================================================================
     # Mode: by_jnr
     # ==================================================================
-    elif args.mode == "by_jnr":
+    elif mode == "by_jnr":
         print(f"\n{'='*60}")
-        print(f"By-JNR Evaluation on {args.split} split")
+        print(f"By-JNR Evaluation on {split} split")
         print(f"{'='*60}")
 
         results = evaluator.evaluate_by_jnr(
             config=config,
-            split=args.split,
+            split=split,
             ablation_mode=ablation_mode,
-            threshold=args.threshold,
+            threshold=threshold,
             output_dir=str(output_dir),
+            print_samples=print_samples,
         )
 
         if not results:
@@ -1767,17 +1966,31 @@ def main():
 
         evaluator.print_jnr_results(
             results,
-            save_path=str(output_dir / "by_jnr" / f"{mode_prefix}_jnr_results_{args.split}.csv"),
+            save_path=str(output_dir / "by_jnr" / f"{mode_prefix}_jnr_results_{split}.csv"),
+        )
+        jnr_json = {
+            str(jnr): {
+                k: v for k, v in m.items()
+                if k not in ("labels", "probabilities", "features",
+                             "per_class_recall", "per_class_precision", "per_class_f1")
+            }
+            for jnr, m in results.items()
+        }
+        save_metrics_json(
+            {"per_jnr": jnr_json}, output_dir,
+            filename=f"metrics_by_jnr_{split}.json",
+            mode="by_jnr", split=split,
+            extra_meta={"checkpoint": str(checkpoint_path), "ablation_mode": ablation_mode},
         )
 
         # Per-JNR ROC / PR curves
-        do_jnr_curves = args.visualize or args.roc or args.pr
+        do_jnr_curves = do_viz or do_roc or do_pr
         if do_jnr_curves:
             jnr_viz_dir = str(output_dir / "by_jnr")
             for jnr_val, jnr_result in sorted(results.items()):
                 if "probabilities" in jnr_result and jnr_result["probabilities"].size > 0:
-                    prefix = f"{mode_prefix}_jnr_{jnr_val:+.0f}_{args.split}"
-                    if args.visualize or args.roc:
+                    prefix = f"{mode_prefix}_jnr_{jnr_val:+.0f}_{split}"
+                    if do_viz or do_roc:
                         plot_roc_curves(
                             jnr_result["labels"],
                             jnr_result["probabilities"],
@@ -1786,7 +1999,7 @@ def main():
                             prefix=prefix,
                             mode_title=f"JNR={jnr_val:+d}",
                         )
-                    if args.visualize or args.pr:
+                    if do_viz or do_pr:
                         plot_pr_curves(
                             jnr_result["labels"],
                             jnr_result["probabilities"],

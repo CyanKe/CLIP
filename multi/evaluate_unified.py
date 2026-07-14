@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import (
     f1_score, precision_score, recall_score, accuracy_score,
-    confusion_matrix, roc_curve, auc
+    confusion_matrix, roc_curve, auc, precision_recall_curve, average_precision_score
 )
 from sklearn.manifold import TSNE
 
@@ -136,6 +136,103 @@ def plot_roc_curves(
         path = os.path.join(save_dir, f"{prefix}_roc_average.png")
         plt.savefig(path, dpi=150, bbox_inches='tight')
         print(f"Average ROC saved to {path}")
+    else:
+        plt.show()
+    plt.close()
+
+
+def plot_pr_curves(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    class_names: list,
+    save_dir: str = None,
+    prefix: str = "pr",
+    mode_title: str = ""
+):
+    """
+    绘制 Precision-Recall 曲线
+
+    生成两张图:
+      1. {prefix}_pr_per_class.png — 每个类别不同颜色的 PR 曲线
+      2. {prefix}_pr_average.png  — Micro/Macro 平均 PR 曲线
+
+    Args:
+        labels: one-hot 标签 [n_samples, n_classes]
+        probabilities: softmax 概率 [n_samples, n_classes]
+        class_names: 类别名称列表
+        save_dir: 保存目录（None 则显示）
+        prefix: 文件名前缀
+        mode_title: 标题后缀
+    """
+    n_classes = labels.shape[1]
+
+    precision_dict, recall_dict, ap_dict = {}, {}, {}
+    for i in range(n_classes):
+        if np.sum(labels[:, i]) == 0:
+            continue
+        precision_dict[i], recall_dict[i], _ = precision_recall_curve(
+            labels[:, i], probabilities[:, i]
+        )
+        ap_dict[i] = average_precision_score(labels[:, i], probabilities[:, i])
+
+    precision_micro, recall_micro, _ = precision_recall_curve(
+        labels.ravel(), probabilities.ravel()
+    )
+    ap_micro = average_precision_score(labels.ravel(), probabilities.ravel())
+
+    all_recall = np.unique(np.concatenate([recall_dict[i] for i in recall_dict]))
+    mean_precision = np.zeros_like(all_recall)
+    for i in precision_dict:
+        mean_precision += np.interp(all_recall, recall_dict[i][::-1], precision_dict[i][::-1])
+    mean_precision /= len(precision_dict)
+    ap_macro = np.trapezoid(mean_precision, all_recall)
+
+    baseline = labels.sum() / labels.size
+    title_suffix = f" ({mode_title})" if mode_title else ""
+
+    # Per-class PR
+    colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    fig, ax = plt.subplots(figsize=(8, 7))
+    for idx, i in enumerate(precision_dict):
+        color = colors[idx % 10]
+        ax.plot(recall_dict[i], precision_dict[i], color=color, linewidth=1.2,
+                label=f'{class_names[i]} (AP={ap_dict[i]:.3f})')
+    ax.axhline(y=baseline, color='navy', linewidth=1.0, linestyle=':', alpha=0.7,
+               label=f'Baseline ({baseline:.3f})')
+    ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
+    ax.set_xlabel('Recall', fontsize=12)
+    ax.set_ylabel('Precision', fontsize=12)
+    ax.set_title(f'Per-class Precision-Recall Curves{title_suffix}', fontsize=14)
+    ax.legend(loc='lower left', fontsize=7, ncol=1)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    if save_dir:
+        path = os.path.join(save_dir, f"{prefix}_pr_per_class.png")
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        print(f"Per-class PR saved to {path}")
+    else:
+        plt.show()
+    plt.close()
+
+    # Average PR
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.plot(recall_micro, precision_micro, color='darkorange', linewidth=2.5,
+            label=f'Micro-average (AP={ap_micro:.3f})')
+    ax.plot(all_recall, mean_precision, color='darkgreen', linewidth=2.5, linestyle='--',
+            label=f'Macro-average (AP={ap_macro:.3f})')
+    ax.axhline(y=baseline, color='navy', linewidth=1.0, linestyle=':', alpha=0.7,
+               label=f'Baseline ({baseline:.3f})')
+    ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
+    ax.set_xlabel('Recall', fontsize=12)
+    ax.set_ylabel('Precision', fontsize=12)
+    ax.set_title(f'Average Precision-Recall Curves{title_suffix}', fontsize=14)
+    ax.legend(loc='lower left', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    if save_dir:
+        path = os.path.join(save_dir, f"{prefix}_pr_average.png")
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        print(f"Average PR saved to {path}")
     else:
         plt.show()
     plt.close()
@@ -537,6 +634,9 @@ class EvaluationStrategy(ABC):
     @abstractmethod
     def run_visualizations(self, model: nn.Module, results: dict, output_dir: Path, **kwargs): ...
 
+    def run_tsne_visualizations(self, model: nn.Module, results: dict, output_dir: Path, **kwargs):
+        """Override in subclasses that need t-SNE/UMAP visualization."""
+
 
 # ============================================================================
 # CZSLEvaluationStrategy
@@ -930,25 +1030,44 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
         preds = results["predictions"]
         features = results.get("features")
         split = kwargs.get("split", "test")
+        do_confusion = kwargs.get("do_confusion", True)
+        do_roc = kwargs.get("do_roc", True)
+        do_pr = kwargs.get("do_pr", True)
 
-        # Combination confusion matrix
-        seen_combos = convert_combination_names_to_indices(self.seen_combinations, self.class_names)
-        unseen_combos = convert_combination_names_to_indices(self.unseen_combinations, self.class_names)
+        if do_confusion:
+            # Combination confusion matrix
+            seen_combos = convert_combination_names_to_indices(self.seen_combinations, self.class_names)
+            unseen_combos = convert_combination_names_to_indices(self.unseen_combinations, self.class_names)
+            self._plot_combination_confusion(
+                labels, preds, output_dir / f"czsl_confusion_{split}.png",
+                seen_combos, unseen_combos
+            )
 
-        self._plot_combination_confusion(
-            labels, preds, output_dir / f"czsl_confusion_{split}.png",
-            seen_combos, unseen_combos
-        )
-
-        # ROC curves
-        if "probabilities" in results:
+        # ROC curves & PR curves
+        if do_roc and "probabilities" in results:
             plot_roc_curves(
                 labels, results["probabilities"], self.class_names,
                 save_dir=str(output_dir), prefix="czsl", mode_title=split
             )
+        if do_pr and "probabilities" in results:
+            plot_pr_curves(
+                labels, results["probabilities"], self.class_names,
+                save_dir=str(output_dir), prefix="czsl", mode_title=split
+            )
+
+    def run_tsne_visualizations(self, model: nn.Module, results: dict, output_dir: Path, **kwargs):
+        labels = results["labels"]
+        preds = results["predictions"]
+        features = results.get("features")
+        split = kwargs.get("split", "test")
+        do_tsne = kwargs.get("do_tsne", True)
+        do_umap = kwargs.get("do_umap", False)
+
+        seen_combos = convert_combination_names_to_indices(self.seen_combinations, self.class_names)
+        unseen_combos = convert_combination_names_to_indices(self.unseen_combinations, self.class_names)
 
         # t-SNE
-        if features is not None and len(features) > 10:
+        if do_tsne and features is not None and len(features) > 10:
             print("Computing t-SNE...")
             perplexity = min(30, len(features) - 1)
             tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
@@ -977,21 +1096,39 @@ class CZSLEvaluationStrategy(EvaluationStrategy):
             plt.close()
             print(f"t-SNE plot saved")
 
-        # Label co-occurrence
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-        nc = labels.shape[1]
-        sns.heatmap((labels.T @ labels).astype(int), annot=True, fmt='d', cmap='Blues',
-                    xticklabels=self.class_names[:nc], yticklabels=self.class_names[:nc], ax=axes[0])
-        axes[0].set_title('True Label Co-occurrence')
-        axes[0].tick_params(axis='x', rotation=45)
-        sns.heatmap((preds.T @ preds).astype(int), annot=True, fmt='d', cmap='Greens',
-                    xticklabels=self.class_names[:nc], yticklabels=self.class_names[:nc], ax=axes[1])
-        axes[1].set_title('Predicted Label Co-occurrence')
-        axes[1].tick_params(axis='x', rotation=45)
-        plt.tight_layout()
-        plt.savefig(str(output_dir / f"czsl_cooccurrence_{split}.png"), dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Co-occurrence plot saved")
+        # UMAP
+        if do_umap and features is not None and len(features) > 10:
+            try:
+                import umap
+                print("Computing UMAP...")
+                reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, len(features) - 1))
+                features_2d = reducer.fit_transform(features)
+                comb_labels = [tuple(sorted(np.where(label == 1)[0].tolist())) for label in labels]
+                seen_set = set(tuple(sorted(c)) for c in seen_combos)
+                unseen_set = set(tuple(sorted(c)) for c in unseen_combos)
+                unique_combs = sorted(set(comb_labels))
+
+                fig, ax = plt.subplots(figsize=(14, 10))
+                colors = plt.cm.tab20(np.linspace(0, 1, max(20, len(unique_combs))))
+                for idx, comb in enumerate(unique_combs):
+                    mask = np.array([c == comb for c in comb_labels])
+                    if mask.sum() > 0:
+                        name = "+".join([self.class_names[i] for i in comb]) if comb else "None"
+                        marker = '^' if comb in unseen_set else ('o' if comb in seen_set else 's')
+                        prefix = "[U] " if comb in unseen_set else ("[S] " if comb in seen_set else "")
+                        ax.scatter(features_2d[mask, 0], features_2d[mask, 1],
+                                   c=[colors[idx % 20]], label=f"{prefix}{name}", alpha=0.6, s=30, marker=marker)
+                ax.set_xlabel('UMAP 1'); ax.set_ylabel('UMAP 2')
+                ax.set_title(f'Feature Space (UMAP) - [S]=Seen, [U]=Unseen')
+                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(str(output_dir / f"czsl_umap_{split}.png"), dpi=150, bbox_inches='tight')
+                plt.close()
+                print(f"UMAP plot saved")
+            except ImportError:
+                print("UMAP not installed, skipping UMAP plot")
+
 
     def _plot_combination_confusion(self, labels, preds, save_path, seen_combos, unseen_combos):
         true_combs = [tuple(sorted(np.where(labels[i] == 1)[0].tolist())) for i in range(len(labels))]
@@ -1224,7 +1361,16 @@ def main():
     parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--visualize", action="store_true")
+    parser.add_argument("--visualize", action="store_true",
+                        help="Generate all visualizations (confusion matrix, ROC, PR, t-SNE, UMAP)")
+    parser.add_argument("--tsne", action="store_true",
+                        help="Generate t-SNE visualization only")
+    parser.add_argument("--umap", action="store_true",
+                        help="Generate UMAP visualization only")
+    parser.add_argument("--roc", action="store_true",
+                        help="Generate ROC curves only")
+    parser.add_argument("--pr", action="store_true",
+                        help="Generate PR curves only")
     parser.add_argument("--save_stft", action="store_true")
     parser.add_argument("--max_stft_samples", type=int, default=100)
     parser.add_argument("--original-clip", action="store_true", help="Use original untrained CLIP (baseline)")
@@ -1305,10 +1451,24 @@ def main():
         with open(output_dir / f"{label}_results_{args.split}.json", 'w', encoding='utf-8') as f:
             json.dump(metrics_to_save, f, indent=2, ensure_ascii=False)
 
-    # Visualizations
-    if args.visualize:
-        print("\nGenerating visualizations...")
-        strategy.run_visualizations(model, results, output_dir, split=args.split)
+    # Visualizations: ROC, PR, confusion matrix
+    if args.visualize or args.roc or args.pr:
+        print("\nGenerating visualizations (ROC, PR, confusion matrix)...")
+        strategy.run_visualizations(
+            model, results, output_dir, split=args.split,
+            do_confusion=args.visualize,
+            do_roc=args.visualize or args.roc,
+            do_pr=args.visualize or args.pr,
+        )
+
+    # t-SNE / UMAP embedding visualizations
+    if args.visualize or args.tsne or args.umap:
+        print("\nGenerating t-SNE / UMAP visualizations...")
+        strategy.run_tsne_visualizations(
+            model, results, output_dir, split=args.split,
+            do_tsne=args.visualize or args.tsne,
+            do_umap=args.visualize or args.umap,
+        )
 
     # Save STFT images (dual-branch only)
     if args.save_stft and isinstance(strategy, DualBranchEvaluationStrategy):
