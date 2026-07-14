@@ -62,7 +62,7 @@ loss:
 
 # 数据配置
 data:
-  base_path: "E:\\912_cyan\\Jamming_signal_simulation\\output\\2D_8X9"
+  base_path: "D:\\VSCODE\\Jamming_signal_simulation\\output\\2D_8x9"
   jnr_start: 0
   jnr_end: 20
   jnr_step: 5
@@ -124,11 +124,25 @@ logging:
   tensorboard:
     log_dir: "runs/clip_czsl"
 
-# 评估配置
+# 评估配置（推理时 CLI 可覆盖；未传 CLI 时直接读这里，避免超长命令行）
+# 用法示例:
+#   python -m multi.evaluate_czsl
+#   python -m multi.evaluate_czsl --mode by_jnr --split test
+#   python -m multi.evaluate_czsl --checkpoint path/to.pt --roc --pr
 evaluation:
-  threshold: 0.5
-  save_predictions: true
-  visualize_embeddings: true
+  checkpoint: "checkpoints/RN50_both_8x9_best.pt"  # 模型检查点；也可用 CLI --checkpoint 覆盖
+  mode: "all"                    # all | by_jnr   (all = zero_shot + by_combination)
+  split: "test"                  # train | val | test
+  output_dir: "results/RN50_8x9"    # 结果输出目录
+  # 可视化开关（CLI --visualize / --roc 等可覆盖）
+  # 注意: 混淆矩阵、共现图始终绘制（zs + bc），不依赖下方开关
+  visualize: false               # 全量可视化（ROC/PR 也可由 roc/pr 单独开）
+  tsne: false                    # 仅 t-SNE
+  umap: false                    # 仅 UMAP
+  roc: true                      # 仅 ROC 曲线
+  pr: true                       # 仅 PR 曲线
+  save_stft: false               # 保存带预测的 STFT 图
+  max_stft_samples: null         # STFT 保存上限（null=全部）
 
 # 干扰类型定义
 jamming_classes:

@@ -12,7 +12,7 @@ model:
 
 # 训练配置
 train:
-  batch_size: 64
+  batch_size: 32
   epochs: 20
   lr: 0.0001                     # 1e-5
   weight_decay: 0.01
@@ -46,10 +46,10 @@ ablation:
 
 # 数据配置
 data:
-  base_path: "E:\\912_cyan\\Jamming_signal_simulation\\output\\2D_8X9"
+  base_path: "D:\\VSCODE\\Jamming_signal_simulation\\output\\2D_8x9"
   jnr_start: 0
   jnr_end: 20
-  jnr_step: 1
+  jnr_step: 5
   num_workers: 0
   pin_memory: true
   image_size: 224
@@ -91,9 +91,9 @@ logging:
 
 # 评估配置
 evaluation:
-  checkpoint: "checkpoints\\persistence_step\\persistence_best.pt"
+  checkpoint: "checkpoints\\persistence\\persistence_latest.pt"
   mode: "all"                      # all | zero_shot | by_combination | by_jnr
-  split: "train"                    # train | val | test
+  split: "test"                    # train | val | test
   # threshold: 0.5
   zero_shot_threshold: 0.5        # zero_shot 专用（组合空间匹配）
   by_combination_threshold: 0.5  # by_combination 专用（单类 softmax）

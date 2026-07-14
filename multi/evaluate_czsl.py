@@ -1,11 +1,13 @@
 """
 CZSL评估脚本 - 支持零样本组合识别评估
-python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode zero_shot
 
-python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode zero_shot --split test --visualize --output_dir results
- --save_stft
+参数优先级: CLI > multi/config.yaml 的 evaluation: > 内置默认值。
+在 evaluation 中写好 checkpoint / mode / split / 可视化开关后，可省略超长 CLI:
 
-python -m multi.evaluate_czsl --checkpoint checkpoints/czsl_best_model.pt --mode by_jnr --split test --output_dir results
+    python -m multi.evaluate_czsl
+    python -m multi.evaluate_czsl --mode by_jnr --split test
+    python -m multi.evaluate_czsl --checkpoint path/to.pt --roc --pr
+    python -m multi.evaluate_czsl --checkpoint path/to.pt --mode all --visualize --output_dir results
 """
 # pylint: disable=no-member
 
@@ -1688,31 +1690,37 @@ def convert_combination_names_to_indices(
 
 
 def main():
-    """主函数"""
+    """主函数
+
+    参数优先级: CLI > config.evaluation > 内置默认值。
+    在 multi/config.yaml 的 evaluation: 中写好 checkpoint/mode/split 等后，
+    可直接: python -m multi.evaluate_czsl
+    """
     parser = argparse.ArgumentParser(description="Evaluate CZSL Model")
     parser.add_argument("--config", type=str, default="multi/config.yaml",
                         help="Path to config file")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to model checkpoint")
-    parser.add_argument("--mode", type=str, default="all",
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to model checkpoint (defaults to evaluation.checkpoint)")
+    parser.add_argument("--mode", type=str, default=None,
                         choices=["all", "by_jnr"],
-                        help="Evaluation mode: 'all' runs zero-shot + by-combination, 'by_jnr' runs per-JNR")
-    parser.add_argument("--split", type=str, default="test",
+                        help="Evaluation mode (overrides config): 'all' = zero-shot + by-combination")
+    parser.add_argument("--split", type=str, default=None,
                         choices=["train", "val", "test"],
-                        help="Data split to evaluate")
-    parser.add_argument("--output_dir", type=str, default="results",
-                        help="Output directory for results")
-    parser.add_argument("--visualize", action="store_true",
+                        help="Data split (overrides config)")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Output directory (overrides config)")
+    # Visualization: default=None so unset CLI falls through to config
+    parser.add_argument("--visualize", action="store_true", default=None,
                         help="Generate all visualizations (confusion matrix, ROC, PR, t-SNE, UMAP)")
-    parser.add_argument("--tsne", action="store_true",
+    parser.add_argument("--tsne", action="store_true", default=None,
                         help="Generate t-SNE visualization only")
-    parser.add_argument("--umap", action="store_true",
+    parser.add_argument("--umap", action="store_true", default=None,
                         help="Generate UMAP visualization only")
-    parser.add_argument("--roc", action="store_true",
+    parser.add_argument("--roc", action="store_true", default=None,
                         help="Generate ROC curves only")
-    parser.add_argument("--pr", action="store_true",
+    parser.add_argument("--pr", action="store_true", default=None,
                         help="Generate PR curves only")
-    parser.add_argument("--save_stft", action="store_true",
+    parser.add_argument("--save_stft", action="store_true", default=None,
                         help="Save STFT images with predictions")
     parser.add_argument("--max_stft_samples", type=int, default=None,
                         help="Maximum number of STFT images to save (default: all)")
@@ -1720,6 +1728,53 @@ def main():
 
     # 加载配置
     config = load_config(args.config)
+    eval_cfg = config.get("evaluation", {}) or {}
+
+    # ── Resolve params: CLI > config.evaluation > default ──
+    checkpoint_path = args.checkpoint or eval_cfg.get("checkpoint")
+    if not checkpoint_path:
+        raise ValueError(
+            "No checkpoint specified. Set --checkpoint or add evaluation.checkpoint to config.yaml"
+        )
+
+    mode = args.mode or eval_cfg.get("mode", "all")
+    split = args.split or eval_cfg.get("split", "test")
+    output_dir_str = args.output_dir or eval_cfg.get("output_dir", "results")
+
+    def _flag(cli_val, config_key, default=False):
+        if cli_val is not None:
+            return cli_val
+        return eval_cfg.get(config_key, default)
+
+    do_viz = _flag(args.visualize, "visualize")
+    do_tsne = _flag(args.tsne, "tsne")
+    do_umap = _flag(args.umap, "umap")
+    do_roc = _flag(args.roc, "roc")
+    do_pr = _flag(args.pr, "pr")
+    do_save_stft = _flag(args.save_stft, "save_stft")
+    max_stft_samples = (
+        args.max_stft_samples
+        if args.max_stft_samples is not None
+        else eval_cfg.get("max_stft_samples")
+    )
+
+    # Mirror onto args so the rest of main can keep using args.*
+    args.checkpoint = checkpoint_path
+    args.mode = mode
+    args.split = split
+    args.output_dir = output_dir_str
+    args.visualize = do_viz
+    args.tsne = do_tsne
+    args.umap = do_umap
+    args.roc = do_roc
+    args.pr = do_pr
+    args.save_stft = do_save_stft
+    args.max_stft_samples = max_stft_samples
+
+    print(f"Evaluation config → checkpoint={args.checkpoint}")
+    print(f"  mode={args.mode}, split={args.split}, output_dir={args.output_dir}")
+    print(f"  visualize={args.visualize}, tsne={args.tsne}, umap={args.umap}, "
+          f"roc={args.roc}, pr={args.pr}, save_stft={args.save_stft}")
 
     # 设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1883,12 +1938,12 @@ def main():
                  labels=results_zs["labels"], predictions=results_zs["predictions"],
                  features=results_zs["features"])
 
-        if args.visualize:
-            evaluator.plot_confusion_by_combination(
-                results_zs["labels"], results_zs["predictions"],
-                save_path=str(output_dir / f"czsl_confusion_zs_{args.split}.png"),
-                seen_combinations=seen_combinations, unseen_combinations=unseen_combinations,
-            )
+        # 混淆矩阵默认绘制（与 persistence 一致；不依赖 visualize）
+        evaluator.plot_confusion_by_combination(
+            results_zs["labels"], results_zs["predictions"],
+            save_path=str(output_dir / f"czsl_confusion_zs_{args.split}.png"),
+            seen_combinations=seen_combinations, unseen_combinations=unseen_combinations,
+        )
         if args.visualize or args.roc:
             plot_roc_curves(
                 results_zs["labels"], results_zs["probabilities"], class_names,
@@ -1915,11 +1970,11 @@ def main():
                 save_path=str(output_dir / f"czsl_umap_{args.split}.png"),
                 seen_combinations=seen_combinations, unseen_combinations=unseen_combinations,
             )
-        if args.visualize:
-            evaluator.plot_label_cooccurrence(
-                results_zs["labels"], results_zs["predictions"],
-                save_path=str(output_dir / f"czsl_cooccurrence_{args.split}.png"),
-            )
+        # 共现图默认绘制（不依赖 visualize）
+        evaluator.plot_label_cooccurrence(
+            results_zs["labels"], results_zs["predictions"],
+            save_path=str(output_dir / f"czsl_cooccurrence_zs_{args.split}.png"),
+        )
         if args.save_stft:
             print("\nSaving STFT images with predictions...")
             evaluator.save_stft_predictions(
@@ -1950,12 +2005,17 @@ def main():
                  labels=results_bc["labels"], predictions=results_bc["predictions"],
                  features=results_bc["features"])
 
-        if args.visualize:
-            evaluator.plot_confusion_by_combination(
-                results_bc["labels"], results_bc["predictions"],
-                save_path=str(output_dir / f"czsl_confusion_bc_{args.split}.png"),
-                seen_combinations=seen_combinations, unseen_combinations=unseen_combinations,
-            )
+        # 混淆矩阵默认绘制（与 persistence 一致；不依赖 visualize）
+        evaluator.plot_confusion_by_combination(
+            results_bc["labels"], results_bc["predictions"],
+            save_path=str(output_dir / f"czsl_confusion_bc_{args.split}.png"),
+            seen_combinations=seen_combinations, unseen_combinations=unseen_combinations,
+        )
+        # 共现图默认绘制（不依赖 visualize）
+        evaluator.plot_label_cooccurrence(
+            results_bc["labels"], results_bc["predictions"],
+            save_path=str(output_dir / f"czsl_cooccurrence_bc_{args.split}.png"),
+        )
         if args.visualize or args.roc:
             plot_roc_curves(
                 results_bc["labels"], results_bc["probabilities"], class_names,
