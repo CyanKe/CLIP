@@ -124,11 +124,23 @@ logging:
   tensorboard:
     log_dir: "runs/clip_czsl"
 
-# 评估配置
+# 评估配置（evaluate_czsl.py：CLI 未指定时读取此处；CLI 优先于 config）
 evaluation:
-  threshold: 0.5
+  checkpoint: "checkpoints/RN50_both_8x9_best.pt"   # 模型权重；CLI --checkpoint 可覆盖
+  mode: "all"                      # all | by_jnr
+  split: "test"                    # train | val | test
+  output_dir: "results/multi"
+  threshold: 0.5                   # 多标签阈值（预留）
   save_predictions: true
   visualize_embeddings: true
+  # 可视化开关（对应 CLI --visualize / --tsne / --umap / --roc / --pr）
+  visualize: false                 # 全部可视化
+  tsne: false
+  umap: false
+  roc: false
+  pr: false
+  save_stft: false                 # 保存 STFT 预测图
+  # max_stft_samples: null         # 限制 STFT 保存数量；null=全部
 
 # 干扰类型定义
 jamming_classes:

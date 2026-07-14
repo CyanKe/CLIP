@@ -83,11 +83,23 @@ logging:
   tensorboard:
     log_dir: "runs/conformer_1d"
 
-# 评估配置
+# 评估配置（evaluate_conformer.py：CLI 未指定时读取此处；CLI 优先于 config）
 evaluation:
-  threshold: 0.5
+  checkpoint: "checkpoints/1d/conformer_best_model.pt"  # 模型权重；CLI --checkpoint 可覆盖
+  mode: "by_combination"           # zero_shot | by_combination | by_jnr
+  split: "test"                    # train | val | test
+  output_dir: "results/conformer_1d"
+  backbone: null                   # null=用 model.backbone；或 conformer | resnet1d | cnn1d
+  threshold: 0.5                   # by_combination 多标签阈值（预留）
   save_predictions: true
   visualize_embeddings: true
+  debug: false                     # 打印首 batch 调试信息
+  # 可视化开关（脚本若支持则读取；与 multi/persistence 字段对齐）
+  visualize: false
+  tsne: false
+  umap: false
+  roc: false
+  pr: false
 
 # 保存配置
 checkpoint:
