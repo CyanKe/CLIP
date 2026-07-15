@@ -1,13 +1,15 @@
 """
 CZSL评估脚本 - 支持零样本组合识别评估
 
-参数优先级: CLI > multi/config.yaml 的 evaluation: > 内置默认值。
-在 evaluation 中写好 checkpoint / mode / split / 可视化开关后，可省略超长 CLI:
+参数优先级: CLI > multi/config.yaml 的 evaluation 段 > 默认值。
 
+推荐（改 config 后免长 CLI）:
     python -m multi.evaluate_czsl
-    python -m multi.evaluate_czsl --mode by_jnr --split test
-    python -m multi.evaluate_czsl --checkpoint path/to.pt --roc --pr
-    python -m multi.evaluate_czsl --checkpoint path/to.pt --mode all --visualize --output_dir results
+    python -m multi.evaluate_czsl --config multi/config.yaml
+
+仍可用 CLI 覆盖:
+    python -m multi.evaluate_czsl --checkpoint checkpoints/xxx_best.pt --mode by_jnr --split test
+    python -m multi.evaluate_czsl --mode all --visualize --output_dir results
 """
 # pylint: disable=no-member
 
@@ -1692,30 +1694,30 @@ def convert_combination_names_to_indices(
 def main():
     """主函数
 
-    参数优先级: CLI > config.evaluation > 内置默认值。
-    在 multi/config.yaml 的 evaluation: 中写好 checkpoint/mode/split 等后，
-    可直接: python -m multi.evaluate_czsl
+    参数优先级: CLI > config.yaml 的 evaluation 段 > 内置默认值。
+    日常可只改 multi/config.yaml 的 evaluation，然后:
+        python -m multi.evaluate_czsl
     """
     parser = argparse.ArgumentParser(description="Evaluate CZSL Model")
     parser.add_argument("--config", type=str, default="multi/config.yaml",
                         help="Path to config file")
     parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to model checkpoint (defaults to evaluation.checkpoint)")
+                        help="Path to model checkpoint (default: evaluation.checkpoint in config)")
     parser.add_argument("--mode", type=str, default=None,
                         choices=["all", "by_jnr"],
-                        help="Evaluation mode (overrides config): 'all' = zero-shot + by-combination")
+                        help="Evaluation mode (default: evaluation.mode in config)")
     parser.add_argument("--split", type=str, default=None,
                         choices=["train", "val", "test"],
-                        help="Data split (overrides config)")
+                        help="Data split (default: evaluation.split in config)")
     parser.add_argument("--output_dir", type=str, default=None,
-                        help="Output directory (overrides config)")
-    # Visualization: default=None so unset CLI falls through to config
+                        help="Output directory (default: evaluation.output_dir in config)")
+    # store_true + default=None → 未传 CLI 时可读 config
     parser.add_argument("--visualize", action="store_true", default=None,
-                        help="Generate all visualizations (confusion matrix, ROC, PR, t-SNE, UMAP)")
+                        help="Generate all visualizations (overrides evaluation.visualize)")
     parser.add_argument("--tsne", action="store_true", default=None,
-                        help="Generate t-SNE visualization only")
+                        help="Generate t-SNE only")
     parser.add_argument("--umap", action="store_true", default=None,
-                        help="Generate UMAP visualization only")
+                        help="Generate UMAP only")
     parser.add_argument("--roc", action="store_true", default=None,
                         help="Generate ROC curves only")
     parser.add_argument("--pr", action="store_true", default=None,
@@ -1730,35 +1732,38 @@ def main():
     config = load_config(args.config)
     eval_cfg = config.get("evaluation", {}) or {}
 
-    # ── Resolve params: CLI > config.evaluation > default ──
+    # ── CLI > config > default ──
+    def _flag(cli_val, key, default=False):
+        if cli_val is not None:
+            return bool(cli_val)
+        return bool(eval_cfg.get(key, default))
+
     checkpoint_path = args.checkpoint or eval_cfg.get("checkpoint")
     if not checkpoint_path:
         raise ValueError(
-            "No checkpoint specified. Set --checkpoint or add evaluation.checkpoint to config.yaml"
+            "No checkpoint specified. Set --checkpoint or evaluation.checkpoint in config.yaml"
         )
-
     mode = args.mode or eval_cfg.get("mode", "all")
     split = args.split or eval_cfg.get("split", "test")
     output_dir_str = args.output_dir or eval_cfg.get("output_dir", "results")
-
-    def _flag(cli_val, config_key, default=False):
-        if cli_val is not None:
-            return cli_val
-        return eval_cfg.get(config_key, default)
-
-    do_viz = _flag(args.visualize, "visualize")
-    do_tsne = _flag(args.tsne, "tsne")
-    do_umap = _flag(args.umap, "umap")
-    do_roc = _flag(args.roc, "roc")
-    do_pr = _flag(args.pr, "pr")
-    do_save_stft = _flag(args.save_stft, "save_stft")
+    do_viz = _flag(args.visualize, "visualize", False)
+    do_tsne = _flag(args.tsne, "tsne", False)
+    do_umap = _flag(args.umap, "umap", False)
+    do_roc = _flag(args.roc, "roc", False)
+    do_pr = _flag(args.pr, "pr", False)
+    do_save_stft = _flag(args.save_stft, "save_stft", False)
     max_stft_samples = (
         args.max_stft_samples
         if args.max_stft_samples is not None
         else eval_cfg.get("max_stft_samples")
     )
 
-    # Mirror onto args so the rest of main can keep using args.*
+    print(f"Config: {args.config}")
+    print(f"Evaluation — mode={mode}, split={split}, checkpoint={checkpoint_path}")
+    print(f"  output_dir={output_dir_str}  viz={do_viz} tsne={do_tsne} umap={do_umap} "
+          f"roc={do_roc} pr={do_pr} save_stft={do_save_stft}")
+
+    # 回写到 args，后续逻辑统一读 args.*（已合并 config）
     args.checkpoint = checkpoint_path
     args.mode = mode
     args.split = split
@@ -1770,11 +1775,6 @@ def main():
     args.pr = do_pr
     args.save_stft = do_save_stft
     args.max_stft_samples = max_stft_samples
-
-    print(f"Evaluation config → checkpoint={args.checkpoint}")
-    print(f"  mode={args.mode}, split={args.split}, output_dir={args.output_dir}")
-    print(f"  visualize={args.visualize}, tsne={args.tsne}, umap={args.umap}, "
-          f"roc={args.roc}, pr={args.pr}, save_stft={args.save_stft}")
 
     # 设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1792,7 +1792,7 @@ def main():
     model = create_czsl_model(config, device=str(device))
 
     # 加载检查点
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # 过滤掉尺寸不匹配的层（分类器）
     state_dict = checkpoint["model_state_dict"]

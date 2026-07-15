@@ -6,14 +6,16 @@ Supports three modes:
     by_combination  — per-combination (seen/unseen) breakdown
     by_jnr          — per-JNR performance analysis
 
-参数优先级: CLI > config_1d.yaml 的 evaluation: > 内置默认值。
-在 evaluation 中写好 checkpoint / mode / split 后，可省略超长 CLI:
+参数优先级: CLI > conformer_1d/config_1d.yaml 的 evaluation 段 > 默认值。
 
-Usage:
+推荐（改 config 后免长 CLI）:
     python conformer_1d/evaluate_conformer.py
-    python conformer_1d/evaluate_conformer.py --mode by_jnr --split test
+    python conformer_1d/evaluate_conformer.py --config conformer_1d/config_1d.yaml
+
+仍可用 CLI 覆盖:
     python conformer_1d/evaluate_conformer.py --checkpoint CHKPT --mode zero_shot
-    python conformer_1d/evaluate_conformer.py --checkpoint CHKPT --backbone resnet1d --mode by_combination
+    python conformer_1d/evaluate_conformer.py --mode by_jnr --split test --output_dir results
+    python conformer_1d/evaluate_conformer.py --backbone resnet1d --mode by_combination
 """
 
 import os
@@ -789,29 +791,28 @@ class ConformerEvaluator:
 # ---------------------------------------------------------------------------
 
 def main():
-    """1D CZSL evaluation entry.
+    """参数优先级: CLI > config.yaml evaluation 段 > 内置默认值。
 
-    参数优先级: CLI > config.evaluation > 内置默认值。
-    在 conformer_1d/config_1d.yaml 的 evaluation: 中写好 checkpoint/mode/split 等后，
-    可直接: python conformer_1d/evaluate_conformer.py
+    日常可只改 conformer_1d/config_1d.yaml 的 evaluation，然后:
+        python conformer_1d/evaluate_conformer.py
     """
     parser = argparse.ArgumentParser(description="1D CZSL Model Evaluation (Conformer / ResNet1D / CNN1D)")
     parser.add_argument("--config", type=str, default="conformer_1d/config_1d.yaml")
     parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to model checkpoint (defaults to evaluation.checkpoint)")
+                        help="Model checkpoint (default: evaluation.checkpoint in config)")
     parser.add_argument("--backbone", type=str, default=None,
                         choices=["conformer", "resnet1d", "cnn1d"],
-                        help="Override config model.backbone (auto-detected if not set)")
+                        help="Override config model.backbone / evaluation.backbone")
     parser.add_argument("--mode", type=str, default=None,
                         choices=["zero_shot", "by_combination", "by_jnr"],
-                        help="Evaluation mode (overrides config)")
+                        help="Evaluation mode (default: evaluation.mode in config)")
     parser.add_argument("--split", type=str, default=None,
                         choices=["train", "val", "test"],
-                        help="Data split (overrides config)")
+                        help="Data split (default: evaluation.split in config)")
     parser.add_argument("--output_dir", type=str, default=None,
-                        help="Output directory (overrides config)")
+                        help="Output directory (default: evaluation.output_dir in config)")
     parser.add_argument("--debug", action="store_true", default=None,
-                        help="Print per-sample debug info")
+                        help="Print first-batch debug info (overrides evaluation.debug)")
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
@@ -820,43 +821,39 @@ def main():
         config = yaml.safe_load(f)
     eval_cfg = config.get("evaluation", {}) or {}
 
-    # ── Resolve params: CLI > config.evaluation > default ──
+    # ── CLI > config > default ──
     checkpoint_path = args.checkpoint or eval_cfg.get("checkpoint")
     if not checkpoint_path:
         raise ValueError(
-            "No checkpoint specified. Set --checkpoint or add evaluation.checkpoint to config.yaml"
+            "No checkpoint specified. Set --checkpoint or evaluation.checkpoint in config_1d.yaml"
         )
-
     mode = args.mode or eval_cfg.get("mode", "by_combination")
     split = args.split or eval_cfg.get("split", "test")
     output_dir_str = args.output_dir or eval_cfg.get("output_dir", "results/conformer_1d")
-    backbone = args.backbone or eval_cfg.get("backbone")
-    if args.debug is not None:
-        debug = args.debug
-    else:
-        debug = bool(eval_cfg.get("debug", False))
+    debug = bool(args.debug) if args.debug is not None else bool(eval_cfg.get("debug", False))
 
-    args.checkpoint = checkpoint_path
-    args.mode = mode
-    args.split = split
-    args.output_dir = output_dir_str
-    args.backbone = backbone
-    args.debug = debug
-
-    print(f"Evaluation config → checkpoint={args.checkpoint}")
-    print(f"  mode={args.mode}, split={args.split}, output_dir={args.output_dir}, "
-          f"backbone={args.backbone}, debug={args.debug}")
+    backbone = args.backbone
+    if backbone is None:
+        backbone = eval_cfg.get("backbone")  # may be null
+    if backbone:
+        config.setdefault("model", {})["backbone"] = backbone
+        print(f"Backbone: {backbone}")
 
     if args.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
     print(f"Device: {device}")
+    print(f"Config: {args.config}")
+    print(f"Evaluation — mode={mode}, split={split}, checkpoint={checkpoint_path}")
+    print(f"  output_dir={output_dir_str}  debug={debug}")
 
-    # Override backbone from CLI / evaluation config if specified
-    if args.backbone is not None:
-        config.setdefault('model', {})['backbone'] = args.backbone
-        print(f"Backbone override: {args.backbone}")
+    # 回写 args 供后续统一读取
+    args.checkpoint = checkpoint_path
+    args.mode = mode
+    args.split = split
+    args.output_dir = output_dir_str
+    args.debug = debug
 
     # Create model (backbone from config)
     print("\nBuilding model...")
