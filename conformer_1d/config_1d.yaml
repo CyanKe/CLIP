@@ -105,28 +105,30 @@ evaluation:
 checkpoint:
   save_dir: "checkpoints\\1d"            # 自动加 backbone 前缀 (e.g. checkpoints/conformer_best_model.pt)
   save_best_only: true
+  save_interval: 10                      # 每 N 个 epoch 保存一次 latest 检查点
   monitor: "val_loss"
   mode: "min"
 
 # 干扰类型定义
 jamming_classes:
   - name: "DFTJ"
-  - name: "ISRJ"
+  - name: "SMSPJ"
+  - name: "CSJ"
   - name: "ISCJ"
-  - name: "ISDJ"
+  - name: "ISRJ"
   - name: "MISRJ"
+  - name: "ISDJ"
+  - name: "C&IJ"
+  
   - name: "AJ"
   - name: "BJ"
   - name: "SJ"
-  - name: "NCJ"
-  - name: "NPJ"
-  - name: "SMSPJ"
-  - name: "C&IJ"
-  - name: "NFMJ"
-  - name: "NPMJ"
   - name: "NAMJ"
-  - name: "CSJ"
+  - name: "NPMJ"
+  - name: "NFMJ"
   - name: "PJ"
+  - name: "NCJ"
+  - name: "NPJ"  
 
 # 是否在 CLIP 文本-信号相似度计算中使用全称翻译（true=全称，false=简称）。
 # 仅影响喂给文本编码器的文本，类别统计/可视化始终用简称。消融对比在此切换。

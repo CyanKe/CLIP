@@ -1,11 +1,27 @@
 """
-CZSL 训练脚本 - 使用标准 InfoNCE 对比损失
-python -m multi.train_czsl --config multi/config.yaml
+多形状 Patch ViT 训练脚本
+
+使用 early_fusion 模式融合三种patch形状：
+- 横向条形 (8x32): 捕捉时间维度特征
+- 纵向条形 (32x8): 捕捉频率维度特征
+- 正方形 (16x16): 捕捉局部空间特征
+
+使用方法:
+    python -m multi.experiments.train_multishape_vit --config multi/config.yaml
+
+配置示例 (在 config.yaml 中添加):
+    model:
+      patch_sizes: [[8, 32], [32, 8], [16, 16]]
+      embed_dim: 512
+      depth: 6
+      num_heads: 8
+      fusion_mode: "early_fusion"
 """
 import os
 import sys
 import yaml
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -21,21 +37,22 @@ try:
     HAS_WANDB = True
 except ImportError:
     HAS_WANDB = False
-    print("Warning: wandb not installed. Using console logging only.")
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-from multi.model import create_czsl_model, CLIPForCZSL
+from multi.experiments.rectangular_patch_vit import MultiShapePatchViTForCZSL, create_multi_shape_patch_model
 from multi.data import create_czsl_dataloaders, create_preprocessed_dataloaders
-from multi.loss import create_loss_function, LabelAwareInfoNCELoss, MultiLabelSigmoidLoss
+from multi.loss import create_loss_function, LabelAwareInfoNCELoss, MultiLabelInfoNCELoss, MultiLabelSigmoidLoss
 
 
-class CZSLTrainer:
-    """CZSL 训练器 - 支持 CLIP (InfoNCE) 和 SigLIP (Sigmoid Loss)"""
+class MultiShapeViTTrainer:
+    """多形状 Patch ViT 训练器"""
 
     def __init__(
         self,
-        model,
+        model: MultiShapePatchViTForCZSL,
         train_loader,
         val_loader,
         optimizer,
@@ -55,30 +72,24 @@ class CZSLTrainer:
 
         self.current_epoch = 0
         self.best_val_loss = float('inf')
+        self.best_val_acc = 0.0
         self.train_config = config.get("train", {})
         self.grad_clip = self.train_config.get("grad_clip", 1.0)
-        self.use_amp = self.train_config.get("use_amp", False)
-        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
         self.checkpoint_config = config.get("checkpoint", {})
         self.save_dir = Path(self.checkpoint_config.get("save_dir", "checkpoints"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.model_name = self.checkpoint_config.get("model_name", "czsl")
+        self.model_name = self.checkpoint_config.get("model_name", "multishape_vit")
 
-        # 检测模型类型
-        self.model_type = config.get("model", {}).get("clip_model", "ViT-B/32")
-
-        # 初始化损失函数（根据模型类型选择）
-        self.loss_fn = create_loss_function(config, model_type=self.model_type)
+        # 损失函数
+        self.loss_fn = create_loss_function(config)
         self.use_label_aware_loss = isinstance(self.loss_fn, LabelAwareInfoNCELoss)
+        self.use_multilabel_infonce = isinstance(self.loss_fn, MultiLabelInfoNCELoss)
         self.use_sigmoid_loss = isinstance(self.loss_fn, MultiLabelSigmoidLoss)
-
-        print(f"Loss function: {type(self.loss_fn).__name__}")
-        if self.use_label_aware_loss:
-            print(f"  handle_zero_sum: {self.loss_fn.handle_zero_sum}")
+        print(f"Using loss function: {type(self.loss_fn).__name__}")
 
     def train_epoch(self, debug: bool = False) -> dict:
-        """训练一个 epoch - 使用标准 InfoNCE"""
+        """训练一个 epoch"""
         self.model.train()
         total_loss = 0.0
         total_correct = 0
@@ -87,7 +98,6 @@ class CZSLTrainer:
         train_bar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1} [Train]")
 
         debug_done = False
-        # 数据解包：collate_fn 返回 (stft_images, time_signals, text_tokens, labels, texts, metas, features_batched)
         for batch_idx, batch_data in enumerate(train_bar):
             if len(batch_data) >= 7:
                 stft_images, time_signals, text_tokens, labels, texts, metas, features_batched = batch_data
@@ -105,83 +115,61 @@ class CZSLTrainer:
             stft_images = stft_images.to(self.device)
             text_tokens = text_tokens.to(self.device)
             labels = labels.to(self.device)
-            if has_time_signal and time_signals is not None:
-                time_signals = time_signals.to(self.device)
 
             # 调整图像尺寸
             if stft_images.shape[-1] != 224:
-                stft_images = nn.functional.interpolate(stft_images, size=(224, 224), mode='bilinear', align_corners=False)
+                stft_images = nn.functional.interpolate(
+                    stft_images, size=(224, 224), mode='bilinear', align_corners=False
+                )
 
             batch_size = stft_images.size(0)
 
-            # Debug: 打印第一批次的详细信息
+            # Debug
             if debug and not debug_done and batch_idx == 0:
-                print(f"\n{'='*80}")
-                print(f"[DEBUG Train] Batch {batch_idx} — batch_size={batch_size}")
-                print(f"  labels[0]: {labels[0].tolist()}")
+                print(f"\n[DEBUG] Batch {batch_idx}, batch_size={batch_size}")
                 print(f"  texts[0]: {texts[0]}")
-                if metas:
-                    print(f"  metas[0]: {metas[0]}")
-                unique_texts = list(dict.fromkeys(texts))
-                print(f"  unique texts in batch: {len(unique_texts)} / {batch_size}")
-                for t in unique_texts[:8]:
-                    print(f"    -> {t}")
-                if len(unique_texts) > 8:
-                    print(f"    ... ({len(unique_texts) - 8} more)")
-                print(f"{'='*80}")
+                print(f"  labels[0]: {labels[0].tolist()}")
                 debug_done = True
 
             self.optimizer.zero_grad()
 
-            # 对比学习前向传播 (传入时域信号)
-            with torch.amp.autocast('cuda', enabled=self.use_amp):
-                image_features, text_features = self.model(stft_images, text_tokens, time_signals)
+            # 前向传播
+            image_features, text_features = self.model(stft_images, text_tokens, time_signals)
 
-                # 计算损失（根据模型类型选择不同的损失计算方式）
-                if self.use_sigmoid_loss:
-                    # SigLIP Sigmoid Loss
-                    loss, logits_per_image, loss_info = self.loss_fn(
-                        image_features, text_features, labels
-                    )
-                    logits_per_text = logits_per_image.T
-                elif self.use_label_aware_loss:
-                    # CLIP Label-Aware InfoNCE Loss
-                    loss, logits_per_image, loss_info = self.loss_fn(
-                        image_features, text_features, labels
-                    )
-                    logits_per_text = logits_per_image.T
-                else:
-                    # 标准 CLIP InfoNCE 损失：对角线为正样本对
-                    logit_scale = self.model.model.logit_scale.exp()
-                    logits_per_image = logit_scale * (image_features @ text_features.t())
-                    logits_per_text = logits_per_image.t()
+            # 计算损失
+            if self.use_sigmoid_loss:
+                loss, logits_per_image, _ = self.loss_fn(image_features, text_features, labels)
+                logits_per_text = logits_per_image.T
+            elif self.use_label_aware_loss or self.use_multilabel_infonce:
+                loss, logits_per_image, _ = self.loss_fn(image_features, text_features, labels)
+                logits_per_text = logits_per_image.T
+            else:
+                logit_scale = self.model.logit_scale.exp()
+                logits_per_image = logit_scale * (image_features @ text_features.t())
+                logits_per_text = logits_per_image.T
 
-                    targets = torch.arange(batch_size, device=self.device)
-                    loss_i2t = F.cross_entropy(logits_per_image, targets)
-                    loss_t2i = F.cross_entropy(logits_per_text, targets)
-                    loss = (loss_i2t + loss_t2i) / 2
+                targets = torch.arange(batch_size, device=self.device)
+                loss_i2t = F.cross_entropy(logits_per_image, targets)
+                loss_t2i = F.cross_entropy(logits_per_text, targets)
+                loss = (loss_i2t + loss_t2i) / 2
 
-            self.scaler.scale(loss).backward()
+            loss.backward()
 
-            # 梯度裁剪（AMP 需先 unscale）
             if self.grad_clip > 0:
-                self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            self.optimizer.step()
 
             total_loss += loss.item() * batch_size
 
-            # 计算对比学习准确率（对角线准确率作为参考指标）
+            # 标签感知准确率（argmax 命中共享标签的样本即算正确）
             with torch.no_grad():
-                # 对于 label-aware 模式，对角线准确率仅供参考
-                # 实际评估应使用 zero-shot 或 KNN
-                targets = torch.arange(batch_size, device=self.device)
+                labels_f = labels.float()
+                pos_mask = (labels_f @ labels_f.T) > 0
                 pred_i2t = logits_per_image.argmax(dim=1)
+                total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
                 pred_t2i = logits_per_text.argmax(dim=1)
-                total_correct += (pred_i2t == targets).sum().item()
-                total_correct += (pred_t2i == targets).sum().item()
+                total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
                 total_samples += batch_size * 2
 
             train_bar.set_postfix(loss=loss.item())
@@ -192,7 +180,7 @@ class CZSLTrainer:
         }
 
     @torch.no_grad()
-    def validate(self, debug: bool = False) -> dict:
+    def validate(self) -> dict:
         """验证"""
         self.model.eval()
         total_loss = 0.0
@@ -201,8 +189,7 @@ class CZSLTrainer:
 
         val_bar = tqdm(self.val_loader, desc=f"Epoch {self.current_epoch + 1} [Val]")
 
-        debug_done = False
-        for batch_idx, batch_data in enumerate(val_bar):
+        for batch_data in val_bar:
             if len(batch_data) >= 7:
                 stft_images, time_signals, text_tokens, labels, texts, metas, features_batched = batch_data
                 has_time_signal = time_signals is not None
@@ -218,55 +205,27 @@ class CZSLTrainer:
 
             stft_images = stft_images.to(self.device)
             text_tokens = text_tokens.to(self.device)
-            if has_time_signal and time_signals is not None:
-                time_signals = time_signals.to(self.device)
+            labels = labels.to(self.device)
 
             if stft_images.shape[-1] != 224:
-                stft_images = nn.functional.interpolate(stft_images, size=(224, 224), mode='bilinear', align_corners=False)
+                stft_images = nn.functional.interpolate(
+                    stft_images, size=(224, 224), mode='bilinear', align_corners=False
+                )
 
             batch_size = stft_images.size(0)
 
-            # Debug: 打印第一批次的详细信息
-            if debug and not debug_done:
-                print(f"\n{'='*80}")
-                print(f"[DEBUG] Batch {batch_idx} — batch_size={batch_size}")
-                print(f"  labels[0]: {labels[0].tolist()}")
-                print(f"  texts[0]: {texts[0]}")
-                if metas:
-                    print(f"  metas[0]: {metas[0]}")
-                # 统计 unique texts
-                unique_texts = list(dict.fromkeys(texts))
-                print(f"  unique texts in batch: {len(unique_texts)} / {batch_size}")
-                if len(unique_texts) <= 10:
-                    for t in unique_texts:
-                        print(f"    -> {t}")
-                else:
-                    for t in unique_texts[:5]:
-                        print(f"    -> {t}")
-                    print(f"    ... ({len(unique_texts) - 5} more unique texts)")
-                print(f"{'='*80}")
-                debug_done = True
-
             image_features, text_features = self.model(stft_images, text_tokens, time_signals)
 
-            # 计算损失（根据模型类型选择不同的损失计算方式）
             if self.use_sigmoid_loss:
-                # SigLIP Sigmoid Loss
-                loss, logits_per_image, loss_info = self.loss_fn(
-                    image_features, text_features, labels
-                )
+                loss, logits_per_image, _ = self.loss_fn(image_features, text_features, labels)
                 logits_per_text = logits_per_image.T
-            elif self.use_label_aware_loss:
-                # CLIP Label-Aware InfoNCE Loss
-                loss, logits_per_image, loss_info = self.loss_fn(
-                    image_features, text_features, labels
-                )
+            elif self.use_label_aware_loss or self.use_multilabel_infonce:
+                loss, logits_per_image, _ = self.loss_fn(image_features, text_features, labels)
                 logits_per_text = logits_per_image.T
             else:
-                # 标准 CLIP InfoNCE 损失
-                logit_scale = self.model.model.logit_scale.exp()
+                logit_scale = self.model.logit_scale.exp()
                 logits_per_image = logit_scale * (image_features @ text_features.t())
-                logits_per_text = logits_per_image.t()
+                logits_per_text = logits_per_image.T
 
                 targets = torch.arange(batch_size, device=self.device)
                 loss_i2t = F.cross_entropy(logits_per_image, targets)
@@ -275,12 +234,13 @@ class CZSLTrainer:
 
             total_loss += loss.item() * batch_size
 
-            # 计算对角线准确率（仅供参考）
-            targets = torch.arange(batch_size, device=self.device)
+            # 标签感知准确率
+            labels_f = labels.float()
+            pos_mask = (labels_f @ labels_f.T) > 0
             pred_i2t = logits_per_image.argmax(dim=1)
+            total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_i2t].sum().item()
             pred_t2i = logits_per_text.argmax(dim=1)
-            total_correct += (pred_i2t == targets).sum().item()
-            total_correct += (pred_t2i == targets).sum().item()
+            total_correct += pos_mask[torch.arange(batch_size, device=self.device), pred_t2i].sum().item()
             total_samples += batch_size * 2
 
             val_bar.set_postfix(loss=loss.item())
@@ -300,28 +260,33 @@ class CZSLTrainer:
             "config": self.config
         }
 
-        latest_path = self.save_dir / f"{self.model_name}_latest.pt"
+        # 保存最新检查点
+        latest_path = self.save_dir / f"{self.model_name}_latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
 
+        # 只保存最佳模型
         if is_best:
-            best_path = self.save_dir / f"{self.model_name}_best.pt"
+            best_path = self.save_dir / f"{self.model_name}_best_model.pt"
             torch.save(checkpoint, best_path)
-            print(f"  ★ Saved best model with loss: {metrics['loss']:.4f}")
+            print(f"  ★ Saved best model (loss: {metrics['loss']:.4f}, acc: {metrics['accuracy']:.4f})")
 
     def fit(self, num_epochs: int, debug: bool = False) -> dict:
-        print(f"\n{'='*60}")
-        print(f"Starting CZSL Training for {num_epochs} epochs")
-        print(f"Device: {self.device}")
-        print(f"{'='*60}\n")
+        print(f"\n{'='*70}")
+        print(f"Multi-Shape Patch ViT Training")
+        print(f"  Patch sizes: {self.config.get('model', {}).get('patch_sizes', [(8,32), (32,8), (16,16)])}")
+        print(f"  Fusion mode: {self.config.get('model', {}).get('fusion_mode', 'early_fusion')}")
+        print(f"  Epochs: {num_epochs}")
+        print(f"  Device: {self.device}")
+        print(f"{'='*70}\n")
 
         if self.use_wandb:
             wandb_config = self.config.get("logging", {}).get("wandb", {})
             wandb.init(
                 project=wandb_config.get("project", "CLIP-CZSL-Jamming"),
                 entity=wandb_config.get("entity", None),
-                name=f"CZSL_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                tags=wandb_config.get("tags", []) + ["CZSL", "InfoNCE"],
-                notes="CZSL training with standard InfoNCE loss",
+                name=f"MultiShapeViT_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                tags=wandb_config.get("tags", []) + ["MultiShapeViT", "early_fusion"],
+                notes="Multi-shape patch ViT with early fusion",
                 config=self.config
             )
             wandb.watch(self.model, log="all", log_freq=100)
@@ -332,7 +297,7 @@ class CZSLTrainer:
             train_metrics = self.train_epoch(debug=debug and epoch == 0)
             self.scheduler.step()
 
-            val_metrics = self.validate(debug=debug and epoch == 0)
+            val_metrics = self.validate()
 
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
             print(f"  Train - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
@@ -351,29 +316,23 @@ class CZSLTrainer:
             is_best = val_metrics["loss"] < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_metrics["loss"]
-                self.save_checkpoint(val_metrics, is_best=True)
-            elif (epoch + 1) % self.checkpoint_config.get("save_interval", 10) == 0 or epoch == num_epochs - 1:
-                self.save_checkpoint(val_metrics, is_best=False)
+                self.best_val_acc = val_metrics["accuracy"]
+
+            self.save_checkpoint(val_metrics, is_best)
 
         if self.use_wandb:
             wandb.finish()
 
-        print(f"\nTraining completed!")
-        print(f"Best validation loss: {self.best_val_loss:.4f}")
+        print(f"\n{'='*70}")
+        print(f"Training completed!")
+        print(f"  Best validation loss: {self.best_val_loss:.4f}")
+        print(f"  Best validation acc:  {self.best_val_acc:.4f}")
+        print(f"{'='*70}")
 
-        return {"best_val_loss": self.best_val_loss}
-
-
-def load_config(config_path: str) -> dict:
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+        return {"best_val_loss": self.best_val_loss, "best_val_acc": self.best_val_acc}
 
 
-def create_optimizer_and_scheduler(
-    model: nn.Module,
-    config: dict,
-    num_training_steps: int
-) -> tuple:
+def create_optimizer_and_scheduler(model: nn.Module, config: dict, num_training_steps: int) -> tuple:
     train_config = config.get("train", {})
 
     optimizer = AdamW(
@@ -395,10 +354,8 @@ def create_optimizer_and_scheduler(
             warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=actual_warmup)
             cosine_scheduler = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=scheduler_config.get("min_lr", 1e-7))
             scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[actual_warmup])
-            print(f"Scheduler: warmup={actual_warmup} epochs, cosine={t_max} epochs")
         else:
             scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=scheduler_config.get("min_lr", 1e-7))
-            print(f"Scheduler: cosine only, T_max={num_epochs}")
     else:
         scheduler = None
 
@@ -406,30 +363,38 @@ def create_optimizer_and_scheduler(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CZSL Training with CLIP")
+    parser = argparse.ArgumentParser(description="Multi-Shape Patch ViT Training")
     parser.add_argument("--config", type=str, default="multi/config.yaml", help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
-    parser.add_argument("--debug", action="store_true", help="Print debug info for first batch of train/val")
+    parser.add_argument("--debug", action="store_true", help="Print debug info")
     parser.add_argument("--preprocessed", action="store_true", help="Use preprocessed .pt files (run preprocess_stft.py first)")
+    parser.add_argument("--patch-sizes", type=str, default=None, help="Override patch sizes, e.g., '8,32;32,8;16,16'")
+    parser.add_argument("--fusion-mode", type=str, default="late_fusion", choices=["early_fusion", "late_fusion"])
+    parser.add_argument("--embed-dim", type=int, default=512)
+    parser.add_argument("--depth", type=int, default=6)
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    # 加载配置
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+
+    # 命令行参数覆盖配置文件
+    if args.patch_sizes:
+        patch_sizes = []
+        for ps in args.patch_sizes.split(';'):
+            h, w = map(int, ps.split(','))
+            patch_sizes.append((h, w))
+        config['model']['patch_sizes'] = patch_sizes
+
+    config['model']['fusion_mode'] = args.fusion_mode
+    config['model']['embed_dim'] = args.embed_dim
+    config['model']['depth'] = args.depth
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 获取模型类型和文本风格
-    model_type = config.get("model", {}).get("clip_model", "ViT-B/32")
-    text_style = config.get("czsl", {}).get("text_style", "class_only")
-
-    # 创建模型（需要先创建模型以获取 processor）
-    print("\nCreating CZSL model...")
-    model = create_czsl_model(config, device=str(device))
-
-    # 获取 processor（用于 SigLIP tokenization）
-    processor = getattr(model, 'processor', None)
-
     # 创建数据加载器
-    print("\nLoading CZSL datasets...")
+    print("\nLoading datasets...")
     if args.preprocessed:
         train_loader, val_loader, test_loader, num_classes = create_preprocessed_dataloaders(
             config=config,
@@ -437,9 +402,6 @@ def main():
             num_workers=config.get("data", {}).get("num_workers", 4),
             pin_memory=config.get("data", {}).get("pin_memory", True),
             load_test=False,
-            model_type=model_type,
-            processor=processor,
-            text_style=text_style,
         )
     else:
         train_loader, val_loader, test_loader, num_classes = create_czsl_dataloaders(
@@ -448,16 +410,20 @@ def main():
             num_workers=config.get("data", {}).get("num_workers", 4),
             pin_memory=config.get("data", {}).get("pin_memory", True),
             load_test=False,
-            model_type=model_type,
-            processor=processor,
-            text_style=text_style,
         )
 
-    # 缓存文本特征（使用配置文件中的 seen_combinations 和 text_style）
+    # 创建模型
+    print("\nCreating Multi-Shape Patch ViT model...")
+    model = create_multi_shape_patch_model(config, device=str(device))
+
+    # 缓存文本特征
     czsl_config = config.get("czsl", {})
     seen_combos = czsl_config.get("seen_combinations", None)
-    model.cache_text_features(max_combination_size=2, include_single=True,
-                              seen_combinations=seen_combos, text_style=text_style)
+    model.cache_text_features(
+        max_combination_size=2,
+        include_single=True,
+        seen_combinations=seen_combos
+    )
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
@@ -468,12 +434,12 @@ def main():
     num_training_steps = len(train_loader) * config.get("train", {}).get("epochs", 20)
     optimizer, scheduler = create_optimizer_and_scheduler(model, config, num_training_steps)
 
-    # 确定是否使用 WandB
+    # WandB
     log_type = config.get("logging", {}).get("type", "console")
     use_wandb = (log_type == "wandb") and HAS_WANDB
 
     # 创建训练器
-    trainer = CZSLTrainer(
+    trainer = MultiShapeViTTrainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,

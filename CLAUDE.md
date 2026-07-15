@@ -26,14 +26,27 @@ python conformer_1d/evaluate_conformer.py --checkpoint CHKPT --mode zero_shot|by
 python persistence/train.py    --config persistence/config.yaml [--resume CHKPT] [--debug]
 python persistence/evaluate.py --checkpoint CHKPT --mode all|by_jnr|zero_shot --split test [--visualize]
 
-# 2D STFT (multi/) — one train script per backbone, all driven by multi/config.yaml
-python -m multi.train_czsl           --config multi/config.yaml   # plain CLIP ViT / RN
-python -m multi.train_multishape_vit  --config multi/config.yaml   # multi-patch-shape ViT
-python -m multi.train_resnet18        --config multi/config.yaml   # ResNet18 dual-branch
-python -m multi.train_dual_branch     --config multi/config.yaml   # CLIP deception+suppression branches
-python -m multi.train_unified         --config multi/config.yaml   # config-backbone-dispatching trainer
-python -m multi.evaluate_czsl         --checkpoint CHKPT --mode zero_shot|by_jnr|by_combination [--split test] [--visualize]
-python -m multi.inference_jnr         --checkpoint CHKPT --jnr 20 --jam_type ISRJ
+# 2D STFT (multi/) — mainline CZSL (driven by multi/config.yaml)
+python -m multi.train_czsl            --config multi/config.yaml   # plain CLIP ViT / RN
+python -m multi.evaluate_czsl         --checkpoint CHKPT --mode all|by_jnr|by_combination [--split test] [--visualize]
+
+# multi/experiments/ — optional backbone / ablation variants (same config file)
+python -m multi.experiments.train_multishape_vit  --config multi/config.yaml   # multi-patch-shape ViT
+python -m multi.experiments.train_resnet18        --config multi/config.yaml   # ResNet18 dual-branch
+python -m multi.experiments.train_dual_branch     --config multi/config.yaml   # CLIP deception+suppression branches
+python -m multi.experiments.train_unified         --config multi/config.yaml   # config-backbone-dispatching trainer
+python -m multi.experiments.evaluate_multishape_vit --checkpoint CHKPT
+python -m multi.experiments.evaluate_dual_branch    --checkpoint CHKPT
+python -m multi.experiments.evaluate_resnet18       --checkpoint CHKPT
+python -m multi.experiments.evaluate_unified        --checkpoint CHKPT
+python -m multi.experiments.evaluate_original_clip  --split test
+python -m multi.experiments.train_feature_only      --config multi/config.yaml
+
+# multi/tools/ — data prep / utilities
+python -m multi.tools.preprocess_stft             --config multi/config.yaml
+python -m multi.tools.compute_normalization_stats
+python -m multi.tools.compute_feature_stats       --config multi/config.yaml
+python -m multi.tools.inference_jnr               --checkpoint CHKPT --jnr 20 --jam_type ISRJ
 
 # MoE fusion eval (needs BOTH a persistence + a conformer checkpoint)
 python -m moe.evaluate_hybrid --checkpoint_persistence CHKPT --checkpoint_conformer CHKPT --mode all --split test --output_dir results/moe_hybrid
@@ -62,7 +75,7 @@ The text side is a frozen (`freeze_text: true`) CLIP text transformer; only `log
 
 ### The config is the architecture
 
-`model.backbone` and the `model.*` / `conformer.*` sub-dicts dispatch to a `create_*_model(config, device)` factory. There is no code-level registration — each train script either hard-codes its factory (`train_multishape_vit.py`) or reads `config["model"]["backbone"]` (`train_unified.py`, `conformer_1d/create_1d_model`). To add or switch a backbone, change the config and use the matching train script.
+`model.backbone` and the `model.*` / `conformer.*` sub-dicts dispatch to a `create_*_model(config, device)` factory. There is no code-level registration — each train script either hard-codes its factory (`multi/experiments/train_multishape_vit.py`) or reads `config["model"]["backbone"]` (`multi/experiments/train_unified.py`, `conformer_1d/create_1d_model`). To add or switch a backbone, change the config and use the matching train script.
 
 `loss.type` in the same YAML dispatches via `multi/loss.py:create_loss_function` — supported values: `infonce`, `label_aware_infonce`, `multilabel_infonce`, `multilabel_contrastive`, `asymmetric`, `bce`, `focal`, `czsl_contrastive`. The default across configs is `multilabel_infonce` (SigLIP-style sigmoid with IoU similarity). Trainers branch on `isinstance(loss_fn, MultiLabelSigmoidLoss | LabelAwareInfoNCELoss)` to decide the forward path; standard `infonce` takes a separate per-batch diagonal-target path.
 
@@ -93,7 +106,8 @@ Each config's `czsl.seen_combinations` / `czsl.unseen_combinations` (lists of 1-
 
 ## Conventions and gotchas
 
-- **Stale legacy entry points:** `multi/train.py` and `multi/evaluate.py` import from a `czsl.*` package that does not exist in this repo. They are leftovers from a rename. The live multi/ entry points are `train_czsl.py` / `evaluate_czsl.py` (and the per-backbone variants). Do not "fix" the `czsl` imports by creating a `czsl` package — prefer redirecting to the named multi/* scripts.
+- **`multi/` layout:** root holds the mainline only (`train_czsl`, `evaluate_czsl`, `data`, `model`, `loss`, `metrics_czsl`, …). Experimental train/eval scripts live under `multi/experiments/`; preprocessing utilities under `multi/tools/`; notebooks / viz / broken legacy under `multi/_archive/`.
+- **Stale legacy entry points:** `multi/_archive/legacy/train.py` and `evaluate.py` import from a non-existent `czsl.*` package (rename leftovers). Do not revive them — use `train_czsl` / `evaluate_czsl` or the matching `multi.experiments.*` module.
 - **`data.base_path` differs per config** and points to absolute Windows paths outside the repo. Persistence's config also has a duplicated `seen_combinations:` key (a YAML quirk — only the second block is read). The MoE config uses a third `base_path`.
 - **Comments are in Chinese** throughout; class/dict names are English. Match the surrounding language when editing.
 - **Git:** `data/`, `results/`, `wandb/`, `*.pt` checkpoints, and `.claude/` are gitignored — checkpoints and generated figures live only on disk.

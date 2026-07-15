@@ -67,6 +67,8 @@ class PersistenceTrainer:
         self.best_val_loss = float('inf')
         self.train_config = config.get("train", {})
         self.grad_clip = self.train_config.get("grad_clip", 1.0)
+        self.use_amp = self.train_config.get("use_amp", False)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
         self.checkpoint_config = config.get("checkpoint", {})
         # Mode-aware checkpoint directory
@@ -131,30 +133,33 @@ class PersistenceTrainer:
             self.optimizer.zero_grad()
 
             # Forward
-            image_features, text_features = self.model(images, text_tokens, features_dict)
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                image_features, text_features = self.model(images, text_tokens, features_dict)
 
-            if self.use_sigmoid_loss or self.use_label_aware_loss:
-                loss, logits_per_image, loss_info = self.loss_fn(
-                    image_features, text_features, labels
-                )
-                logits_per_text = logits_per_image.T
-            else:
-                # Standard InfoNCE
-                logit_scale = self.model.logit_scale.exp()
-                logits_per_image = logit_scale * (image_features @ text_features.T)
-                logits_per_text = logits_per_image.T
+                if self.use_sigmoid_loss or self.use_label_aware_loss:
+                    loss, logits_per_image, loss_info = self.loss_fn(
+                        image_features, text_features, labels
+                    )
+                    logits_per_text = logits_per_image.T
+                else:
+                    # Standard InfoNCE
+                    logit_scale = self.model.logit_scale.exp()
+                    logits_per_image = logit_scale * (image_features @ text_features.T)
+                    logits_per_text = logits_per_image.T
 
-                targets = torch.arange(images.size(0), device=self.device)
-                loss_i2t = F.cross_entropy(logits_per_image, targets)
-                loss_t2i = F.cross_entropy(logits_per_text, targets)
-                loss = (loss_i2t + loss_t2i) / 2
+                    targets = torch.arange(images.size(0), device=self.device)
+                    loss_i2t = F.cross_entropy(logits_per_image, targets)
+                    loss_t2i = F.cross_entropy(logits_per_text, targets)
+                    loss = (loss_i2t + loss_t2i) / 2
 
-            loss.backward()
+            self.scaler.scale(loss).backward()
 
             if self.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             batch_size = images.size(0)
             total_loss += loss.item() * batch_size
@@ -334,10 +339,9 @@ class PersistenceTrainer:
             is_best = val_metrics["loss"] < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_metrics["loss"]
-
-            save_best_only = self.checkpoint_config.get("save_best_only", True)
-            if not save_best_only or is_best:
-                self.save_checkpoint(val_metrics, is_best)
+                self.save_checkpoint(val_metrics, is_best=True)
+            elif (epoch + 1) % self.checkpoint_config.get("save_interval", 10) == 0 or epoch == num_epochs - 1:
+                self.save_checkpoint(val_metrics, is_best=False)
 
         if self.use_wandb:
             wandb.finish()

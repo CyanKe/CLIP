@@ -433,7 +433,7 @@ class PreprocessedSTFTDataset(Dataset):
     与 STFTDataset 不同，此类不做任何归一化/缩放/percentile，
     仅从预处理好的 .pt 文件索引已归一化的 tensor。
 
-    预处理脚本: multi/preprocess_stft.py
+    预处理脚本: multi/tools/preprocess_stft.py
     """
 
     def __init__(
@@ -1047,7 +1047,7 @@ def create_preprocessed_dataloaders(
     创建基于预处理 .pt 文件的 CZSL 数据加载器
 
     使用前需先运行:
-        python -m multi.preprocess_stft --config multi/config.yaml
+        python -m multi.tools.preprocess_stft --config multi/config.yaml
 
     预处理后的 __getitem__ 只需 tensor 索引 + float16→float32 转换，
     无 h5py 读取 / percentile / interpolate / clip_norm，速度提升 10-20x。
@@ -1079,7 +1079,7 @@ def create_preprocessed_dataloaders(
             pt_file = os.path.join(data_folder, f'{split_name}_{stft_suffix}_preprocessed.pt')
 
             if not os.path.exists(pt_file):
-                print(f"  Skip {jnr_folder}/{split_name} — not preprocessed. Run: python -m multi.preprocess_stft")
+                print(f"  Skip {jnr_folder}/{split_name} — not preprocessed. Run: python -m multi.tools.preprocess_stft")
                 continue
 
             dataset = PreprocessedSTFTDataset(
